@@ -267,15 +267,327 @@ app.get("/api/routes/engine/:route_id", async (req, res) => {
   }
 });
 
-// Legacy backward-compatibility endpoints preserved
+// GET ALL ACTIVE RIDES BY CORRIDOR ID ONLY (Ruling out Status constraints)
 app.get("/api/rides", async (req, res) => {
+  const { route_id } = req.query;
+
   try {
-    const result = await pool.query(`SELECT * FROM ride_offers WHERE status = 'pending' ORDER BY created_at DESC;`);
+    let query = `SELECT * FROM ride_offers`;
+    const params = [];
+
+    if (route_id) {
+      params.push(parseInt(route_id, 10));
+      query += ` WHERE route_id = $1`; // High-speed integer matching
+    }
+    
+    query += ` ORDER BY created_at DESC;`;
+
+    const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
+    console.error("❌ Error fetching rides by route_id:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// 1. GET: Fetch active custom corridor requests logged by passengers
+app.get("/api/corridors/passenger-requests", async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        cr.id AS request_id,
+        cr.pickup_hub_id,
+        h.name AS start_location,
+        cr.destination_name AS end_location,
+        COUNT(*) AS passenger_count
+      FROM corridor_requests cr
+      JOIN hubs h ON cr.pickup_hub_id = h.id
+      GROUP BY cr.id, cr.pickup_hub_id, h.name, cr.destination_name
+      ORDER BY passenger_count DESC;
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching passenger requests:", err.message);
+    res.status(500).json({ error: "Server error checking demand logs" });
+  }
+});
+
+// 2. GET: Fetch all baseline system corridors
+app.get("/api/routes/all", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT route_id, name, stops, base_price FROM routes ORDER BY name ASC;");
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching predefined corridors:", err.message);
+    res.status(500).json({ error: "Server error fetching routes list" });
+  }
+});
+
+
+
+
+
+
+/* ---------------- PASSENGER JOINS THE POOL (BOOK A SEAT) ---------------- */
+app.post("/api/rides/join-pool", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { ride_id, passenger_id, pickup_hub_id, dropoff_hub_id, seats_booked } = req.body;
+
+    if (!ride_id || !passenger_id || !pickup_hub_id || !dropoff_hub_id || !seats_booked) {
+      return res.status(400).json({ error: "Missing required booking details." });
+    }
+
+    // Start Transaction
+    await client.query("BEGIN");
+
+    // 1. Lock and check remaining seats in the vehicle pool
+    const rideCheck = await client.query(
+      `SELECT available_seats, total_seats FROM rides WHERE id = $1 FOR UPDATE`,
+      [ride_id]
+    );
+
+    if (rideCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Active ride run not found." });
+    }
+
+    const { available_seats } = rideCheck.rows[0];
+
+    // 2. Prevent overbooking
+    if (available_seats < seats_booked) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Not enough seats available in this pool." });
+    }
+
+    // 3. Deduct available seats from the master ride record
+    await client.query(
+      `UPDATE rides SET available_seats = available_seats - $1 WHERE id = $2`,
+      [seats_booked, ride_id]
+    );
+
+    // 4. Insert passenger booking into the pool registry
+    const bookingResult = await client.query(
+      `
+      INSERT INTO ride_bookings (ride_id, passenger_id, pickup_hub_id, dropoff_hub_id, seats_booked, status)
+      VALUES ($1, $2, $3, $4, $5, 'booked')
+      RETURNING id AS booking_id, status;
+      `,
+      [ride_id, passenger_id, pickup_hub_id, dropoff_hub_id, seats_booked]
+    );
+
+    // Commit changes safely
+    await client.query("COMMIT");
+
+    res.status(201).json({
+      message: "Successfully joined the corridor ride pool!",
+      booking_id: bookingResult.rows[0].booking_id,
+      status: bookingResult.rows[0].status
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error joining pool manifest:", err.message);
+    res.status(500).json({ error: "Server error joining the pool." });
+  } finally {
+    client.release();
+  }
+});
+
+
+/* ---------------- GET ACTIVE MANIFEST FOR THE DRIVER'S RIDE POOL ---------------- */
+app.get("/api/rides/:rideId/pool-manifest", async (req, res) => {
+  try {
+    const { rideId } = req.params;
+    const result = await pool.query(
+      `
+      SELECT 
+        rb.id AS booking_id,
+        rb.seats_booked,
+        rb.status,
+        h_start.name AS pickup_hub,
+        h_end.name AS dropoff_hub
+      FROM ride_bookings rb
+      JOIN hubs h_start ON h_start.id = rb.pickup_hub_id
+      JOIN hubs h_end ON h_end.id = rb.dropoff_hub_id
+      WHERE rb.ride_id = $1 AND rb.status IN ('booked', 'onboard')
+      ORDER BY rb.booked_at ASC;
+      `,
+      [rideId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching pool manifest:", err.message);
+    res.status(500).json({ error: "Server error reading manifest." });
+  }
+});
+
+
+
+/* ---------------- DRIVER GOES ONLINE → CREATE RIDE & MATCH POOL ---------------- */
+/* ---------------- DRIVER GOES ONLINE → CREATE LIVE POOLED RUN ---------------- */
+app.post("/api/rides/create", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { driver_id, vehicle_id, route_id, total_seats } = req.body;
+
+    if (!driver_id || !route_id) {
+      return res.status(400).json({ error: "Missing driver_id or route_id parameters." });
+    }
+
+    // 1. 🔍 STEP 1: Safe profile lookup (Avoids strict alias cross-join collisions)
+    const driverProfileQuery = await pool.query(
+      `SELECT name FROM users WHERE id = $1 LIMIT 1`,
+      [driver_id]
+    );
+    
+    // Fallback if vehicle table or user table structure varies slightly
+    const vehicleQuery = await pool.query(
+      `SELECT make, model FROM vehicles WHERE driver_id = $1 LIMIT 1`,
+      [driver_id]
+    );
+
+    const driverName = driverProfileQuery.rows[0]?.name || "Driver";
+    const carMake = vehicleQuery.rows[0]?.make || "Corridor";
+    const carModel = vehicleQuery.rows[0]?.model || "Vehicle";
+
+    // Start database transaction block
+    await client.query("BEGIN");
+
+    // 2. 🗺️ STEP 2: Extract real route geography, pricing blueprints, and coordinates
+    const routeGeomQuery = await client.query(
+      `
+      SELECT 
+        r.base_price,
+        ARRAY_AGG(h.name ORDER BY rs.stop_order) AS stops,
+        (ARRAY_AGG(h.latitude ORDER BY rs.stop_order))[1] AS start_lat,
+        (ARRAY_AGG(h.longitude ORDER BY rs.stop_order))[1] AS start_lng
+      FROM routes r
+      JOIN route_stops rs ON rs.route_id = r.id
+      JOIN hubs h ON h.id = rs.hub_id
+      WHERE r.id = $1
+      GROUP BY r.id, r.base_price;
+      `,
+      [route_id]
+    );
+    
+    const routeData = routeGeomQuery.rows[0];
+    if (!routeData || !routeData.stops || routeData.stops.length < 2) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "The chosen corridor route blueprint has an incomplete stop list." });
+    }
+
+    const startLoc = routeData.stops[0];
+    const endLoc = routeData.stops[routeData.stops.length - 1];
+    const pricePerSeat = routeData.base_price;
+    const seatsCount = total_seats || 4;
+
+    // 3. 🚖 STEP 3: Write a valid operational record to ride_offers matching your verified columns
+    const rideOfferQuery = await client.query(
+      `
+      INSERT INTO ride_offers (
+        driver_id, 
+        vehicle_id, 
+        route_id, 
+        start_location, 
+        end_location, 
+        departure_time, 
+        total_seats, 
+        available_seats, 
+        price_per_seat, 
+        pickup_lat, 
+        pickup_lng, 
+        status, 
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, $7, $8, $9, $10, 'active', CURRENT_TIMESTAMP)
+      RETURNING id AS offer_id, status;
+      `,
+      [
+        driver_id, 
+        vehicle_id || null, 
+        route_id, 
+        startLoc, 
+        endLoc, 
+        seatsCount, 
+        seatsCount, 
+        pricePerSeat, 
+        routeData.start_lat, 
+        routeData.start_lng
+      ]
+    );
+    const newOffer = rideOfferQuery.rows[0];
+
+    // 4. 👥 STEP 4: Convert waiting passengers in route_pool from 'searching' to 'matched'
+    const matchQueueQuery = await client.query(
+      `
+      UPDATE route_pool
+      SET status = 'matched'
+      WHERE route_id = $1 AND status = 'searching'
+      RETURNING id, user_id;
+      `,
+      [route_id]
+    );
+
+    const passengerCount = matchQueueQuery.rows.length;
+    await client.query("COMMIT");
+
+    // 5. 🏁 STEP 5: Hand clean data to frontend navigation context
+    res.status(201).json({
+      message: "Corridor pool initialized dynamically.",
+      ride_id: newOffer.offer_id,
+      status: newOffer.status,
+      start_location: startLoc,
+      end_location: endLoc,
+      total_seats: seatsCount,
+      filled: passengerCount,
+      price_per_seat: pricePerSeat,
+      driver_name: driverName,
+      make: carMake,
+      model: carModel
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error executing dynamic ride creator:", err.message);
+    res.status(500).json({ error: "Internal server error deploying live ride offer matrix." });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+// Change your Express endpoint for checking active passenger demand to this:
+/* ------------- FETCH ACTIVE PASSENGER REQUESTS (DEMAND MATRIX) ------------- */
+app.get("/api/corridors/passenger-requests", async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        rp.id AS request_id,
+        rp.route_id,
+        rp.user_id AS passenger_id,
+        u.name AS passenger_name,
+        h1.name AS start_location,
+        h2.name AS end_location,
+        rp.joined_at
+      FROM route_pool rp
+      JOIN users u ON rp.user_id = u.id
+      JOIN hubs h1 ON rp.pickup_hub_id = h1.id
+      JOIN hubs h2 ON rp.dropoff_hub_id = h2.id
+      WHERE rp.status = 'searching'
+      ORDER BY rp.joined_at DESC;
+    `;
+
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching passenger requests from route_pool:", err.message);
+    res.status(500).json({ error: "Server error querying live passenger demand matrix" });
+  }
+});
+
 
 app.listen(5000, "0.0.0.0", () => {
   console.log("🚀 Corridor Engine active on port 5000");
