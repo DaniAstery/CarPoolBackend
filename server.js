@@ -425,7 +425,7 @@ app.get("/api/rides/:rideId/pool-manifest", async (req, res) => {
 
 
 
-/* ---------------- DRIVER GOES ONLINE → CREATE RIDE & MATCH POOL ---------------- */
+
 /* ---------------- DRIVER GOES ONLINE → CREATE LIVE POOLED RUN ---------------- */
 app.post("/api/rides/create", async (req, res) => {
   const client = await pool.connect();
@@ -438,7 +438,7 @@ app.post("/api/rides/create", async (req, res) => {
 
     // 1. 🔍 STEP 1: Safe profile lookup (Avoids strict alias cross-join collisions)
     const driverProfileQuery = await pool.query(
-      `SELECT name FROM users WHERE id = $1 LIMIT 1`,
+      `SELECT full_name FROM users WHERE id = $1 LIMIT 1`,
       [driver_id]
     );
     
@@ -501,7 +501,7 @@ app.post("/api/rides/create", async (req, res) => {
         status, 
         created_at
       )
-      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, $7, $8, $9, $10, 'active', CURRENT_TIMESTAMP)
+      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, $7, $8, $9, $10, 'pending', CURRENT_TIMESTAMP)
       RETURNING id AS offer_id, status;
       `,
       [
