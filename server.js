@@ -594,6 +594,243 @@ app.get("/api/routes/all", async (req, res) => {
   }
 });
 
+/* ---------------- FETCH LIVE PICKUP ACCEPTANCE MATRIX ---------------- */
+app.get("/api/rides/proposal-status/:rideOfferId", async (req, res) => {
+  const { rideOfferId } = req.params;
+  try {
+    // 1. Fetch the ride offer details along with who has accepted so far
+    const rideQuery = await pool.query(
+      `SELECT accepted_passengers, route_id FROM ride_offers WHERE id = $1`,
+      [rideOfferId]
+    );
+
+    if (rideQuery.rows.length === 0) {
+      return res.status(404).json({ error: "Active ride deployment run not found." });
+    }
+
+    const { accepted_passengers, route_id } = rideQuery.rows[0];
+
+    // 2. Fetch all passengers grouped into this specific active deployment manifest
+    const ridersQuery = await pool.query(
+      `SELECT user_id FROM route_pool 
+       WHERE matched_ride_offer_id = $1 AND status = 'matched'`,
+      [rideOfferId]
+    );
+
+    const manifestRiders = ridersQuery.rows.map(r => r.user_id);
+
+    res.json({
+      rideOfferId: parseInt(rideOfferId, 10),
+      routeId: route_id,
+      manifestPassengers: manifestRiders, // e.g. [1, 68, 69]
+      acceptedPassengers: accepted_passengers || [] // e.g. [1, 68]
+    });
+  } catch (err) {
+    console.error("❌ ERROR FETCHING PROPOSAL MATRIX STATUS:", err.stack);
+    res.status(500).json({ error: "Internal transaction failure querying acceptance fields." });
+  }
+});
+
+
+/* ---------------- PASSENGER ACCEPTS PROPOSED PICKUP POINT ---------------- */
+app.post("/api/rides/accept-proposal", async (req, res) => {
+  const { ride_offer_id, user_id } = req.body;
+  if (!ride_offer_id || !user_id) {
+    return res.status(400).json({ error: "Missing ride_offer_id or user_id parameters." });
+  }
+
+  try {
+    // Use array_append to thread the user_id into the tracking array without duplicates
+    await pool.query(
+      `UPDATE ride_offers 
+       SET accepted_passengers = array_append(
+         array_remove(accepted_passengers, $2), $2
+       ) 
+       WHERE id = $1`,
+      [ride_offer_id, user_id]
+    );
+
+    res.json({ message: "Pickup proposal accepted successfully." });
+  } catch (err) {
+    console.error("❌ ERROR RECORDING PROPOSAL ACCEPTANCE:", err.stack);
+    res.status(500).json({ error: "Failed to post acceptance state changes adjustment." });
+  }
+});
+
+
+
+
+
+app.get("/api/rides/active-proposal/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  if (!userId) {
+    return res.status(400).json({ error: "Missing userId parameter path." });
+  }
+
+  try {
+    // Step A: Find the active matched ride for this user from the route pool
+    const poolQuery = await pool.query(
+      `SELECT matched_ride_offer_id 
+       FROM route_pool 
+       WHERE user_id = $1 AND status = 'matched' 
+       ORDER BY joined_at DESC LIMIT 1`,
+      [parseInt(userId, 10)]
+    );
+
+    // If the passenger isn't matched yet, return a clean 404 so the app can handle the loading/waiting state
+    if (poolQuery.rows.length === 0 || !poolQuery.rows[0].matched_ride_offer_id) {
+      return res.status(404).json({ error: "No active matched trip allocation found for this user." });
+    }
+
+    const activeRideOfferId = poolQuery.rows[0].matched_ride_offer_id;
+
+    // Step B: Pull the acceptance tracking array directly from the resolved ride offer row
+    const rideQuery = await pool.query(
+      `SELECT id, route_id, accepted_passengers 
+       FROM ride_offers 
+       WHERE id = $1`,
+      [activeRideOfferId]
+    );
+
+    if (rideQuery.rows.length === 0) {
+      return res.status(404).json({ error: "The allocated ride run records are missing from the cluster." });
+    }
+
+    const { id, route_id, accepted_passengers } = rideQuery.rows[0];
+
+    // Step C: Gather the complete passenger manifest group bound to this exact same trip
+    const manifestQuery = await pool.query(
+      `SELECT user_id 
+       FROM route_pool 
+       WHERE matched_ride_offer_id = $1 AND status = 'matched'`,
+      [activeRideOfferId]
+    );
+
+    const manifestUserIds = manifestQuery.rows.map(row => row.user_id);
+
+    // Return everything to the phone layout cleanly
+    return res.json({
+      rideOfferId: id,
+      routeId: route_id,
+      manifestPassengers: manifestUserIds,          // Array of all passenger IDs (e.g., [1, 2])
+      acceptedPassengers: accepted_passengers || []  // Array of IDs who tapped accept (e.g., [2])
+    });
+
+  } catch (err) {
+    console.error("❌ BACKEND STATE RESOLVER ERROR:", err.stack);
+    return res.status(500).json({ error: "Internal transactional exception mapping execution matrices." });
+  }
+});
+
+
+/* =========================================================================
+   1. 📡 LIVE TRACKING ENGINE: Fetch Passenger Manifest Status & Driver GPS Coordinates
+   ========================================================================= */
+app.get("/api/rides/track-live/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    // Step A: Find the active trip context row for this passenger
+    const poolQuery = await pool.query(
+      `SELECT matched_ride_offer_id 
+       FROM route_pool 
+       WHERE user_id = $1 AND status = 'matched' 
+       ORDER BY joined_at DESC LIMIT 1`,
+      [parseInt(userId, 10)]
+    );
+
+    if (poolQuery.rows.length === 0 || !poolQuery.rows[0].matched_ride_offer_id) {
+      return res.status(404).json({ error: "No active trip tracked for this user identifier." });
+    }
+
+    const activeRideOfferId = poolQuery.rows[0].matched_ride_offer_id;
+
+    // Step B: Fetch the real-time driver telemetry coordinates and metadata tracking structures
+    const rideQuery = await pool.query(
+      `SELECT id, route_id, pickup_lat, pickup_lng, status FROM ride_offers WHERE id = $1`,
+      [activeRideOfferId]
+    );
+
+    if (rideQuery.rows.length === 0) {
+      return res.status(404).json({ error: "Target deployment vehicle streaming profile missing." });
+    }
+
+    // Step C: Resolve the absolute walking and arrival state matrix of all grouped co-riders
+    const manifestQuery = await pool.query(
+      `SELECT user_id, status FROM route_pool 
+       WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived')
+       ORDER BY user_id ASC`,
+      [activeRideOfferId]
+    );
+
+    const passengerManifest = manifestQuery.rows.map(row => ({
+      userId: row.user_id,
+      status: row.status // 'matched' indicates Walking, 'arrived' indicates at the hub
+    }));
+
+    return res.json({
+      rideOfferId: rideQuery.rows[0].id,
+      routeId: rideQuery.rows[0].route_id,
+      rideStatus: rideQuery.rows[0].status,
+      driverLocation: {
+        latitude: parseFloat(rideQuery.rows[0].pickup_lat) || 9.0045, // Fallback safely to Megenagna route vectors
+        longitude: parseFloat(rideQuery.rows[0].pickup_lng) || 38.7865,
+      },
+      passengers: passengerManifest
+    });
+
+  } catch (err) {
+    console.error("❌ LIVE TRACKING MATRIX EXCEPTION:", err.stack);
+    return res.status(500).json({ error: "Internal database tracking stream error." });
+  }
+});
+
+/* =========================================================================
+   2. 📍 ARRIVAL CHECKPOINT SIGNAL: Commit Passenger Presence Node Validation
+   ========================================================================= */
+app.post("/api/rides/signal-arrival", async (req, res) => {
+  const { ride_offer_id, user_id } = req.body;
+
+  if (!ride_offer_id || !user_id) {
+    return res.status(400).json({ error: "Missing ride_offer_id or user_id mapping keys." });
+  }
+
+  try {
+    const targetRideId = parseInt(ride_offer_id, 10);
+    const targetUserId = parseInt(user_id, 10);
+
+    // Atomic transaction updating the exact passenger node status context to 'arrived'
+    const result = await pool.query(
+      `UPDATE route_pool 
+       SET status = 'arrived' 
+       WHERE user_id = $1 AND matched_ride_offer_id = $2 
+       RETURNING id, status`,
+      [targetUserId, targetRideId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Passenger cluster matching context mismatch." });
+    }
+
+    console.log(`📍 Presence Verification Locked: User ${targetUserId} arrived at Hub via Ride ${targetRideId}`);
+    return res.json({ success: true, message: "Arrival presence validated cleanly." });
+
+  } catch (err) {
+    console.error("❌ SIGNAL ARRIVAL TRANSACTION FAILURE:", err.stack);
+    return res.status(500).json({ error: "Failed to log terminal point arrival verification." });
+  }
+});
+
+
+
+
+
+
+
+
+
+
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
