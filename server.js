@@ -81,10 +81,96 @@ app.get("/api/routes/status/:userId", async (req, res) => {
 });
 
 /* ===========================================================================
-   👥 3. THE CENTRAL MATCHING ENGINE FUNCTION (Atomic Transaction CTE)
+   👥 3. CENTRAL CONTINUOUS MATCHING ENGINE (Headcount-Based Allocation)
 =========================================================================== */
 async function executeCorridorAutoMatch(client, route_id, hub_id) {
-  // 1. Look for the top driver waiting at this exact hub pipeline
+  
+  // 1. Find the current active or pending ride offer for this route
+  const currentRideQuery = await client.query(
+    `SELECT id, driver_id, vehicle_id, price_per_seat 
+     FROM ride_offers
+     WHERE route_id = $1 AND status = 'pending'
+     ORDER BY created_at DESC LIMIT 1 FOR UPDATE;`,
+    [route_id]
+  );
+
+  const activeRideOffer = currentRideQuery.rows[0];
+
+  // 2. Fetch all currently unassigned passengers waiting at the hub
+  const passengerPoolQuery = await client.query(
+    `SELECT id, pickup_hub_id, dropoff_hub_id FROM route_pool 
+     WHERE route_id = $1 AND pickup_hub_id = $2 AND status IN ('searching', 'arrived') 
+     ORDER BY joined_at ASC FOR UPDATE SKIP LOCKED;`,
+    [route_id, hub_id]
+  );
+
+  const availableRiders = passengerPoolQuery.rows;
+
+  // =========================================================================
+  // CASE A: CAR HAS BATCH OF 2 -> IMMEDIATELY TOP UP THE 3RD PASSENGER
+  // =========================================================================
+  if (activeRideOffer) {
+    // Count exactly how many passengers are currently locked to this specific ride offer ID
+    const currentMatchCountQuery = await client.query(
+      `SELECT COUNT(id) AS "matchCount" FROM route_pool 
+       WHERE matched_ride_offer_id = $1 AND status = 'matched';`,
+      [activeRideOffer.id]
+    );
+
+    const currentMatchedHeadcount = parseInt(currentMatchCountQuery.rows[0].matchCount, 10) || 0;
+
+    // If the car has exactly 2 passengers and someone new is waiting in the queue
+    if (currentMatchedHeadcount === 2 && availableRiders.length > 0) {
+      const thirdPassenger = availableRiders[0]; // Grab the next person inline
+
+      console.log(`⚡ Filling 3rd seat: Appending Passenger ID ${thirdPassenger.id} to Ride Offer ${activeRideOffer.id}`);
+
+      // Match the 3rd passenger directly to this ride offer
+      await client.query(
+        `UPDATE route_pool 
+         SET status = 'matched', matched_ride_offer_id = $1 
+         WHERE id = $2;`,
+        [activeRideOffer.id, thirdPassenger.id]
+      );
+
+      // Adjust the pricing matrix down to ETB 80 since the batch is now completely full (3/3)
+      await client.query(
+        `UPDATE ride_offers 
+         SET price_per_seat = 80, 
+             available_seats = available_seats - 1 
+         WHERE id = $1;`,
+        [activeRideOffer.id]
+      );
+
+      return {
+        status: "success",
+        ride_id: activeRideOffer.id,
+        matchedCount: 3,
+        message: "Successfully grouped 3rd passenger into the active batch."
+      };
+    }
+
+    // If the car already has 3 or more passengers, DO NOT add more. 
+    // Fall through to check if there's a new driver for the remaining queue.
+    if (currentMatchedHeadcount >= 3) {
+      console.log(`🚗 Ride Offer ${activeRideOffer.id} has reached its 3-batch maximum. Stragglers will hold.`);
+    }
+  }
+
+  // =========================================================================
+  // CASE B: STARTING A NEW BATCH FOR THE NEXT QUEUED DRIVER (Min 2, Max 3)
+  // =========================================================================
+  
+  // If Passenger 4 is standing alone, availableRiders.length is 1. This stops them from matching prematurely.
+  if (availableRiders.length < 2) {
+    return { 
+      status: "buffering", 
+      matchedCount: availableRiders.length, 
+      message: "Awaiting a baseline pair of passengers to start a fresh batch." 
+    };
+  }
+
+  // Pull the next driver waiting at the terminal hub line
   const topDriverQuery = await client.query(
     `SELECT id, driver_id, vehicle_id, capacity FROM driver_queue 
      WHERE route_id = $1 AND current_hub_id = $2 AND status = 'queued'
@@ -93,56 +179,33 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
   );
 
   const activeDriver = topDriverQuery.rows[0];
-  if (!activeDriver) return { status: "buffering", message: "No driver in queue." };
-
-  // 2. Fetch up to 4 searching passengers standing at this EXACT pickup hub station
-  const passengerPoolQuery = await client.query(
-    `SELECT id, pickup_hub_id, dropoff_hub_id FROM route_pool 
-     WHERE route_id = $1 AND pickup_hub_id = $2 AND status = 'searching' 
-     ORDER BY joined_at ASC LIMIT 4 FOR UPDATE SKIP LOCKED;`,
-    [route_id, hub_id]
-  );
-  
-  const totalRiders = passengerPoolQuery.rows.length;
-
-  // 🛑 POWER OF 2 RULE: Exit safely if we don't have our core pair yet
-  if (totalRiders < 2) {
-    return { status: "buffering", matchedCount: totalRiders };
+  if (!activeDriver) {
+    return { status: "buffering", message: "Passengers waiting, but no driver checked into queue." };
   }
 
-  // 📍 Get base price from route config
-  const routeMetaData = await client.query(
-    `SELECT base_price FROM routes WHERE id = $1;`, [route_id]
-  );
-  if (routeMetaData.rows.length === 0) {
-    throw new Error(`Route configuration missing for ID ${route_id}`);
-  }
+  // Slice out a clean initial chunk (grabs up to 3 passengers if available, otherwise handles 2)
+  const initialBatch = availableRiders.slice(0, 3);
+  const matchedCount = initialBatch.length;
+
+  const routeMetaData = await client.query(`SELECT base_price FROM routes WHERE id = $1;`, [route_id]);
   const basePrice = parseFloat(routeMetaData.rows[0].base_price);
 
-  // 🏙️ RESOLVE HUB NAMES: Pull text descriptors directly from your hubs table
-  const targetPickupId = passengerPoolQuery.rows[0].pickup_hub_id;
-  const targetDropoffId = passengerPoolQuery.rows[0].dropoff_hub_id;
-
-  const hubNamesQuery = await client.query(
-    `SELECT id, name FROM hubs WHERE id IN ($1, $2);`,
-    [targetPickupId, targetDropoffId]
-  );
-
+  const targetPickupId = initialBatch[0].pickup_hub_id;
+  const targetDropoffId = initialBatch[0].dropoff_hub_id;
+  const hubNamesQuery = await client.query(`SELECT id, name FROM hubs WHERE id IN ($1, $2);`, [targetPickupId, targetDropoffId]);
+  
   const hubMap = {};
   hubNamesQuery.rows.forEach(row => { hubMap[row.id] = row.name; });
   
   const startLoc = hubMap[targetPickupId] || "Terminal Station Start";
   const endLoc = hubMap[targetDropoffId] || "Terminal Station End";
 
-  // Dynamic pricing calculations based on final group density
   let finalPricePerSeat = basePrice;
-  if (totalRiders === 3) finalPricePerSeat *= 0.90;
-  if (totalRiders === 4) finalPricePerSeat *= 0.80;
+  if (matchedCount === 3) finalPricePerSeat = 80;
 
-  const remainingSeats = activeDriver.capacity - totalRiders;
-  const passengerIds = passengerPoolQuery.rows.map(p => p.id);
+  const remainingSeats = activeDriver.capacity - matchedCount;
+  const passengerIds = initialBatch.map(p => p.id);
 
-  // ⚡ THE FIXED ATOMIC TRANSACTION: Insert ride and cascade update the passenger pool using a CTE
   const matchTransactionQuery = await client.query(
     `WITH inserted_ride AS (
       INSERT INTO ride_offers (
@@ -164,7 +227,7 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
 
   const generatedRideOfferId = matchTransactionQuery.rows[0]?.new_ride_offer_id;
 
-  // Clear the driver from the active platform queue
+  // Clear driver from queue
   await client.query(
     `UPDATE driver_queue SET status = 'dispatched' WHERE vehicle_id = $1;`,
     [activeDriver.vehicle_id]
@@ -173,11 +236,10 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
   return {
     status: "success",
     ride_id: generatedRideOfferId,
-    matchedCount: totalRiders,
+    matchedCount: matchedCount,
     finalPrice: finalPricePerSeat
   };
 }
-
 /* ===========================================================================
    🎟️ 4. CORE PASSENGER PIPELINE MANIFESTS
 =========================================================================== */
@@ -824,12 +886,49 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
 
 
 
+// 📊 DRIVER Get Corridor Pool Status OF PASSENGERS metrics for a specific pickup hub
 
+// 📊 Get Corridor Pool Status metrics from the live route_pool schema
+app.get("/api/rides/corridor-pool-status", async (req, res) => {
+  const hubId = req.query.hubId ? parseInt(req.query.hubId, 10) : 1;
 
+  // 🔍 Debug Connection Mapping: Print target database info on lookup
+  if (pool && pool.options) {
+    console.log(`📡 Backend Query targeting Database: [${pool.options.database}] | User: [${pool.options.user}]`);
+  }
 
+  try {
+    // Querying the verified table name layout
+    const stateQuery = await pool.query(
+      `SELECT 
+        COUNT(CASE WHEN status = 'searching' THEN 1 END) AS "searchingCount",
+        COUNT(CASE WHEN status = 'matched' THEN 1 END) AS "matchedCount"
+       FROM route_pool
+       WHERE pickup_hub_id = $1`,
+      [hubId]
+    );
 
+    const matchedRidersQuery = await pool.query(
+      `SELECT user_id AS "userId" 
+       FROM route_pool 
+       WHERE pickup_hub_id = $1 AND status = 'matched'`,
+      [hubId]
+    );
 
+    const totalSearching = parseInt(stateQuery.rows[0]?.searchingCount, 10) || 0;
+    const totalMatched = parseInt(stateQuery.rows[0]?.matchedCount, 10) || 0;
 
+    return res.json({
+      totalSearching: totalSearching,
+      totalMatched: totalMatched,
+      matchedRiders: matchedRidersQuery.rows || []
+    });
+
+  } catch (err) {
+    console.error("❌ CORRIDOR TELEMETRY METRIC AGGREGATION FAILURE:", err.stack);
+    return res.status(500).json({ error: "Internal server error reading active pools." });
+  }
+});
 
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
