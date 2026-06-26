@@ -286,6 +286,7 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
   }
 });
 
+
 /* ---------------- PASSENGER SIDE: JOIN CORRIDOR WAITING POOL ---------------- */
 app.post("/api/routes/join", async (req, res) => {
   const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
@@ -298,6 +299,30 @@ app.post("/api/routes/join", async (req, res) => {
   try {
     await client.query("BEGIN");
 
+    // 🛡️ 1. DOUBLE-MATCH GUARD: Check if the user is already active in ANY pooling state
+    const existingActiveUser = await client.query(
+      `SELECT id, status, matched_ride_offer_id FROM route_pool 
+       WHERE user_id = $1 AND status IN ('searching', 'arrived', 'matched')
+       LIMIT 1 FOR UPDATE;`, // Lock the row to prevent racing conditions
+      [user_id]
+    );
+
+    if (existingActiveUser.rows.length > 0) {
+      const activeRecord = existingActiveUser.rows[0];
+      await client.query("ROLLBACK");
+
+      console.log(`⚠️ Prevented duplicate join: User ${user_id} is already in state [${activeRecord.status}]`);
+      
+      // Return their active state instantly so the mobile UI updates smoothly without making a mess
+      return res.status(200).json({
+        message: "User is already active in a corridor pool.",
+        alreadyActive: true,
+        pool: activeRecord,
+        match_pipeline: { status: "buffering", message: "Re-routed to active session state." }
+      });
+    }
+
+    // 2. Resolve hub destinations if missing
     let finalPickup = pickup_hub_id;
     let finalDropoff = dropoff_hub_id;
 
@@ -315,13 +340,7 @@ app.post("/api/routes/join", async (req, res) => {
       }
     }
 
-    // Clear out any previous looking-for-ride states for this specific user
-    await client.query(
-      `UPDATE route_pool SET status = 'cancelled' WHERE user_id = $1 AND status = 'searching'`,
-      [user_id]
-    );
-
-    // Insert passenger into queue line
+    // 3. Clean Insertion: User is completely verified to have no other active pool records
     const newEntry = await client.query(
       `INSERT INTO route_pool (route_id, user_id, pickup_hub_id, dropoff_hub_id, status, joined_at)
        VALUES ($1, $2, $3, $4, 'searching', NOW())
@@ -329,13 +348,14 @@ app.post("/api/routes/join", async (req, res) => {
       [route_id, user_id, finalPickup, finalDropoff]
     );
 
-    // Fire the engine to see if match criteria are fulfilled
+    // Fire the matching engine with our strict 3-max / 2-min cluster logic
     const matchPipeline = await executeCorridorAutoMatch(client, route_id, finalPickup);
 
     await client.query("COMMIT");
 
     res.status(201).json({
       message: "Success",
+      alreadyActive: false,
       pool: newEntry.rows[0],
       match_pipeline: matchPipeline
     });
@@ -348,6 +368,7 @@ app.post("/api/routes/join", async (req, res) => {
     client.release();
   }
 });
+
 
 /* ---------------- PASSENGER JOINS THE POOL (BOOK A SEAT) ---------------- */
 app.post("/api/rides/join-pool", async (req, res) => {
@@ -465,6 +486,8 @@ app.post("/api/rides", async (req, res) => {
     res.status(500).json({ error: "Server error while launching corridor deployment." });
   }
 });
+
+
 
 /* ---------------- GET ACTIVE MANIFEST FOR THE DRIVER'S RIDE POOL ---------------- */
 app.get("/api/rides/:rideId/pool-manifest", async (req, res) => {
@@ -929,6 +952,114 @@ app.get("/api/rides/corridor-pool-status", async (req, res) => {
     return res.status(500).json({ error: "Internal server error reading active pools." });
   }
 });
+
+
+/* ---------------- PASSENGER SIDE: DECLINE PROPOSAL & SWAP ---------------- */
+app.post("/api/routes/decline-proposal", async (req, res) => {
+  const { user_id, ride_offer_id } = req.body;
+
+  if (!user_id || !ride_offer_id) {
+    return res.status(400).json({ error: "Missing required user_id or ride_offer_id." });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // 1. Fetch details of the record being declined to capture the exact route layout details
+    const currentMatchQuery = await client.query(
+      `SELECT id, route_id, pickup_hub_id 
+       FROM route_pool 
+       WHERE user_id = $1 AND matched_ride_offer_id = $2 AND status = 'matched'
+       FOR UPDATE;`,
+      [user_id, ride_offer_id]
+    );
+
+    const matchRecord = currentMatchQuery.rows[0];
+
+    if (!matchRecord) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Active matching proposal record not found." });
+    }
+
+    // 2. Mark the declining passenger as 'cancelled' to remove them from the asset allocation
+    await client.query(
+      `UPDATE route_pool 
+       SET status = 'cancelled', matched_ride_offer_id = NULL 
+       WHERE id = $1;`,
+      [matchRecord.id]
+    );
+
+    console.log(`❌ Passenger ${user_id} declined proposal for Ride Offer ${ride_offer_id}.`);
+
+    // 3. SEAT SWAP GATEWAY: Fetch the next passenger who is strictly 'searching'
+    // This explicitly skips anyone who has moved to the 'arrived' physical status
+    const replacementPassengerQuery = await client.query(
+      `SELECT id FROM route_pool 
+       WHERE route_id = $1 AND pickup_hub_id = $2 AND status = 'searching'
+       ORDER BY joined_at ASC 
+       LIMIT 1 FOR UPDATE SKIP LOCKED;`,
+      [matchRecord.route_id, matchRecord.pickup_hub_id]
+    );
+
+    const replacementPassenger = replacementPassengerQuery.rows[0];
+
+    if (replacementPassenger) {
+      console.log(`⚡ Swap Engine Activated: Moving Searching Passenger ID ${replacementPassenger.id} into Ride Offer ${ride_offer_id}`);
+
+      // Instantly swap the searching passenger into the open seat position
+      await client.query(
+        `UPDATE route_pool 
+         SET status = 'matched', matched_ride_offer_id = $1 
+         WHERE id = $2;`,
+        [ride_offer_id, replacementPassenger.id]
+      );
+    } else {
+      // ⚠️ No searching replacements found: drop vehicle's headcount state back down by 1 seat
+      console.log(`📡 No replacement passengers available in searching state. Restoring seat vacancy.`);
+      
+      await client.query(
+        `UPDATE ride_offers 
+         SET available_seats = available_seats + 1 
+         WHERE id = $1;`,
+         [ride_offer_id]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.status(200).json({
+      message: "Processed proposal decline successfully.",
+      swappedInReplacement: !!replacementPassenger
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ PASSENGER DECLINE SWAP ENGINE ERROR:", err.message);
+    res.status(500).json({ error: "Internal processing failure during swap sequence." });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
