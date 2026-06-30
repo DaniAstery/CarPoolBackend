@@ -79,7 +79,6 @@ app.get("/api/routes/status/:userId", async (req, res) => {
     client.release(); 
   }
 });
-
 /* ===========================================================================
    👥 3. CENTRAL CONTINUOUS MATCHING ENGINE (Headcount-Based Allocation)
 =========================================================================== */
@@ -110,7 +109,6 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
   // CASE A: CAR HAS BATCH OF 2 -> IMMEDIATELY TOP UP THE 3RD PASSENGER
   // =========================================================================
   if (activeRideOffer) {
-    // Count exactly how many passengers are currently locked to this specific ride offer ID
     const currentMatchCountQuery = await client.query(
       `SELECT COUNT(id) AS "matchCount" FROM route_pool 
        WHERE matched_ride_offer_id = $1 AND status = 'matched';`,
@@ -119,13 +117,11 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
 
     const currentMatchedHeadcount = parseInt(currentMatchCountQuery.rows[0].matchCount, 10) || 0;
 
-    // If the car has exactly 2 passengers and someone new is waiting in the queue
     if (currentMatchedHeadcount === 2 && availableRiders.length > 0) {
-      const thirdPassenger = availableRiders[0]; // Grab the next person inline
+      const thirdPassenger = availableRiders[0];
 
       console.log(`⚡ Filling 3rd seat: Appending Passenger ID ${thirdPassenger.id} to Ride Offer ${activeRideOffer.id}`);
 
-      // Match the 3rd passenger directly to this ride offer
       await client.query(
         `UPDATE route_pool 
          SET status = 'matched', matched_ride_offer_id = $1 
@@ -133,7 +129,6 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
         [activeRideOffer.id, thirdPassenger.id]
       );
 
-      // Adjust the pricing matrix down to ETB 80 since the batch is now completely full (3/3)
       await client.query(
         `UPDATE ride_offers 
          SET price_per_seat = 80, 
@@ -150,8 +145,6 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
       };
     }
 
-    // If the car already has 3 or more passengers, DO NOT add more. 
-    // Fall through to check if there's a new driver for the remaining queue.
     if (currentMatchedHeadcount >= 3) {
       console.log(`🚗 Ride Offer ${activeRideOffer.id} has reached its 3-batch maximum. Stragglers will hold.`);
     }
@@ -160,8 +153,6 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
   // =========================================================================
   // CASE B: STARTING A NEW BATCH FOR THE NEXT QUEUED DRIVER (Min 2, Max 3)
   // =========================================================================
-  
-  // If Passenger 4 is standing alone, availableRiders.length is 1. This stops them from matching prematurely.
   if (availableRiders.length < 2) {
     return { 
       status: "buffering", 
@@ -170,10 +161,10 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
     };
   }
 
-  // Pull the next driver waiting at the terminal hub line
+  // 🔧 FIX 1: Support both 'waiting' and 'queued' statuses for mock data compatibility
   const topDriverQuery = await client.query(
     `SELECT id, driver_id, vehicle_id, capacity FROM driver_queue 
-     WHERE route_id = $1 AND current_hub_id = $2 AND status = 'queued'
+     WHERE route_id = $1 AND current_hub_id = $2 AND status IN ('queued', 'waiting')
      ORDER BY entered_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED;`,
     [route_id, hub_id]
   );
@@ -183,7 +174,7 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
     return { status: "buffering", message: "Passengers waiting, but no driver checked into queue." };
   }
 
-  // Slice out a clean initial chunk (grabs up to 3 passengers if available, otherwise handles 2)
+  // Slice out initial passengers chunk (grabs all 3 users)
   const initialBatch = availableRiders.slice(0, 3);
   const matchedCount = initialBatch.length;
 
@@ -206,6 +197,7 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
   const remainingSeats = activeDriver.capacity - matchedCount;
   const passengerIds = initialBatch.map(p => p.id);
 
+  // 🔧 FIX 2: Wrapped the updating parameters mapping cleanly to pass plain database primitives
   const matchTransactionQuery = await client.query(
     `WITH inserted_ride AS (
       INSERT INTO ride_offers (
@@ -217,7 +209,7 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
     )
     UPDATE route_pool 
     SET status = 'matched', matched_ride_offer_id = (SELECT id FROM inserted_ride) 
-    WHERE id = ANY($9)
+    WHERE id = ANY($9::int[])
     RETURNING (SELECT id FROM inserted_ride) AS new_ride_offer_id;`,
     [
       activeDriver.driver_id, activeDriver.vehicle_id, route_id, startLoc, endLoc,
@@ -301,7 +293,8 @@ app.post("/api/routes/join", async (req, res) => {
 
     // 🛡️ 1. DOUBLE-MATCH GUARD: Check if the user is already active in ANY pooling state
     const existingActiveUser = await client.query(
-      `SELECT id, status, matched_ride_offer_id FROM route_pool 
+      `SELECT id, status, route_id, pickup_hub_id, dropoff_hub_id, matched_ride_offer_id 
+       FROM route_pool 
        WHERE user_id = $1 AND status IN ('searching', 'arrived', 'matched')
        LIMIT 1 FOR UPDATE;`, // Lock the row to prevent racing conditions
       [user_id]
@@ -311,14 +304,24 @@ app.post("/api/routes/join", async (req, res) => {
       const activeRecord = existingActiveUser.rows[0];
       await client.query("ROLLBACK");
 
-      console.log(`⚠️ Prevented duplicate join: User ${user_id} is already in state [${activeRecord.status}]`);
+      console.log(`⚠️ App recovery: User ${user_id} is already in state [${activeRecord.status}]`);
       
-      // Return their active state instantly so the mobile UI updates smoothly without making a mess
+      // Determine exactly where the user should be routed based on their current database state
+      let targetScreen = "MatchingScreen"; 
+      if (activeRecord.status === "matched") {
+        targetScreen = "LiveTrackingScreen"; 
+      }
+
       return res.status(200).json({
         message: "User is already active in a corridor pool.",
         alreadyActive: true,
+        navigateTo: targetScreen, 
         pool: activeRecord,
-        match_pipeline: { status: "buffering", message: "Re-routed to active session state." }
+        match_pipeline: { 
+          status: "recovered", 
+          message: "Re-routed to active session state.",
+          ride_offer_id: activeRecord.matched_ride_offer_id
+        }
       });
     }
 
@@ -811,16 +814,18 @@ app.get("/api/rides/active-proposal/:userId", async (req, res) => {
 
 /* =========================================================================
    1. 📡 LIVE TRACKING ENGINE: Fetch Passenger Manifest Status & Driver GPS Coordinates
+/* ========================================================================= 
+   📦 LIVE TRACKING STREAM CONTROLLER (FIXED FOR ARRIVED SESSION RECOVERY)
    ========================================================================= */
 app.get("/api/rides/track-live/:userId", async (req, res) => {
   const { userId } = req.params;
 
   try {
-    // Step A: Find the active trip context row for this passenger
+    // Step A: 🌟 FIX: Allow 'arrived' users to retrieve their active tracking group matrix
     const poolQuery = await pool.query(
       `SELECT matched_ride_offer_id 
        FROM route_pool 
-       WHERE user_id = $1 AND status = 'matched' 
+       WHERE user_id = $1 AND status IN ('matched', 'arrived') 
        ORDER BY joined_at DESC LIMIT 1`,
       [parseInt(userId, 10)]
     );
@@ -859,8 +864,8 @@ app.get("/api/rides/track-live/:userId", async (req, res) => {
       routeId: rideQuery.rows[0].route_id,
       rideStatus: rideQuery.rows[0].status,
       driverLocation: {
-        latitude: parseFloat(rideQuery.rows[0].pickup_lat) || 9.0045, // Fallback safely to Megenagna route vectors
-        longitude: parseFloat(rideQuery.rows[0].pickup_lng) || 38.7865,
+        latitude: parseFloat(rideQuery.rows[0].pickup_lat) || 9.0115, // Updated default vector to converge near the hub
+        longitude: parseFloat(rideQuery.rows[0].pickup_lng) || 38.7945,
       },
       passengers: passengerManifest
     });
@@ -870,7 +875,6 @@ app.get("/api/rides/track-live/:userId", async (req, res) => {
     return res.status(500).json({ error: "Internal database tracking stream error." });
   }
 });
-
 /* =========================================================================
    2. 📍 ARRIVAL CHECKPOINT SIGNAL: Commit Passenger Presence Node Validation
    ========================================================================= */
