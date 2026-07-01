@@ -79,89 +79,105 @@ app.get("/api/routes/status/:userId", async (req, res) => {
     client.release(); 
   }
 });
+
+
+
 /* ===========================================================================
    👥 3. CENTRAL CONTINUOUS MATCHING ENGINE (Headcount-Based Allocation)
 =========================================================================== */
+/* ========================================================================= 
+   🚀 ENGINE: UNIFIED CORRIDOR AUTO-MATCH & RECOVERY PIPELINE
+   ========================================================================= */
+/* ========================================================================= 
+   🚀 ENGINE: DYNAMIC CAPACITY CORRIDOR AUTO-MATCH & RECOVERY
+   ========================================================================= */
 async function executeCorridorAutoMatch(client, route_id, hub_id) {
-  
-  // 1. Find the current active or pending ride offer for this route
-  const currentRideQuery = await client.query(
-    `SELECT id, driver_id, vehicle_id, price_per_seat 
-     FROM ride_offers
-     WHERE route_id = $1 AND status = 'pending'
-     ORDER BY created_at DESC LIMIT 1 FOR UPDATE;`,
-    [route_id]
-  );
+  console.log(`🎬 Dynamic Matching Engine Invoked: Route [${route_id}] | Hub [${hub_id}]`);
 
-  const activeRideOffer = currentRideQuery.rows[0];
-
-  // 2. Fetch all currently unassigned passengers waiting at the hub
-  const passengerPoolQuery = await client.query(
-    `SELECT id, pickup_hub_id, dropoff_hub_id FROM route_pool 
-     WHERE route_id = $1 AND pickup_hub_id = $2 AND status IN ('searching', 'arrived') 
+  // -------------------------------------------------------------------------
+  // STEP 1: FETCH ALL ELIGIBLE PASSENGERS WAITING IN LINE (FIFO)
+  // -------------------------------------------------------------------------
+  const waitingPassengersQuery = await client.query(
+    `SELECT id, user_id, pickup_hub_id, dropoff_hub_id FROM route_pool 
+     WHERE route_id = $1 AND pickup_hub_id = $2 AND status = 'searching' 
      ORDER BY joined_at ASC FOR UPDATE SKIP LOCKED;`,
     [route_id, hub_id]
   );
 
-  const availableRiders = passengerPoolQuery.rows;
+  let availableRiders = waitingPassengersQuery.rows;
+  if (availableRiders.length === 0) {
+    console.log(`ℹ️ No searching passengers found at Hub [${hub_id}] for Route [${route_id}].`);
+    return { status: "idle", message: "Passenger pool empty." };
+  }
 
-  // =========================================================================
-  // CASE A: CAR HAS BATCH OF 2 -> IMMEDIATELY TOP UP THE 3RD PASSENGER
-  // =========================================================================
-  if (activeRideOffer) {
-    const currentMatchCountQuery = await client.query(
-      `SELECT COUNT(id) AS "matchCount" FROM route_pool 
-       WHERE matched_ride_offer_id = $1 AND status = 'matched';`,
-      [activeRideOffer.id]
-    );
+  // -------------------------------------------------------------------------
+  // STEP 2: REACTIVE RECOVERY & TOP-UP FOR EXISTING RIDE OFFERS
+  // Look for ANY active or pending ride offer that has empty seats right now.
+  // -------------------------------------------------------------------------
+  const openOffersQuery = await client.query(
+    `SELECT id, available_seats, total_seats FROM ride_offers
+     WHERE route_id = $1 AND status IN ('pending', 'active') AND available_seats > 0
+     ORDER BY created_at ASC FOR UPDATE;`,
+    [route_id]
+  );
 
-    const currentMatchedHeadcount = parseInt(currentMatchCountQuery.rows[0].matchCount, 10) || 0;
+  let passengerIndex = 0;
 
-    if (currentMatchedHeadcount === 2 && availableRiders.length > 0) {
-      const thirdPassenger = availableRiders[0];
+  for (const offer of openOffersQuery.rows) {
+    let seatsAvailable = offer.available_seats; // Rely strictly on table capacity state
+    let matchedInThisCycle = 0;
 
-      console.log(`⚡ Filling 3rd seat: Appending Passenger ID ${thirdPassenger.id} to Ride Offer ${activeRideOffer.id}`);
+    // Fill seats up to exactly what the ride_offer table allows
+    while (seatsAvailable > 0 && passengerIndex < availableRiders.length) {
+      const targetPassenger = availableRiders[passengerIndex];
+      
+      console.log(`⚡ Filling Open Seat: Pairing Passenger Row ID ${targetPassenger.id} into Ride Offer ${offer.id}`);
 
       await client.query(
         `UPDATE route_pool 
          SET status = 'matched', matched_ride_offer_id = $1 
          WHERE id = $2;`,
-        [activeRideOffer.id, thirdPassenger.id]
+        [offer.id, targetPassenger.id]
       );
 
+      seatsAvailable--;
+      passengerIndex++;
+      matchedInThisCycle++;
+    }
+
+    if (matchedInThisCycle > 0) {
+      // Calculate current total passengers in car to evaluate pricing tiers dynamically
+      const totalMatchedNow = offer.total_seats - seatsAvailable;
+      const finalPrice = totalMatchedNow >= 3 ? 80 : 100; 
+
+      // Update the ride offer with exact remaining seats and correct price tier
       await client.query(
         `UPDATE ride_offers 
-         SET price_per_seat = 80, 
-             available_seats = available_seats - 1 
-         WHERE id = $1;`,
-        [activeRideOffer.id]
+         SET available_seats = $1, price_per_seat = $2 
+         WHERE id = $3;`,
+        [seatsAvailable, finalPrice, offer.id]
       );
-
-      return {
-        status: "success",
-        ride_id: activeRideOffer.id,
-        matchedCount: 3,
-        message: "Successfully grouped 3rd passenger into the active batch."
-      };
     }
 
-    if (currentMatchedHeadcount >= 3) {
-      console.log(`🚗 Ride Offer ${activeRideOffer.id} has reached its 3-batch maximum. Stragglers will hold.`);
-    }
+    if (passengerIndex >= availableRiders.length) break;
   }
 
-  // =========================================================================
-  // CASE B: STARTING A NEW BATCH FOR THE NEXT QUEUED DRIVER (Min 2, Max 3)
-  // =========================================================================
+  // Slice out remaining passengers who didn't get sorted into existing vacancies
+  availableRiders = availableRiders.slice(passengerIndex);
+
+  // -------------------------------------------------------------------------
+  // STEP 3: INITIALIZE NEW CORRIDOR BATCH FOR NEXT QUEUED DRIVER
+  // Minimum baseline requirement is 2 passengers to form a valid trip.
+  // -------------------------------------------------------------------------
   if (availableRiders.length < 2) {
     return { 
       status: "buffering", 
       matchedCount: availableRiders.length, 
-      message: "Awaiting a baseline pair of passengers to start a fresh batch." 
+      message: "Awaiting baseline pairs to call a new driver dispatch." 
     };
   }
 
-  // 🔧 FIX 1: Support both 'waiting' and 'queued' statuses for mock data compatibility
+  // Grab the top driver waiting in the queue
   const topDriverQuery = await client.query(
     `SELECT id, driver_id, vehicle_id, capacity FROM driver_queue 
      WHERE route_id = $1 AND current_hub_id = $2 AND status IN ('queued', 'waiting')
@@ -171,33 +187,32 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
 
   const activeDriver = topDriverQuery.rows[0];
   if (!activeDriver) {
-    return { status: "buffering", message: "Passengers waiting, but no driver checked into queue." };
+    return { status: "buffering", message: "Passengers waiting, but driver queue is empty." };
   }
 
-  // Slice out initial passengers chunk (grabs all 3 users)
-  const initialBatch = availableRiders.slice(0, 3);
+  // 🌟 DYNAMIC CAPACITY SLICING: Cap the batch size strictly by the driver's vehicle capacity maxed at 3
+  const maxBatchSize = Math.min(activeDriver.capacity, 3); 
+  const initialBatch = availableRiders.slice(0, maxBatchSize);
   const matchedCount = initialBatch.length;
 
   const routeMetaData = await client.query(`SELECT base_price FROM routes WHERE id = $1;`, [route_id]);
-  const basePrice = parseFloat(routeMetaData.rows[0].base_price);
+  const basePrice = parseFloat(routeMetaData.rows[0].base_price) || 100;
 
   const targetPickupId = initialBatch[0].pickup_hub_id;
   const targetDropoffId = initialBatch[0].dropoff_hub_id;
-  const hubNamesQuery = await client.query(`SELECT id, name FROM hubs WHERE id IN ($1, $2);`, [targetPickupId, targetDropoffId]);
   
+  const hubNamesQuery = await client.query(`SELECT id, name FROM hubs WHERE id IN ($1, $2);`, [targetPickupId, targetDropoffId]);
   const hubMap = {};
   hubNamesQuery.rows.forEach(row => { hubMap[row.id] = row.name; });
   
   const startLoc = hubMap[targetPickupId] || "Terminal Station Start";
   const endLoc = hubMap[targetDropoffId] || "Terminal Station End";
 
-  let finalPricePerSeat = basePrice;
-  if (matchedCount === 3) finalPricePerSeat = 80;
-
+  const finalPricePerSeat = matchedCount === 3 ? 80 : basePrice;
   const remainingSeats = activeDriver.capacity - matchedCount;
   const passengerIds = initialBatch.map(p => p.id);
 
-  // 🔧 FIX 2: Wrapped the updating parameters mapping cleanly to pass plain database primitives
+  // Insert new ride offer and match batch passengers atomically
   const matchTransactionQuery = await client.query(
     `WITH inserted_ride AS (
       INSERT INTO ride_offers (
@@ -219,7 +234,7 @@ async function executeCorridorAutoMatch(client, route_id, hub_id) {
 
   const generatedRideOfferId = matchTransactionQuery.rows[0]?.new_ride_offer_id;
 
-  // Clear driver from queue
+  // Dispatch driver out of queue
   await client.query(
     `UPDATE driver_queue SET status = 'dispatched' WHERE vehicle_id = $1;`,
     [activeDriver.vehicle_id]
@@ -958,6 +973,7 @@ app.get("/api/rides/corridor-pool-status", async (req, res) => {
 });
 
 
+
 /* ---------------- PASSENGER SIDE: DECLINE PROPOSAL & SWAP ---------------- */
 app.post("/api/routes/decline-proposal", async (req, res) => {
   const { user_id, ride_offer_id } = req.body;
@@ -971,13 +987,13 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // 1. Fetch details of the record being declined to capture the exact route layout details
+    // 1. Fetch details of the record being declined
     const currentMatchQuery = await client.query(
       `SELECT id, route_id, pickup_hub_id 
        FROM route_pool 
        WHERE user_id = $1 AND matched_ride_offer_id = $2 AND status = 'matched'
        FOR UPDATE;`,
-      [user_id, ride_offer_id]
+      [parseInt(user_id, 10), parseInt(ride_offer_id, 10)]
     );
 
     const matchRecord = currentMatchQuery.rows[0];
@@ -987,84 +1003,92 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
       return res.status(404).json({ error: "Active matching proposal record not found." });
     }
 
-    // 2. Mark the declining passenger as 'cancelled' to remove them from the asset allocation
+    const { route_id, pickup_hub_id } = matchRecord;
+
+    // 2. Mark the declining passenger as 'cancelled'
     await client.query(
-      `UPDATE route_pool 
-       SET status = 'cancelled', matched_ride_offer_id = NULL 
-       WHERE id = $1;`,
+      `UPDATE route_pool SET status = 'cancelled', matched_ride_offer_id = NULL WHERE id = $1;`,
       [matchRecord.id]
     );
 
     console.log(`❌ Passenger ${user_id} declined proposal for Ride Offer ${ride_offer_id}.`);
 
-    // 3. SEAT SWAP GATEWAY: Fetch the next passenger who is strictly 'searching'
-    // This explicitly skips anyone who has moved to the 'arrived' physical status
+    // 3. SEAT SWAP GATEWAY: Try to fill this specific seat with an inline waiting passenger
     const replacementPassengerQuery = await client.query(
       `SELECT id FROM route_pool 
        WHERE route_id = $1 AND pickup_hub_id = $2 AND status = 'searching'
        ORDER BY joined_at ASC 
        LIMIT 1 FOR UPDATE SKIP LOCKED;`,
-      [matchRecord.route_id, matchRecord.pickup_hub_id]
+      [route_id, pickup_hub_id]
     );
 
     const replacementPassenger = replacementPassengerQuery.rows[0];
+    let swappedIn = false;
 
     if (replacementPassenger) {
-      console.log(`⚡ Swap Engine Activated: Moving Searching Passenger ID ${replacementPassenger.id} into Ride Offer ${ride_offer_id}`);
-
-      // Instantly swap the searching passenger into the open seat position
+      console.log(`⚡ Swap Engine: Moving waiting row ID ${replacementPassenger.id} into Ride Offer ${ride_offer_id}`);
       await client.query(
-        `UPDATE route_pool 
-         SET status = 'matched', matched_ride_offer_id = $1 
-         WHERE id = $2;`,
+        `UPDATE route_pool SET status = 'matched', matched_ride_offer_id = $1 WHERE id = $2;`,
         [ride_offer_id, replacementPassenger.id]
       );
+      swappedIn = true;
     } else {
-      // ⚠️ No searching replacements found: drop vehicle's headcount state back down by 1 seat
-      console.log(`📡 No replacement passengers available in searching state. Restoring seat vacancy.`);
-      
+      // No instant replacement: release the seat slot back to the ride offer configuration
       await client.query(
-        `UPDATE ride_offers 
-         SET available_seats = available_seats + 1 
-         WHERE id = $1;`,
-         [ride_offer_id]
+        `UPDATE ride_offers SET available_seats = available_seats + 1 WHERE id = $1;`,
+        [ride_offer_id]
       );
     }
+
+    // 4. POOL VIABILITY CHECK: Evaluate if remaining active members drop below 2
+    const checkRemainingQuery = await client.query(
+      `SELECT id, user_id FROM route_pool 
+       WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived');`,
+      [ride_offer_id]
+    );
+
+    const activeCount = checkRemainingQuery.rows.length;
+    let poolDissolved = false;
+
+    if (activeCount < 2) {
+      console.log(`♻️ Pool unviable (${activeCount} left). Dissolving group layout for Ride Offer ID [${ride_offer_id}]`);
+      poolDissolved = true;
+
+      // Revert the lonely remaining passenger back to 'searching' inside this transaction block
+      await client.query(
+        `UPDATE route_pool 
+         SET status = 'searching', matched_ride_offer_id = NULL 
+         WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived');`,
+        [ride_offer_id]
+      );
+
+      // Cancel the unviable ride offer record
+      await client.query(
+        `UPDATE ride_offers SET status = 'cancelled' WHERE id = $1;`,
+        [ride_offer_id]
+      );
+    }
+
+    // 5. 🌟 DECOUPLED CALL: Invoke upgraded Matching Engine to resolve searching/stranded entries
+    // Passing the transactional client down allows the recovery engine to execute within the same safe atomic space.
+    await executeCorridorAutoMatch(client, route_id, pickup_hub_id);
 
     await client.query("COMMIT");
 
     res.status(200).json({
-      message: "Processed proposal decline successfully.",
-      swappedInReplacement: !!replacementPassenger
+      message: "Processed proposal decline with unified engine recovery successfully.",
+      swappedInReplacement: swappedIn,
+      poolDissolved: poolDissolved
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("❌ PASSENGER DECLINE SWAP ENGINE ERROR:", err.message);
+    console.error("❌ PASSENGER DECLINE SWAP ENGINE ERROR:", err.stack);
     res.status(500).json({ error: "Internal processing failure during swap sequence." });
   } finally {
     client.release();
   }
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
