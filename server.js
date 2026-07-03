@@ -24,62 +24,72 @@ app.get('/', (req, res) => {
 =========================================================================== */
 app.get("/api/routes/status/:userId", async (req, res) => {
   const { userId } = req.params;
-  
-  if (!userId || userId === "undefined" || userId === "null") {
-    return res.status(400).json({ error: "Valid User ID parameter is required" });
+
+  if (!userId) {
+    return res.status(400).json({ error: "Missing user identification query path." });
   }
 
-  const client = await pool.connect(); 
-  
   try {
-    // 1. Pull the most recent booking entry for this passenger
-    const userStatus = await client.query(
-      `SELECT status, route_id, pickup_hub_id, matched_ride_offer_id 
-       FROM route_pool WHERE user_id = $1 
+    // 🎯 FIX 1: Search for rows that are either 'matched' OR 'arrived' 
+    const currentPoolQuery = await pool.query(
+      `SELECT id, matched_ride_offer_id, status, joined_at 
+       FROM route_pool 
+       WHERE user_id = $1 AND status IN ('matched', 'arrived') 
        ORDER BY joined_at DESC LIMIT 1`,
-      [userId]
+      [parseInt(userId, 10)]
     );
 
-    if (userStatus.rows.length === 0) {
-      return res.json({ status: "idle", currentPoolCount: 0 });
-    }
-
-    const record = userStatus.rows[0];
-    let finalPrice = null;
-
-    // If the atomic transaction completed, fetch the locked fare from the generated offer
-    if (record.status === "matched") {
-      const priceQuery = await client.query(
-        `SELECT price_per_seat FROM ride_offers WHERE id = $1`,
-        [record.matched_ride_offer_id]
+    // If no row is matched or arrived yet, return the default searching state
+    if (currentPoolQuery.rows.length === 0) {
+      // Find how many other people are waiting at the same hub for queue counts
+      const countQuery = await pool.query(
+        `SELECT COUNT(*) FROM route_pool WHERE status = 'searching'`
       );
-      finalPrice = priceQuery.rows[0]?.price_per_seat || null;
+      
+      return res.json({
+        status: "searching",
+        currentPoolCount: parseInt(countQuery.rows[0].count, 10) || 1
+      });
     }
 
-    // 2. Count how many total searching users are standing at this station platform
-    const countQuery = await client.query(
-      `SELECT COUNT(*) FROM route_pool 
-       WHERE route_id = $1 AND pickup_hub_id = $2 AND status = 'searching'`,
-      [record.route_id, record.pickup_hub_id]
+    const activePoolRow = currentPoolQuery.rows[0];
+    const rideOfferId = activePoolRow.matched_ride_offer_id;
+
+    // 🎯 FIX 2: Gather co-riders matching this trip lifecycle block
+    const passengersQuery = await pool.query(
+      `SELECT user_id, status 
+       FROM route_pool 
+       WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived')`,
+      [rideOfferId]
     );
 
-    const liveHubQueueCount = parseInt(countQuery.rows[0].count, 10);
+    const parsedPassengers = passengersQuery.rows.map(row => ({
+      userId: row.user_id,
+      status: row.status // Will return 'matched' or 'arrived' cleanly
+    }));
 
-    res.json({
-      status: record.status, 
-      matched_ride_offer_id: record.matched_ride_offer_id,
-      finalPrice: finalPrice,
-      currentPoolCount: record.status === 'matched' ? 2 : liveHubQueueCount
+    // Fetch the ride tracking state from offer parameters
+    const rideOfferQuery = await pool.query(
+      `SELECT status FROM ride_offers WHERE id = $1`,
+      [rideOfferId]
+    );
+
+    const rideStatus = rideOfferQuery.rows[0]?.status || "pending";
+
+    // Send complete structural mapping back to the frontend loop
+    return res.json({
+      status: activePoolRow.status, // Returns 'matched' or 'arrived'
+      matched_ride_offer_id: rideOfferId,
+      rideStatus: rideStatus,
+      finalPrice: 80, // Dynamic cost matrix placeholder
+      passengers: parsedPassengers
     });
 
   } catch (err) {
-    console.error("❌ STATUS ENDPOINT ERROR:", err.stack);
-    res.status(500).json({ error: err.message });
-  } finally {
-    client.release(); 
+    console.error("❌ BACKEND MATCHING QUEUE RECOVERY ERROR:", err.stack);
+    return res.status(500).json({ error: "Internal exception executing pool status checks." });
   }
 });
-
 
 
 /* ===========================================================================
@@ -735,6 +745,7 @@ app.get("/api/rides/proposal-status/:rideOfferId", async (req, res) => {
 });
 
 
+
 /* ---------------- PASSENGER ACCEPTS PROPOSED PICKUP POINT ---------------- */
 app.post("/api/rides/accept-proposal", async (req, res) => {
   const { ride_offer_id, user_id } = req.body;
@@ -743,7 +754,28 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
   }
 
   try {
-    // Use array_append to thread the user_id into the tracking array without duplicates
+    // 1. 🛡️ Data Integrity Check: Validate pool matching alignment records
+    const poolCheck = await pool.query(
+      `SELECT id, status 
+       FROM route_pool 
+       WHERE user_id = $1 AND matched_ride_offer_id = $2`,
+      [user_id, ride_offer_id]
+    );
+
+    // If no row is returned, this user is attempting an unauthorized/invalid injection
+    if (poolCheck.rows.length === 0) {
+      return res.status(403).json({ 
+        error: "Unauthorized acceptance. User is not matched to this specific ride offer route pool cluster." 
+      });
+    }
+
+    // Optional optimization: Prevent executing a state change if they are already flagged as canceled/dropped out
+    if (poolCheck.rows[0].status === 'dropped') {
+      return res.status(400).json({ error: "Cannot accept. Passenger has already left or been dropped from this pool cluster." });
+    }
+
+    // 2. 📝 Execute Database Updates sequentially across the state transaction
+    // Thread the user_id securely into the tracking array without duplicates
     await pool.query(
       `UPDATE ride_offers 
        SET accepted_passengers = array_append(
@@ -753,13 +785,15 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
       [ride_offer_id, user_id]
     );
 
-    res.json({ message: "Pickup proposal accepted successfully." });
+    res.json({ 
+      success: true, 
+      message: "Pickup proposal accepted successfully and validated against route pool ledger." 
+    });
   } catch (err) {
     console.error("❌ ERROR RECORDING PROPOSAL ACCEPTANCE:", err.stack);
     res.status(500).json({ error: "Failed to post acceptance state changes adjustment." });
   }
 });
-
 
 
 
@@ -832,62 +866,95 @@ app.get("/api/rides/active-proposal/:userId", async (req, res) => {
 /* ========================================================================= 
    📦 LIVE TRACKING STREAM CONTROLLER (FIXED FOR ARRIVED SESSION RECOVERY)
    ========================================================================= */
-app.get("/api/rides/track-live/:userId", async (req, res) => {
+app.get("/api/rides/active-proposal/:userId", async (req, res) => {
   const { userId } = req.params;
 
+  if (!userId) {
+    return res.status(400).json({ error: "Missing userId parameter path." });
+  }
+
   try {
-    // Step A: 🌟 FIX: Allow 'arrived' users to retrieve their active tracking group matrix
+    // 🎯 Step A: Updated to find active allocations whether status is 'matched' OR 'arrived'
     const poolQuery = await pool.query(
-      `SELECT matched_ride_offer_id 
+      `SELECT matched_ride_offer_id, status
        FROM route_pool 
        WHERE user_id = $1 AND status IN ('matched', 'arrived') 
        ORDER BY joined_at DESC LIMIT 1`,
       [parseInt(userId, 10)]
     );
 
+    // If the passenger isn't matched or arrived yet, return a clean 404
     if (poolQuery.rows.length === 0 || !poolQuery.rows[0].matched_ride_offer_id) {
-      return res.status(404).json({ error: "No active trip tracked for this user identifier." });
+      return res.status(404).json({ error: "No active matched trip allocation found for this user." });
     }
 
     const activeRideOfferId = poolQuery.rows[0].matched_ride_offer_id;
+    const userCurrentPoolStatus = poolQuery.rows[0].status;
 
-    // Step B: Fetch the real-time driver telemetry coordinates and metadata tracking structures
+    // Step B: Pull the acceptance tracking array directly from the resolved ride offer row
     const rideQuery = await pool.query(
-      `SELECT id, route_id, pickup_lat, pickup_lng, status FROM ride_offers WHERE id = $1`,
+      `SELECT id, route_id, accepted_passengers 
+       FROM ride_offers 
+       WHERE id = $1`,
       [activeRideOfferId]
     );
 
     if (rideQuery.rows.length === 0) {
-      return res.status(404).json({ error: "Target deployment vehicle streaming profile missing." });
+      return res.status(404).json({ error: "The allocated ride run records are missing from the cluster." });
     }
 
-    // Step C: Resolve the absolute walking and arrival state matrix of all grouped co-riders
+    const { id, route_id, accepted_passengers } = rideQuery.rows[0];
+
+    // 🎯 Step C: Gather the complete passenger manifest group bound to this exact same trip (both matched and arrived riders)
     const manifestQuery = await pool.query(
-      `SELECT user_id, status FROM route_pool 
-       WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived')
-       ORDER BY user_id ASC`,
+      `SELECT user_id, status 
+       FROM route_pool 
+       WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived')`,
       [activeRideOfferId]
     );
 
-    const passengerManifest = manifestQuery.rows.map(row => ({
+    // Build a structured list of passengers with their real-time statuses so the frontend matrix can map them easily
+    const passengersWithStatus = manifestQuery.rows.map(row => ({
       userId: row.user_id,
-      status: row.status // 'matched' indicates Walking, 'arrived' indicates at the hub
+      status: row.status // Will return 'matched' or 'arrived'
     }));
 
+    const manifestUserIds = manifestQuery.rows.map(row => row.user_id);
+
+    // Return everything to the phone layout cleanly
     return res.json({
-      rideOfferId: rideQuery.rows[0].id,
-      routeId: rideQuery.rows[0].route_id,
-      rideStatus: rideQuery.rows[0].status,
-      driverLocation: {
-        latitude: parseFloat(rideQuery.rows[0].pickup_lat) || 9.0115, // Updated default vector to converge near the hub
-        longitude: parseFloat(rideQuery.rows[0].pickup_lng) || 38.7945,
-      },
-      passengers: passengerManifest
+      rideOfferId: id,
+      routeId: route_id,
+      currentUserPoolStatus: userCurrentPoolStatus,  // 🌟 Tells frontend if 'this' specific user is already 'arrived'
+      manifestPassengers: manifestUserIds,          
+      acceptedPassengers: accepted_passengers || [],
+      passengers: passengersWithStatus               // 🌟 Complete status ledger for the co-rider matrix rendering
     });
 
   } catch (err) {
-    console.error("❌ LIVE TRACKING MATRIX EXCEPTION:", err.stack);
-    return res.status(500).json({ error: "Internal database tracking stream error." });
+    console.error("❌ BACKEND STATE RESOLVER ERROR:", err.stack);
+    return res.status(500).json({ error: "Internal transactional exception mapping execution matrices." });
+  }
+});
+
+
+// 📤 Arrival Signal Handshake Route Handler
+app.post("/api/rides/signal-arrival", async (req, res) => {
+  const { ride_offer_id, user_id } = req.body;
+  
+  try {
+    // Flag the user's presence state directly within the pool table mapping for real-time aggregation checks
+    await pool.query(
+      `UPDATE route_pool 
+       SET status = 'arrived' 
+       WHERE user_id = $1 AND matched_ride_offer_id = $2 AND status = 'matched'`,
+      [parseInt(user_id, 10), parseInt(ride_offer_id, 10)]
+    );
+    
+    return res.json({ success: true, message: "Presence terminal handshake sequence verified." });
+  } catch (err) {
+    console.error("❌ HANDSHAKE WRITER BLOCKED:", err.stack);
+    return res.status(500).json({ error: "Database rejected transaction loop writing arrival matrix." });
   }
 });
 /* =========================================================================
@@ -1089,6 +1156,72 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
     client.release();
   }
 });
+
+
+app.get("/api/rides/track-live/offer/:offerId", async (req, res) => {
+  const { offerId } = req.params;
+
+  try {
+    // 1. Fetch overall trip metadata and real-time driver coordinates
+    const offerQuery = await pool.query(
+      `SELECT status, pickup_lat, pickup_lng, accepted_passengers
+       FROM ride_offers 
+       WHERE id = $1`,
+      [parseInt(offerId, 10)]
+    );
+
+    if (offerQuery.rows.length === 0) {
+      return res.status(404).json({ error: "Ride offer execution block not found." });
+    }
+
+    const offerRow = offerQuery.rows[0];
+
+    // 2. 🎯 UNNEST & LEFT JOIN: Unroll the integer array and link live route_pool status
+    const manifestQuery = await pool.query(
+      `SELECT 
+         unrolled.passenger_id AS user_id,
+         COALESCE(rp.status, 'Accepted') AS dynamic_status
+       FROM (
+         SELECT UNNEST(accepted_passengers) AS passenger_id
+         FROM ride_offers
+         WHERE id = $1
+       ) unrolled
+       LEFT JOIN route_pool rp 
+         ON rp.user_id = unrolled.passenger_id 
+        AND rp.matched_ride_offer_id = $1`,
+      [parseInt(offerId, 10)]
+    );
+
+    // 3. Return a clean, scannable structural map to your React Native view
+    return res.json({
+      rideOfferId: parseInt(offerId, 10),
+      rideStatus: offerRow.status,
+      driverLocation: {
+        // Fall back to pickup hub if real-time tracking points are null
+        latitude: parseFloat(offerRow.pickup_lat) || 9.0115,
+        longitude: parseFloat(offerRow.pickup_lng) || 38.7945
+      },
+      passengers: manifestQuery.rows.map(p => ({
+        userId: p.user_id,
+        status: p.dynamic_status // Dynamically yields 'arrived', 'accepted', etc.
+      }))
+    });
+
+  } catch (err) {
+    console.error("❌ Telemetry execution query breakdown:", err.stack);
+    return res.status(500).json({ error: "Internal server telemetry parsing fault." });
+  }
+});
+
+
+
+
+
+
+
+
+
+
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
