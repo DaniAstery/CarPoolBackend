@@ -681,7 +681,7 @@ app.get("/api/rides", async (req, res) => {
 app.get("/api/corridors/passenger-requests", async (req, res) => {
   try {
     const query = `
-      SELECT rp.id AS request_id, rp.route_id, rp.user_id AS passenger_id, u.name AS passenger_name,
+      SELECT rp.id AS request_id, rp.route_id, rp.user_id AS passenger_id, u.full_name AS passenger_name,
         h1.name AS start_location, h2.name AS end_location, rp.joined_at
       FROM route_pool rp
       JOIN users u ON rp.user_id = u.id
@@ -1212,6 +1212,200 @@ app.get("/api/rides/track-live/offer/:offerId", async (req, res) => {
     return res.status(500).json({ error: "Internal server telemetry parsing fault." });
   }
 });
+
+
+/**
+ * 🔄 1. GET ACTIVE ASSIGNMENT PROPOSAL FOR DRIVER
+ * Route: GET /api/rides/driver-proposal/:driverId
+ */
+app.get('/api/rides/driver-proposal/:driverId', async (req, res) => {
+  const { driverId } = req.params;
+  
+  try {
+    const query = `
+      SELECT 
+        ro.id, ro.driver_id, ro.vehicle_id, ro.start_location, ro.end_location, 
+        ro.total_seats, ro.available_seats, ro.price_per_seat, ro.status, ro.route_id,
+        ro.accepted_passengers,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'user_id', rp.user_id::integer,
+              'status', rp.status::text
+            )
+          ) FILTER (WHERE rp.user_id IS NOT NULL), '[]'
+        ) AS route_pool_passengers
+      FROM ride_offers ro
+      LEFT JOIN route_pool rp ON rp.matched_ride_offer_id = ro.id
+      WHERE ro.driver_id = $1 AND ro.status IN ('pending', 'accepted', 'inprogress')
+      GROUP BY ro.id
+      ORDER BY ro.created_at DESC
+      LIMIT 1;
+    `;
+    
+    const result = await pool.query(query, [parseInt(driverId, 10)]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "No active dispatch assignment found for this driver." });
+    }
+    
+    const offer = result.rows[0];
+    
+    let passengerArray = [];
+    if (offer.accepted_passengers) {
+      passengerArray = Array.isArray(offer.accepted_passengers) 
+        ? offer.accepted_passengers.map(Number) 
+        : offer.accepted_passengers.replace(/{|}/g, '').split(',').map(Number);
+    }
+
+    res.json({
+      id: offer.id,
+      driver_id: offer.driver_id,
+      vehicle_id: offer.vehicle_id,
+      start_location: offer.start_location,
+      end_location: offer.end_location,
+      total_seats: offer.total_seats,
+      available_seats: offer.available_seats,
+      price_per_seat: offer.price_per_seat,
+      status: offer.status, 
+      route_id: offer.route_id,
+      accepted_passengers: passengerArray, 
+      route_pool_passengers: offer.route_pool_passengers
+    });
+
+  } catch (err) {
+    console.error("Error executing driver-proposal pool fetch:", err);
+    res.status(500).json({ error: "Internal Database Sync Error" });
+  }
+});
+
+app.post("/api/rides/driver-accept", async (req, res) => {
+  const { ride_offer_id, driver_id } = req.body;
+
+  if (!ride_offer_id || !driver_id) {
+    return res.status(400).json({ error: "Missing ride_offer_id or driver_id parameters." });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Fetch details using actual schema column fields
+    const offerQuery = `
+      SELECT id, route_id, accepted_passengers, total_seats 
+      FROM ride_offers 
+      WHERE id = $1 AND driver_id = $2 FOR UPDATE
+    `;
+    const offerRes = await client.query(offerQuery, [ride_offer_id, driver_id]);
+
+    if (offerRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Active dispatch offer not found or driver allocation mismatch." });
+    }
+
+    const offer = offerRes.rows[0];
+    const { route_id, total_seats } = offer;
+
+    let confirmedPassengerIds = [];
+    if (offer.accepted_passengers) {
+      if (Array.isArray(offer.accepted_passengers)) {
+        confirmedPassengerIds = offer.accepted_passengers.map(id => parseInt(id, 10));
+      } else if (typeof offer.accepted_passengers === "string") {
+        confirmedPassengerIds = offer.accepted_passengers
+          .replace(/{|}/g, "")
+          .split(",")
+          .map(id => parseInt(id.trim(), 10))
+          .filter(id => !isNaN(id));
+      }
+    }
+
+    if (confirmedPassengerIds.length < 2) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Cannot accept dispatch. Minimum core passenger threshold not met." });
+    }
+
+    const finalAvailableSeats = total_seats - confirmedPassengerIds.length;
+    const updateOfferQuery = `
+      UPDATE ride_offers 
+      SET status = 'accepted', available_seats = $1 
+      WHERE id = $2
+    `;
+    await client.query(updateOfferQuery, [finalAvailableSeats, ride_offer_id]);
+
+    const deleteQueueQuery = `DELETE FROM driver_queue WHERE driver_id = $1`;
+    await client.query(deleteQueueQuery, [driver_id]);
+
+    // 🎯 Dynamically resolve active hub assignment parameters from the route pool data
+    let targetHubId = 1; 
+    const hubLookupQuery = `SELECT pickup_hub_id FROM route_pool WHERE matched_ride_offer_id = $1 LIMIT 1`;
+    const hubRes = await client.query(hubLookupQuery, [ride_offer_id]);
+    if (hubRes.rows.length > 0 && hubRes.rows[0].pickup_hub_id) {
+      targetHubId = parseInt(hubRes.rows[0].pickup_hub_id, 10);
+    }
+
+    // 🎯 Recycle unaccepted entries inside route_pool table mapping relationships
+    if (confirmedPassengerIds.length > 0) {
+      const resetLeftoverPoolQuery = `
+        UPDATE route_pool 
+        SET status = 'searching', matched_ride_offer_id = NULL 
+        WHERE matched_ride_offer_id = $1 
+        AND user_id NOT IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
+        RETURNING user_id
+      `;
+      
+      const resetRes = await client.query(resetLeftoverPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
+      console.log(`[Corridor Dispatch] Locked ${confirmedPassengerIds.length} riders. Kicked out ${resetRes.rows.length} pending riders back to searching stack.`);
+    }
+
+    await client.query("COMMIT");
+
+    // Invoke matching engine asynchronously
+    executeCorridorAutoMatch(pool, route_id, targetHubId)
+      .then(() => console.log(`[AutoMatch] Execution loop context processed cleanly for Route ${route_id}`))
+      .catch((err) => console.error("[AutoMatch Error] Async dispatch node loop failure:", err));
+
+    return res.status(200).json({
+      success: true,
+      message: "Manifest locked in successfully. Leftover riders recycled.",
+      rideOfferId: ride_offer_id,
+      acceptedCount: confirmedPassengerIds.length,
+      availableSeats: finalAvailableSeats
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Critical failure during driver-accept execution sequence:", error);
+    return res.status(500).json({ error: "Internal transaction failure inside processing node." });
+  } finally {
+    client.release();
+  }
+});
+app.post('/api/rides/driver-decline', async (req, res) => {
+  const { ride_offer_id, driver_id } = req.body;
+
+  try {
+    const query = `
+      UPDATE ride_offers
+      SET status = 'rejected'
+      WHERE id = $1 AND driver_id = $2
+      RETURNING id;
+    `;
+    await pool.query(query, [ride_offer_id, driver_id]);
+    
+    res.json({ success: true, message: "Offer cluster declined cleanly." });
+  } catch (err) {
+    console.error("Error writing driver rejection metrics:", err);
+    res.status(500).json({ error: "Internal Write Process Failure" });
+  }
+});
+
+
+
+
+
+
+
 
 
 
