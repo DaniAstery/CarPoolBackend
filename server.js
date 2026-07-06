@@ -1401,11 +1401,35 @@ app.post('/api/rides/driver-decline', async (req, res) => {
 });
 
 
+app.get('/api/rides/driver-active-session/:driverId', async (req, res) => {
+  const { driverId } = req.params;
 
+  try {
+    const query = `
+      SELECT id, status, route_id 
+      FROM ride_offers 
+      WHERE driver_id = $1 
+        AND status IN ('accepted', 'arrived', 'ontrip')
+      ORDER BY created_at DESC 
+      LIMIT 1;
+    `;
+    const result = await pool.query(query, [parseInt(driverId, 10)]);
 
+    if (result.rows.length > 0) {
+      return res.json({
+        hasActiveSession: true,
+        rideOfferId: result.rows[0].id,
+        status: result.rows[0].status,
+        routeId: result.rows[0].route_id
+      });
+    }
 
-
-
+    return res.json({ hasActiveSession: false });
+  } catch (err) {
+    console.error("Gatekeeper session verification failure:", err);
+    res.status(500).json({ error: "Internal session state sync error." });
+  }
+});
 
 
 
