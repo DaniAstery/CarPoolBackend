@@ -1436,6 +1436,159 @@ app.get('/api/rides/driver-active-session/:driverId', async (req, res) => {
 
 
 
+app.get("/api/rides/status/:rideOfferId", async (req, res) => {
+  try {
+    const { rideOfferId } = req.params;
+
+    const rideQuery = await pool.query(
+      `SELECT id, start_location, end_location, total_seats, price_per_seat, status, accepted_passengers
+       FROM ride_offers 
+       WHERE id = $1 LIMIT 1;`,
+      [parseInt(rideOfferId, 10)]
+    );
+
+    if (rideQuery.rows.length === 0) {
+      return res.status(404).json({ error: "Active ride offer targets not found." });
+    }
+
+    const offer = rideQuery.rows[0];
+    
+    // Dynamically calculate passenger counts based on the integer array layout length
+    const passengerCount = Array.isArray(offer.accepted_passengers) 
+      ? offer.accepted_passengers.length 
+      : 0;
+
+    return res.json({
+      id: offer.id,
+      start_location: offer.start_location,
+      end_location: offer.end_location,
+      total_seats: offer.total_seats,
+      price_per_seat: offer.price_per_seat,
+      status: offer.status,
+      passenger_count: passengerCount
+    });
+
+  } catch (err) {
+    console.error("❌ ERROR FETCHING LIVE RIDE METRICS:", err.message);
+    return res.status(500).json({ error: "Internal server error reading ride states." });
+  }
+});
+
+
+/* ========================================================================= 
+   🚀 ENDPOINT 2: UPDATE STATUS TO ARRIVED (THE ARRIVAL BUTTON MATRIX)
+   ========================================================================= */
+app.post("/api/rides/arrive", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { ride_offer_id } = req.body;
+
+    if (!ride_offer_id) {
+      return res.status(400).json({ error: "Missing ride_offer_id parameter." });
+    }
+
+    await client.query("BEGIN");
+
+        // 🎯 FIX: Atomically change column status value to 'arrived' for the target primary key row
+      const updateRideOfferQuery = await client.query(
+      `UPDATE ride_offers 
+      SET status = 'arrived' 
+      WHERE id = $1 AND (status = 'accepted' OR status = 'arrived')
+      RETURNING id, status;`,
+      [parseInt(ride_offer_id, 10)]
+    );
+
+    if (updateRideOfferQuery.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ 
+        error: "Ride offer not found or status cannot transition to arrived (must be pending)." 
+      });
+    }
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      message: "Driver arrival state initialized and committed successfully.",
+      ride_offer: updateRideOfferQuery.rows[0]
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ TRANSACTION ARREST: ARRIVAL SYSTEM FAULT:", err.message);
+    return res.status(500).json({ error: "Internal exception processing driver status updates." });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+// POST: /api/rides/complete
+router.post("/api/rides/complete", async (req, res) => {
+  const { ride_offer_id } = req.body;
+
+  if (!ride_offer_id) {
+    return res.status(400).json({ error: "Missing ride_offer_id parameter vector." });
+  }
+
+  try {
+    // 1. Fetch metadata package matching current corridor ride profile
+    const offerCheck = await db.query(
+      "SELECT price_per_seat FROM ride_offers WHERE id = $1",
+      [ride_offer_id]
+    );
+
+    if (offerCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Ride offer profile instance not found." });
+    }
+
+    const pricePerSeat = parseFloat(offerCheck.rows[0].price_per_seat) || 0;
+
+    // 2. Count current confirmed passengers actively checked in on-board
+    const passengerCountCheck = await db.query(
+      "SELECT COUNT(*) FROM lookups_passengers WHERE ride_offer_id = $1 AND status != 'cancelled'",
+      [ride_offer_id]
+    );
+    
+    const activeSeatsFilled = parseInt(passengerCountCheck.rows[0].count, 10) || 0;
+    
+    // 3. Compute final gross ledger revenue calculation
+    const calculatedFinalPrice = activeSeatsFilled * pricePerSeat;
+
+    // 4. Record calculation and switch state in a single query transaction block
+    const updateResult = await db.query(
+      `UPDATE ride_offers 
+       SET status = 'completed', 
+           final_price = $1,
+           updated_at = NOW() 
+       WHERE id = $2 
+       RETURNING id, status, final_price`,
+      [calculatedFinalPrice, ride_offer_id]
+    );
+
+    console.log(`🏁 Corridor #${ride_offer_id} closed successfully. Final price recorded: ETB ${calculatedFinalPrice}`);
+
+    return res.status(200).json({
+      message: "Corridor trip successfully closed out.",
+      rideOfferId: updateResult.rows[0].id,
+      status: updateResult.rows[0].status,
+      finalPrice: parseFloat(updateResult.rows[0].final_price)
+    });
+
+  } catch (err) {
+    console.error("Database operational fault inside completion execution:", err);
+    return res.status(500).json({ error: "Internal server synchronization core routing error." });
+  }
+});
+
+
+
+
+
+
+
+
+
 
 
 
