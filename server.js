@@ -567,7 +567,6 @@ app.post("/api/rides/create", async (req, res) => {
     );
 
     if (activeOfferCheck.rows.length > 0) {
-      // Rollback immediately to prevent execution lock leaking
       await client.query("ROLLBACK");
       return res.status(400).json({ 
         error: `Unacceptable overlap: Driver already has an active corridor trip running (Offer ID #${activeOfferCheck.rows[0].id} is currently '${activeOfferCheck.rows[0].status}').` 
@@ -597,20 +596,26 @@ app.post("/api/rides/create", async (req, res) => {
     const pricePerSeat = routeData.base_price;
     const seatsCount = total_seats || 4;
 
-    // 4. Safe Insertion: This will only execute if the check above returned 0 active rows
+    // 4. Safe Insertion: Initializing ride offer status to 'pending' with empty accepted passengers
     const rideOfferQuery = await client.query(
       `INSERT INTO ride_offers (driver_id, vehicle_id, route_id, start_location, end_location, 
-        departure_time, total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, $7, $8, $9, $10, 'pending', CURRENT_TIMESTAMP)
+        departure_time, total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng, status, accepted_passengers, created_at)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, $7, $8, $9, $10, 'pending', '{}', CURRENT_TIMESTAMP)
        RETURNING id AS offer_id, status;`,
       [driver_id, vehicle_id || null, route_id, startLoc, endLoc, seatsCount, seatsCount, pricePerSeat, routeData.start_lat, routeData.start_lng]
     );
     const newOffer = rideOfferQuery.rows[0];
 
-    // 5. Link queue users to the newly initialized session container
+    // 5. 🎯 BIND MATCHED PASSENGERS ONLY
+    // Link queue users to the newly initialized session container via matched_ride_offer_id
     const matchQueueQuery = await client.query(
-      `UPDATE route_pool SET status = 'matched' WHERE route_id = $1 AND status = 'searching' RETURNING id, user_id;`,
-      [route_id]
+      `UPDATE route_pool 
+       SET status = 'matched',
+           matched_ride_offer_id = $1 
+       WHERE route_id = $2 
+         AND status = 'searching' 
+       RETURNING id, user_id;`,
+      [newOffer.offer_id, route_id]
     );
 
     const passengerCount = matchQueueQuery.rows.length;
@@ -636,11 +641,10 @@ app.post("/api/rides/create", async (req, res) => {
     await client.query("ROLLBACK");
     console.error("❌ Error executing dynamic ride creator:", err.message);
     return res.status(500).json({ error: "Internal server error deploying live ride offer matrix." });
-  } finally {
+  } {
     client.release();
   }
 });
-
 /* ===========================================================================
    📈 6. ANALYTICS & LOGGING HUD MATRIX ENGINES
 =========================================================================== */
