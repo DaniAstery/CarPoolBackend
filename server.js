@@ -1158,61 +1158,58 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
 });
 
 
-app.get("/api/rides/track-live/offer/:offerId", async (req, res) => {
-  const { offerId } = req.params;
+app.get("/api/rides/track-live/offer/:id", async (req, res) => {
+  const rideOfferId = parseInt(req.params.id, 10);
+
+  if (isNaN(rideOfferId)) {
+    return res.status(400).json({ error: "Invalid structural tracking ID parameter vector." });
+  }
 
   try {
-    // 1. Fetch overall trip metadata and real-time driver coordinates
+    // 1. Fetch current macro metrics for the target offering instance row
     const offerQuery = await pool.query(
-      `SELECT status, pickup_lat, pickup_lng, accepted_passengers
+      `SELECT id, status, price_per_seat, pickup_lat, pickup_lng 
        FROM ride_offers 
        WHERE id = $1`,
-      [parseInt(offerId, 10)]
+      [rideOfferId]
     );
 
     if (offerQuery.rows.length === 0) {
-      return res.status(404).json({ error: "Ride offer execution block not found." });
+      return res.status(404).json({ error: "Target Corridor Offer profile index not found." });
     }
 
-    const offerRow = offerQuery.rows[0];
+    const offer = offerQuery.rows[0];
 
-    // 2. 🎯 UNNEST & LEFT JOIN: Unroll the integer array and link live route_pool status
-    const manifestQuery = await pool.query(
-      `SELECT 
-         unrolled.passenger_id AS user_id,
-         COALESCE(rp.status, 'Accepted') AS dynamic_status
-       FROM (
-         SELECT UNNEST(accepted_passengers) AS passenger_id
-         FROM ride_offers
-         WHERE id = $1
-       ) unrolled
-       LEFT JOIN route_pool rp 
-         ON rp.user_id = unrolled.passenger_id 
-        AND rp.matched_ride_offer_id = $1`,
-      [parseInt(offerId, 10)]
+    // 2. Fetch all co-riders currently linked to this offer inside route_pool
+    const passengersQuery = await pool.query(
+      `SELECT user_id, status 
+       FROM route_pool 
+       WHERE matched_ride_offer_id = $1`,
+      [rideOfferId]
     );
 
-    // 3. Return a clean, scannable structural map to your React Native view
-    return res.json({
-      rideOfferId: parseInt(offerId, 10),
-      rideStatus: offerRow.status,
+    // 3. Format payload payload structure matching your client JSON specifications exactly
+    const trackingPayload = {
+      rideOfferId: offer.id,
+      rideStatus: offer.status, // e.g. 'accepted', 'arrived', 'completed'
+      price_per_seat: offer.price_per_seat,
       driverLocation: {
-        // Fall back to pickup hub if real-time tracking points are null
-        latitude: parseFloat(offerRow.pickup_lat) || 9.0115,
-        longitude: parseFloat(offerRow.pickup_lng) || 38.7945
+        latitude: parseFloat(offer.pickup_lat) || 9.0106,
+        longitude: parseFloat(offer.pickup_lng) || 38.7894
       },
-      passengers: manifestQuery.rows.map(p => ({
-        userId: p.user_id,
-        status: p.dynamic_status // Dynamically yields 'arrived', 'accepted', etc.
+      passengers: passengersQuery.rows.map(row => ({
+        userId: parseInt(row.user_id, 10),
+        status: row.status // e.g. 'matched', 'arrived'
       }))
-    });
+    };
+
+    return res.status(200).json(trackingPayload);
 
   } catch (err) {
-    console.error("❌ Telemetry execution query breakdown:", err.stack);
-    return res.status(500).json({ error: "Internal server telemetry parsing fault." });
+    console.error("Telemetry engine failure:", err);
+    return res.status(500).json({ error: "Internal server telemetry data retrieval error." });
   }
 });
-
 
 /**
  * 🔄 1. GET ACTIVE ASSIGNMENT PROPOSAL FOR DRIVER
