@@ -1524,72 +1524,65 @@ app.post("/api/rides/arrive", async (req, res) => {
 
 
 // POST: /api/rides/complete
-router.post("/api/rides/complete", async (req, res) => {
+
+app.post("/api/rides/complete", async (req, res) => {
   const { ride_offer_id } = req.body;
 
   if (!ride_offer_id) {
-    return res.status(400).json({ error: "Missing ride_offer_id parameter vector." });
+    return res.status(400).json({ error: "Missing ride_offer_id parameters." });
   }
 
   try {
-    // 1. Fetch metadata package matching current corridor ride profile
-    const offerCheck = await db.query(
+    // 1. Fetch base pricing configuration directly from the database row
+    const offerCheck = await pool.query(
       "SELECT price_per_seat FROM ride_offers WHERE id = $1",
       [ride_offer_id]
     );
 
     if (offerCheck.rows.length === 0) {
-      return res.status(404).json({ error: "Ride offer profile instance not found." });
+      return res.status(404).json({ error: "Ride offer target profile instance not found." });
     }
 
     const pricePerSeat = parseFloat(offerCheck.rows[0].price_per_seat) || 0;
 
-    // 2. Count current confirmed passengers actively checked in on-board
-    const passengerCountCheck = await db.query(
-      "SELECT COUNT(*) FROM lookups_passengers WHERE ride_offer_id = $1 AND status != 'cancelled'",
+    // 2. Synchronize associated users to 'completed'
+    const passengerUpdate = await pool.query(
+      `UPDATE route_pool 
+       SET status = 'completed'
+       WHERE matched_ride_offer_id = $1
+       RETURNING id, user_id, status`,
       [ride_offer_id]
     );
-    
-    const activeSeatsFilled = parseInt(passengerCountCheck.rows[0].count, 10) || 0;
-    
-    // 3. Compute final gross ledger revenue calculation
-    const calculatedFinalPrice = activeSeatsFilled * pricePerSeat;
 
-    // 4. Record calculation and switch state in a single query transaction block
-    const updateResult = await db.query(
+    const completedRidersCount = passengerUpdate.rowCount || 0;
+    const calculatedFinalPrice = completedRidersCount * pricePerSeat;
+
+    // 3. Finalize parent driver offer row state to 'completed'
+    const offerUpdate = await pool.query(
       `UPDATE ride_offers 
        SET status = 'completed', 
-           final_price = $1,
-           updated_at = NOW() 
+           final_price = $1
        WHERE id = $2 
        RETURNING id, status, final_price`,
       [calculatedFinalPrice, ride_offer_id]
     );
 
-    console.log(`🏁 Corridor #${ride_offer_id} closed successfully. Final price recorded: ETB ${calculatedFinalPrice}`);
+    console.log(`🏁 Transactional Lifecycle Sealed for Corridor Run ID #${ride_offer_id}:`);
+    console.log(`   🔹 ride_offers status -> completed (final_price: ETB ${calculatedFinalPrice})`);
+    console.log(`   🔹 route_pool passengers -> ${completedRidersCount} records synchronized`);
 
     return res.status(200).json({
-      message: "Corridor trip successfully closed out.",
-      rideOfferId: updateResult.rows[0].id,
-      status: updateResult.rows[0].status,
-      finalPrice: parseFloat(updateResult.rows[0].final_price)
+      message: "Corridor parameters successfully updated to completed state profiles.",
+      rideOffer: offerUpdate.rows[0],
+      updatedRidersCount: completedRidersCount,
+      finalPrice: calculatedFinalPrice
     });
 
   } catch (err) {
-    console.error("Database operational fault inside completion execution:", err);
-    return res.status(500).json({ error: "Internal server synchronization core routing error." });
+    console.error("Database operational fault inside completion transaction execution:", err);
+    return res.status(500).json({ error: "Internal database tracking matrix generation runtime fault." });
   }
 });
-
-
-
-
-
-
-
-
-
-
 
 
 
