@@ -547,6 +547,7 @@ app.post("/api/rides/create", async (req, res) => {
       return res.status(400).json({ error: "Missing driver_id or route_id parameters." });
     }
 
+    // 1. Fetch profiles cleanly outside the write transaction block
     const driverProfileQuery = await pool.query(`SELECT full_name FROM users WHERE id = $1 LIMIT 1`, [driver_id]);
     const vehicleQuery = await pool.query(`SELECT make, model FROM vehicles WHERE driver_id = $1 LIMIT 1`, [driver_id]);
 
@@ -554,8 +555,26 @@ app.post("/api/rides/create", async (req, res) => {
     const carMake = vehicleQuery.rows[0]?.make || "Corridor";
     const carModel = vehicleQuery.rows[0]?.model || "Vehicle";
 
+    // 🚨 BEGIN TRANSACTION BLOCK
     await client.query("BEGIN");
 
+    // 2. CRITICAL CONSTRAINT CHECK: Prevent concurrent active ride offers for this driver
+    const activeOfferCheck = await client.query(
+      `SELECT id, status FROM ride_offers 
+       WHERE driver_id = $1 AND status != 'completed'
+       LIMIT 1;`,
+      [driver_id]
+    );
+
+    if (activeOfferCheck.rows.length > 0) {
+      // Rollback immediately to prevent execution lock leaking
+      await client.query("ROLLBACK");
+      return res.status(400).json({ 
+        error: `Unacceptable overlap: Driver already has an active corridor trip running (Offer ID #${activeOfferCheck.rows[0].id} is currently '${activeOfferCheck.rows[0].status}').` 
+      });
+    }
+
+    // 3. Collect Route and Geometry layout paths
     const routeGeomQuery = await client.query(
       `SELECT r.base_price, ARRAY_AGG(h.name ORDER BY rs.stop_order) AS stops,
         (ARRAY_AGG(h.latitude ORDER BY rs.stop_order))[1] AS start_lat,
@@ -578,6 +597,7 @@ app.post("/api/rides/create", async (req, res) => {
     const pricePerSeat = routeData.base_price;
     const seatsCount = total_seats || 4;
 
+    // 4. Safe Insertion: This will only execute if the check above returned 0 active rows
     const rideOfferQuery = await client.query(
       `INSERT INTO ride_offers (driver_id, vehicle_id, route_id, start_location, end_location, 
         departure_time, total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng, status, created_at)
@@ -587,15 +607,18 @@ app.post("/api/rides/create", async (req, res) => {
     );
     const newOffer = rideOfferQuery.rows[0];
 
+    // 5. Link queue users to the newly initialized session container
     const matchQueueQuery = await client.query(
       `UPDATE route_pool SET status = 'matched' WHERE route_id = $1 AND status = 'searching' RETURNING id, user_id;`,
       [route_id]
     );
 
     const passengerCount = matchQueueQuery.rows.length;
+    
+    // Everything validated and executed successfully -> commit changes permanently
     await client.query("COMMIT");
 
-    res.status(201).json({
+    return res.status(201).json({
       message: "Corridor pool initialized dynamically.",
       ride_id: newOffer.offer_id,
       status: newOffer.status,
@@ -612,7 +635,7 @@ app.post("/api/rides/create", async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ Error executing dynamic ride creator:", err.message);
-    res.status(500).json({ error: "Internal server error deploying live ride offer matrix." });
+    return res.status(500).json({ error: "Internal server error deploying live ride offer matrix." });
   } finally {
     client.release();
   }
@@ -1398,6 +1421,7 @@ app.post('/api/rides/driver-decline', async (req, res) => {
 });
 
 
+
 app.get('/api/rides/driver-active-session/:driverId', async (req, res) => {
   const { driverId } = req.params;
 
@@ -1406,25 +1430,39 @@ app.get('/api/rides/driver-active-session/:driverId', async (req, res) => {
       SELECT id, status, route_id 
       FROM ride_offers 
       WHERE driver_id = $1 
-        AND status IN ('accepted', 'arrived', 'ontrip')
+        AND status IN ('pending', 'accepted', 'arrived', 'inprogress') -- Added 'pending' & synced 'inprogress'
       ORDER BY created_at DESC 
       LIMIT 1;
     `;
     const result = await pool.query(query, [parseInt(driverId, 10)]);
 
     if (result.rows.length > 0) {
+      const session = result.rows[0];
+      const normalizedStatus = session.status.toLowerCase();
+      let targetScreen = "WaitingForRiders"; // Default fallback route targeting initial state
+
+      // 🗺️ State Routing Resolution Matrix
+      if (normalizedStatus === "pending") {
+        targetScreen = "WaitingForRidersScreen"; // 👈 Your target screen anchor
+      } else if (normalizedStatus === "accepted" || normalizedStatus === "arrived") {
+        targetScreen = "NavigateToPickup"; 
+      } else if (normalizedStatus === "inprogress" || normalizedStatus === "ontrip") {
+        targetScreen = "TripInProgress";
+      }
+
       return res.json({
         hasActiveSession: true,
-        rideOfferId: result.rows[0].id,
-        status: result.rows[0].status,
-        routeId: result.rows[0].route_id
+        rideOfferId: session.id,
+        status: session.status,
+        routeId: session.route_id,
+        targetScreen: targetScreen // Passes the exact navigation mapping string vector
       });
     }
 
     return res.json({ hasActiveSession: false });
   } catch (err) {
     console.error("Gatekeeper session verification failure:", err);
-    res.status(500).json({ error: "Internal session state sync error." });
+    return res.status(500).json({ error: "Internal session state sync error." });
   }
 });
 
