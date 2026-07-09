@@ -456,58 +456,41 @@ app.post("/api/rides/join-pool", async (req, res) => {
 
 
 
-// POST /api/rides/start-trip
-app.post("/api/rides/start-trip", async (req, res) => {
-  const client = await pool.connect();
+// POST /api/rides/start
+app.post("/api/rides/start", async (req, res) => {
+  const { rideOfferId, routeId } = req.body;
+
   try {
-    const { ride_offer_id } = req.body;
+    console.log(`🎬 Initiating active trip for Ride Offer ID: ${rideOfferId}`);
 
-    if (!ride_offer_id) {
-      return res.status(400).json({ error: "Missing ride_offer_id parameter." });
-    }
-
-    await client.query("BEGIN");
-
-    // 🎯 FIX: Cast database status to lowercase to prevent string-casing mismatches
-    const updateOffer = await client.query(
+    // 🎯 FIX: Changed status value from 'inTransit' to 'in_trip'
+    const updateResult = await pool.query(
       `UPDATE ride_offers 
-       SET status = 'inTransit' 
-       WHERE id = $1 AND LOWER(status) = 'arrived'
-       RETURNING id, status;`,
-      [parseInt(ride_offer_id, 10)]
+       SET status = 'in_trip', 
+           updated_at = NOW() 
+       WHERE id = $1 
+       RETURNING id, route_id, status, driver_id;`,
+      [rideOfferId]
     );
 
-    if (updateOffer.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ 
-        error: "Ride offer not found or must be in 'arrived' status to start." 
-      });
+    if (updateResult.rows.length === 0) {
+      return res.status(404).json({ error: "Ride offer not found or failed to initialize." });
     }
 
-    // Update the route pool safely
-    await client.query(
-      `UPDATE route_pool 
-       SET status = 'inTransit' 
-       WHERE matched_ride_offer_id = $1 AND LOWER(status) = 'matched';`,
-      [parseInt(ride_offer_id, 10)]
-    );
-
-    await client.query("COMMIT");
+    const updatedOffer = updateResult.rows[0];
+    console.log(`✅ State Engine Updated: Row #${updatedOffer.id} is now [${updatedOffer.status}]`);
 
     return res.status(200).json({
-      message: "Corridor trip successfully transitioned to transit matrix.",
-      ride_offer: updateOffer.rows[0]
+      success: true,
+      message: "Trip successfully initialized.",
+      rideOffer: updatedOffer
     });
 
   } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ TRANSACTION ARREST: START TRIP FAULT:", err.message);
-    return res.status(500).json({ error: "Internal database exception starting trip." });
-  } finally {
-    client.release();
+    console.error("❌ Critical Failure inside /start endpoint:", err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
-
 
 
 
