@@ -475,7 +475,7 @@ app.post("/api/rides/start-trip", async (req, res) => {
     const updateOffer = await client.query(
       `UPDATE ride_offers 
        SET status = 'in_trip',
-           updated_at = NOW()
+           created_at = NOW()
        WHERE id = $1 AND TRIM(LOWER(status)) = 'arrived'
        RETURNING id, status, route_id, driver_id;`,
       [parsedRideId]
@@ -496,7 +496,7 @@ app.post("/api/rides/start-trip", async (req, res) => {
     const poolUpdate = await client.query(
       `UPDATE route_pool 
        SET status = 'in_trip',
-           updated_at = NOW()
+           joined_at = NOW()
        WHERE matched_ride_offer_id = $1 AND TRIM(LOWER(status)) = 'matched'
        RETURNING id;`,
       [parsedRideId]
@@ -1552,51 +1552,55 @@ app.post('/api/rides/driver-decline', async (req, res) => {
 
 
 
-app.get('/api/rides/driver-active-session/:driverId', async (req, res) => {
-  const { driverId } = req.params;
-
+// GET /api/rides/driver-active-session/:driverId
+app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
   try {
-    const query = `
-      SELECT id, status, route_id 
-      FROM ride_offers 
-      WHERE driver_id = $1 
-        AND status IN ('pending', 'accepted', 'arrived', 'inprogress') -- Added 'pending' & synced 'inprogress'
-      ORDER BY created_at DESC 
-      LIMIT 1;
-    `;
-    const result = await pool.query(query, [parseInt(driverId, 10)]);
+    const { driverId } = req.params;
+    const parsedDriverId = parseInt(driverId, 10);
 
-    if (result.rows.length > 0) {
-      const session = result.rows[0];
-      const normalizedStatus = session.status.toLowerCase();
-      let targetScreen = "WaitingForRiders"; // Default fallback route targeting initial state
+    console.log(`📡 [GATEKEEPER] Verifying active session state for Driver ID: ${parsedDriverId}`);
 
-      // 🗺️ State Routing Resolution Matrix
-      if (normalizedStatus === "pending") {
-        targetScreen = "WaitingForRidersScreen"; // 👈 Your target screen anchor
-      } else if (normalizedStatus === "accepted" || normalizedStatus === "arrived") {
-        targetScreen = "NavigateToPickup"; 
-      } else if (normalizedStatus === "inprogress" || normalizedStatus === "ontrip") {
-        targetScreen = "TripInProgress";
-      }
+    if (isNaN(parsedDriverId)) {
+      return res.status(400).json({ error: "Invalid driver tracking identifier format." });
+    }
 
-      return res.json({
-        hasActiveSession: true,
-        rideOfferId: session.id,
-        status: session.status,
-        routeId: session.route_id,
-        targetScreen: targetScreen // Passes the exact navigation mapping string vector
+    // 🎯 LOOKUP: Grab the latest row that is NOT completed or cancelled
+    const result = await pool.query(
+      `SELECT id, route_id, status, driver_id 
+       FROM ride_offers 
+       WHERE driver_id = $1 
+         AND TRIM(LOWER(status)) NOT IN ('cancelled', 'completed')
+       ORDER BY created_at DESC 
+       LIMIT 1;`,
+      [parsedDriverId]
+    );
+
+    console.log(`📊 [GATEKEEPER DB] Rows matching active state filters: ${result.rows.length}`);
+
+    if (result.rows.length === 0) {
+      return res.status(200).json({ 
+        hasActiveSession: false,
+        reason: `No uncompleted session profiles found for driver #${parsedDriverId}`
       });
     }
 
-    return res.json({ hasActiveSession: false });
+    const activeOffer = result.rows[0];
+    console.log(`🚀 [GATEKEEPER MATCH] Found active trip row #${activeOffer.id} with status: [${activeOffer.status}]`);
+
+    // Clean JSON payload structure mapping straight to the frontend switch matrix
+    return res.status(200).json({
+      hasActiveSession: true,
+      rideOfferId: activeOffer.id,
+      routeId: activeOffer.route_id,
+      status: activeOffer.status.trim(), // Will return 'in_trip' perfectly
+      driverId: activeOffer.driver_id
+    });
+
   } catch (err) {
-    console.error("Gatekeeper session verification failure:", err);
-    return res.status(500).json({ error: "Internal session state sync error." });
+    console.error("❌ CRITICAL GATEKEEPER SERVICE FAULT:", err.message);
+    return res.status(500).json({ error: `Internal status synchronization error: ${err.message}` });
   }
 });
-
-
 
 
 
