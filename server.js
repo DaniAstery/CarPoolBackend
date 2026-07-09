@@ -1671,19 +1671,20 @@ app.post("/api/rides/arrive", async (req, res) => {
 
 
 // GET /api/rides/driver-active-session/:driverId
-// GET /api/rides/driver-active-session/:driverId
+// Ensure your route definition matches your parameter extraction name!
 app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
   try {
-    const { driverId } = req.params;
-    const parsedDriverId = parseInt(driverId, 10);
+    // 🛡️ Fallback extraction: Checks for both ':driverId' and generic ':id'
+    const rawDriverId = req.params.driverId || req.params.id;
+    const parsedDriverId = parseInt(rawDriverId, 10);
 
-    console.log(`📡 [GATEKEEPER ALERT] Intercepting session validation check for Driver ID: ${parsedDriverId}`);
+    console.log(`🔎 GATEKEEPER DEBUG -> Incoming Raw Parameter: "${rawDriverId}" | Parsed As: ${parsedDriverId}`);
 
-    if (isNaN(parsedDriverId)) {
-      return res.status(400).json({ error: "Invalid driver tracking parameter format specified." });
+    if (!parsedDriverId || isNaN(parsedDriverId)) {
+      return res.status(400).json({ error: "Driver ID tracking parameter is missing or invalid syntax." });
     }
 
-    // 🎯 QUERY: Dynamically identify the latest running session row for this driver
+    // Direct, cast-validated parameter entry query
     const result = await pool.query(
       `SELECT id, route_id, status, driver_id 
        FROM ride_offers 
@@ -1694,33 +1695,31 @@ app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
       [parsedDriverId]
     );
 
-    console.log(`📊 [GATEKEEPER DATABASE RESPONSE] Matching active records found: ${result.rows.length}`);
+    console.log(`📊 DATABASE QUANTITY CHECK -> Found rows matching criteria: ${result.rows.length}`);
 
     if (result.rows.length === 0) {
       return res.status(200).json({ 
         hasActiveSession: false,
-        reason: `No uncompleted session profiles active for driver profile #${parsedDriverId}`
+        reason: `Zero matching uncompleted rows inside database for driver_id: ${parsedDriverId}`
       });
     }
 
     const activeOffer = result.rows[0];
-    console.log(`🚀 [GATEKEEPER MATRIX MATCH] Found running row #${activeOffer.id} with status: [${activeOffer.status}]`);
+    console.log(`🚀 TARGET ACQUIRED -> Found row #${activeOffer.id} matching active status [${activeOffer.status}]`);
 
     return res.status(200).json({
       hasActiveSession: true,
       rideOfferId: activeOffer.id,
       routeId: activeOffer.route_id,
-      status: activeOffer.status, // Safely returns "inTransit"
+      status: activeOffer.status, // Passes 'inTransit' up cleanly
       driverId: activeOffer.driver_id
     });
 
   } catch (err) {
-    console.error("❌ CRITICAL BACKEND GATEWAY EXCEPTION:", err.message);
-    return res.status(500).json({ error: `Internal state synchronization malfunction: ${err.message}` });
+    console.error("❌ BACKEND RUNTIME EXCEPTION:", err.message);
+    return res.status(500).json({ error: `Internal state engine crash: ${err.message}` });
   }
 });
-
-// POST: /api/rides/complete
 
 app.post("/api/rides/complete", async (req, res) => {
   const { ride_offer_id } = req.body;
