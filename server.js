@@ -1672,23 +1672,29 @@ app.post("/api/rides/arrive", async (req, res) => {
 //get accepted ride_offer for the driver to arrive and start the trip
 app.get("/api/rides/active-accepted-offer", async (req, res) => {
   try {
-    // Look up the most recent ride offer whose state is strictly 'accepted'
-    const queryResult = await pool.query(
-      `SELECT id, status 
+    // Assuming you pull the driver_id from auth middleware. 
+    // Using a fallback for testing if middleware isn't present.
+    const driverId = req.user?.id || 1; 
+
+    // 🎯 FIX: Query rows that are either 'accepted' OR 'arrived'
+    const result = await pool.query(
+      `SELECT id, route_id, status 
        FROM ride_offers 
-       WHERE status = 'accepted' 
+       WHERE driver_id = $1 
+         AND LOWER(status) IN ('accepted', 'arrived')
        ORDER BY created_at DESC 
-       LIMIT 1;`
+       LIMIT 1;`,
+      [driverId]
     );
 
-    if (queryResult.rows.length === 0) {
-      return res.status(404).json({ error: "No active accepted ride offer found." });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "No active pickup phase offers found." });
     }
 
-    return res.json(queryResult.rows[0]);
+    return res.json(result.rows[0]);
   } catch (err) {
-    console.error("❌ FAILED TO DISCOVER ACCEPTED OFFER:", err.message);
-    return res.status(500).json({ error: "Internal server registry breakdown." });
+    console.error("Discovery endpoint error:", err.message);
+    return res.status(500).json({ error: "Internal server error during status discovery." });
   }
 });
 
