@@ -1669,39 +1669,54 @@ app.post("/api/rides/arrive", async (req, res) => {
   }
 });
 
-//get accepted ride_offer for the driver to arrive and start the trip
+
+// GET /api/rides/driver-active-session/:driverId
 // GET /api/rides/driver-active-session/:driverId
 app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
   try {
     const { driverId } = req.params;
+    const parsedDriverId = parseInt(driverId, 10);
 
-    // 🎯 FIX: Force LOWER() on the column to catch 'inTransit' (camelCase) safely
+    console.log(`📡 [GATEKEEPER ALERT] Intercepting session validation check for Driver ID: ${parsedDriverId}`);
+
+    if (isNaN(parsedDriverId)) {
+      return res.status(400).json({ error: "Invalid driver tracking parameter format specified." });
+    }
+
+    // 🎯 QUERY: Dynamically identify the latest running session row for this driver
     const result = await pool.query(
-      `SELECT id, route_id, status 
+      `SELECT id, route_id, status, driver_id 
        FROM ride_offers 
        WHERE driver_id = $1 
          AND LOWER(status) NOT IN ('cancelled', 'completed')
        ORDER BY created_at DESC 
        LIMIT 1;`,
-      [parseInt(driverId, 10)]
+      [parsedDriverId]
     );
 
+    console.log(`📊 [GATEKEEPER DATABASE RESPONSE] Matching active records found: ${result.rows.length}`);
+
     if (result.rows.length === 0) {
-      return res.status(200).json({ hasActiveSession: false });
+      return res.status(200).json({ 
+        hasActiveSession: false,
+        reason: `No uncompleted session profiles active for driver profile #${parsedDriverId}`
+      });
     }
 
     const activeOffer = result.rows[0];
+    console.log(`🚀 [GATEKEEPER MATRIX MATCH] Found running row #${activeOffer.id} with status: [${activeOffer.status}]`);
 
     return res.status(200).json({
       hasActiveSession: true,
       rideOfferId: activeOffer.id,
       routeId: activeOffer.route_id,
-      status: activeOffer.status // Will return 'inTransit' cleanly
+      status: activeOffer.status, // Safely returns "inTransit"
+      driverId: activeOffer.driver_id
     });
 
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message });
+    console.error("❌ CRITICAL BACKEND GATEWAY EXCEPTION:", err.message);
+    return res.status(500).json({ error: `Internal state synchronization malfunction: ${err.message}` });
   }
 });
 
