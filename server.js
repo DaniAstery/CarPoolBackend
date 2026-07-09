@@ -454,6 +454,63 @@ app.post("/api/rides/join-pool", async (req, res) => {
   }
 });
 
+
+
+// POST /api/rides/start-trip
+app.post("/api/rides/start-trip", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { ride_offer_id } = req.body;
+
+    if (!ride_offer_id) {
+      return res.status(400).json({ error: "Missing ride_offer_id parameter." });
+    }
+
+    await client.query("BEGIN");
+
+    // 🎯 FIX: Cast database status to lowercase to prevent string-casing mismatches
+    const updateOffer = await client.query(
+      `UPDATE ride_offers 
+       SET status = 'inTransit' 
+       WHERE id = $1 AND LOWER(status) = 'arrived'
+       RETURNING id, status;`,
+      [parseInt(ride_offer_id, 10)]
+    );
+
+    if (updateOffer.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ 
+        error: "Ride offer not found or must be in 'arrived' status to start." 
+      });
+    }
+
+    // Update the route pool safely
+    await client.query(
+      `UPDATE route_pool 
+       SET status = 'inTransit' 
+       WHERE matched_ride_offer_id = $1 AND LOWER(status) = 'matched';`,
+      [parseInt(ride_offer_id, 10)]
+    );
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      message: "Corridor trip successfully transitioned to transit matrix.",
+      ride_offer: updateOffer.rows[0]
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ TRANSACTION ARREST: START TRIP FAULT:", err.message);
+    return res.status(500).json({ error: "Internal database exception starting trip." });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
 /* ===========================================================================
    🚖 5. DRIVER OPERATIONAL CONTROLLERS
 =========================================================================== */
@@ -1699,6 +1756,7 @@ app.post("/api/rides/complete", async (req, res) => {
     return res.status(500).json({ error: "Internal database tracking matrix generation runtime fault." });
   }
 });
+
 
 
 
