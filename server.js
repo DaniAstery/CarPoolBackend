@@ -461,53 +461,70 @@ app.post("/api/rides/start-trip", async (req, res) => {
   const client = await pool.connect();
   try {
     const { ride_offer_id } = req.body;
+    const parsedRideId = parseInt(ride_offer_id, 10);
 
-    if (!ride_offer_id) {
-      return res.status(400).json({ error: "Missing ride_offer_id parameter." });
+    console.log(`🎬 [START TRIP] Request received for Ride Offer ID: ${ride_offer_id} (Parsed: ${parsedRideId})`);
+
+    if (!parsedRideId || isNaN(parsedRideId)) {
+      return res.status(400).json({ error: "Missing or invalid ride_offer_id parameter format." });
     }
 
     await client.query("BEGIN");
 
-    // 🎯 FIX: Cast database status to lowercase to prevent string-casing mismatches
+    // 🎯 UPGRADE 1: Trim and normalize state tracking strings, updating to standard 'in_trip'
     const updateOffer = await client.query(
       `UPDATE ride_offers 
-       SET status = 'in_transit' 
-       WHERE id = $1 AND LOWER(status) = 'arrived'
-       RETURNING id, status;`,
-      [parseInt(ride_offer_id, 10)]
+       SET status = 'in_trip',
+           updated_at = NOW()
+       WHERE id = $1 AND TRIM(LOWER(status)) = 'arrived'
+       RETURNING id, status, route_id, driver_id;`,
+      [parsedRideId]
     );
 
     if (updateOffer.rows.length === 0) {
       await client.query("ROLLBACK");
+      console.log(`⚠️ [START TRIP REJECTION] Row #${parsedRideId} not found or status was not 'arrived'.`);
       return res.status(404).json({ 
-        error: "Ride offer not found or must be in 'arrived' status to start." 
+        error: "Ride offer not found or current status is not 'arrived'. Cannot transition to trip state." 
       });
     }
 
-    // Update the route pool safely
-    await client.query(
-        `UPDATE route_pool 
-        SET status = 'in_transit' 
-       WHERE matched_ride_offer_id = $1 AND LOWER(status) = 'matched';`,
-      [parseInt(ride_offer_id, 10)]
+    const activeOffer = updateOffer.rows[0];
+    console.log(`✅ [START TRIP] ride_offers row #${activeOffer.id} successfully updated to [${activeOffer.status}]`);
+
+    // 🎯 UPGRADE 2: Update route_pool records using clean, trim-safe casing matching
+    const poolUpdate = await client.query(
+      `UPDATE route_pool 
+       SET status = 'in_trip',
+           updated_at = NOW()
+       WHERE matched_ride_offer_id = $1 AND TRIM(LOWER(status)) = 'matched'
+       RETURNING id;`,
+      [parsedRideId]
     );
+
+    console.log(`👥 [START TRIP] Synchronized ${poolUpdate.rows.length} passenger pool entries to 'in_trip' matrix.`);
 
     await client.query("COMMIT");
 
     return res.status(200).json({
+      success: true,
       message: "Corridor trip successfully transitioned to transit matrix.",
-      ride_offer: updateOffer.rows[0]
+      ride_offer: {
+        id: activeOffer.id,
+        status: activeOffer.status.trim(), // Strip any legacy column layout spacing safely
+        routeId: activeOffer.route_id,
+        driverId: activeOffer.driver_id
+      }
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ TRANSACTION ARREST: START TRIP FAULT:", err.message);
-    return res.status(500).json({ error: "Internal database exception starting trip." });
+    return res.status(500).json({ error: "Internal database state validation exception starting trip." });
   } finally {
     client.release();
   }
 });
-
 
 
 
