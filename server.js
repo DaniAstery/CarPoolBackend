@@ -456,41 +456,58 @@ app.post("/api/rides/join-pool", async (req, res) => {
 
 
 
-// POST /api/rides/start
-app.post("/api/rides/start", async (req, res) => {
-  const { rideOfferId, routeId } = req.body;
-
+// POST /api/rides/start-trip
+app.post("/api/rides/start-trip", async (req, res) => {
+  const client = await pool.connect();
   try {
-    console.log(`🎬 Initiating active trip for Ride Offer ID: ${rideOfferId}`);
+    const { ride_offer_id } = req.body;
 
-    // 🎯 FIX: Changed status value from 'inTransit' to 'in_trip'
-    const updateResult = await pool.query(
-      `UPDATE ride_offers 
-       SET status = 'in_trip', 
-           updated_at = NOW() 
-       WHERE id = $1 
-       RETURNING id, route_id, status, driver_id;`,
-      [rideOfferId]
-    );
-
-    if (updateResult.rows.length === 0) {
-      return res.status(404).json({ error: "Ride offer not found or failed to initialize." });
+    if (!ride_offer_id) {
+      return res.status(400).json({ error: "Missing ride_offer_id parameter." });
     }
 
-    const updatedOffer = updateResult.rows[0];
-    console.log(`✅ State Engine Updated: Row #${updatedOffer.id} is now [${updatedOffer.status}]`);
+    await client.query("BEGIN");
+
+    // 🎯 FIX: Cast database status to lowercase to prevent string-casing mismatches
+    const updateOffer = await client.query(
+      `UPDATE ride_offers 
+       SET status = 'in_transit' 
+       WHERE id = $1 AND LOWER(status) = 'arrived'
+       RETURNING id, status;`,
+      [parseInt(ride_offer_id, 10)]
+    );
+
+    if (updateOffer.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ 
+        error: "Ride offer not found or must be in 'arrived' status to start." 
+      });
+    }
+
+    // Update the route pool safely
+    await client.query(
+        `UPDATE route_pool 
+        SET status = 'in_transit' 
+       WHERE matched_ride_offer_id = $1 AND LOWER(status) = 'matched';`,
+      [parseInt(ride_offer_id, 10)]
+    );
+
+    await client.query("COMMIT");
 
     return res.status(200).json({
-      success: true,
-      message: "Trip successfully initialized.",
-      rideOffer: updatedOffer
+      message: "Corridor trip successfully transitioned to transit matrix.",
+      ride_offer: updateOffer.rows[0]
     });
 
   } catch (err) {
-    console.error("❌ Critical Failure inside /start endpoint:", err.message);
-    return res.status(500).json({ error: err.message });
+    await client.query("ROLLBACK");
+    console.error("❌ TRANSACTION ARREST: START TRIP FAULT:", err.message);
+    return res.status(500).json({ error: "Internal database exception starting trip." });
+  } finally {
+    client.release();
   }
 });
+
 
 
 
@@ -1654,55 +1671,51 @@ app.post("/api/rides/arrive", async (req, res) => {
 
 
 // GET /api/rides/driver-active-session/:driverId
-// Ensure your route definition matches your parameter extraction name!
 app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
   try {
-    // 🛡️ Fallback extraction: Checks for both ':driverId' and generic ':id'
-    const rawDriverId = req.params.driverId || req.params.id;
-    const parsedDriverId = parseInt(rawDriverId, 10);
+    const { driverId } = req.params;
 
-    console.log(`🔎 GATEKEEPER DEBUG -> Incoming Raw Parameter: "${rawDriverId}" | Parsed As: ${parsedDriverId}`);
-
-    if (!parsedDriverId || isNaN(parsedDriverId)) {
-      return res.status(400).json({ error: "Driver ID tracking parameter is missing or invalid syntax." });
+    if (!driverId) {
+      return res.status(400).json({ error: "Missing driverId tracking parameter." });
     }
 
-    // Direct, cast-validated parameter entry query
+    // 🎯 FIX: Force LOWER() handling to ensure camelCase 'inTransit' isn't dropped by strict matches
     const result = await pool.query(
-      `SELECT id, route_id, status, driver_id 
+      `SELECT id, route_id, status 
        FROM ride_offers 
        WHERE driver_id = $1 
          AND LOWER(status) NOT IN ('cancelled', 'completed')
        ORDER BY created_at DESC 
        LIMIT 1;`,
-      [parsedDriverId]
+      [parseInt(driverId, 10)]
     );
 
-    console.log(`📊 DATABASE QUANTITY CHECK -> Found rows matching criteria: ${result.rows.length}`);
-
+    // If no row is open, tell the gatekeeper it's safe to stay on CreateCorridorScreen
     if (result.rows.length === 0) {
       return res.status(200).json({ 
         hasActiveSession: false,
-        reason: `Zero matching uncompleted rows inside database for driver_id: ${parsedDriverId}`
+        message: "No active or ongoing corridor sessions found." 
       });
     }
 
     const activeOffer = result.rows[0];
-    console.log(`🚀 TARGET ACQUIRED -> Found row #${activeOffer.id} matching active status [${activeOffer.status}]`);
+    console.log(`📡 Gateway API serving active offer #${activeOffer.id} with status: [${activeOffer.status}]`);
 
+    // Return the response keys structured for your frontend switch matrix
     return res.status(200).json({
       hasActiveSession: true,
       rideOfferId: activeOffer.id,
       routeId: activeOffer.route_id,
-      status: activeOffer.status, // Passes 'inTransit' up cleanly
-      driverId: activeOffer.driver_id
+      status: activeOffer.status // Passes 'inTransit' straight up
     });
 
   } catch (err) {
-    console.error("❌ BACKEND RUNTIME EXCEPTION:", err.message);
-    return res.status(500).json({ error: `Internal state engine crash: ${err.message}` });
+    console.error("❌ GATEKEEPER SERVICE REJECT:", err.message);
+    return res.status(500).json({ error: `Internal gatekeeper database fault: ${err.message}` });
   }
 });
+
+// POST: /api/rides/complete
 
 app.post("/api/rides/complete", async (req, res) => {
   const { ride_offer_id } = req.body;
