@@ -1612,6 +1612,31 @@ app.post("/api/rides/arrive", async (req, res) => {
   }
 });
 
+//get accepted ride_offer for the driver to arrive and start the trip
+app.get("/api/rides/active-accepted-offer", async (req, res) => {
+  try {
+    // Look up the most recent ride offer whose state is strictly 'accepted'
+    const queryResult = await pool.query(
+      `SELECT id, status 
+       FROM ride_offers 
+       WHERE status = 'accepted' 
+       ORDER BY created_at DESC 
+       LIMIT 1;`
+    );
+
+    if (queryResult.rows.length === 0) {
+      return res.status(404).json({ error: "No active accepted ride offer found." });
+    }
+
+    return res.json(queryResult.rows[0]);
+  } catch (err) {
+    console.error("❌ FAILED TO DISCOVER ACCEPTED OFFER:", err.message);
+    return res.status(500).json({ error: "Internal server registry breakdown." });
+  }
+});
+
+
+
 
 
 // POST: /api/rides/complete
