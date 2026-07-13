@@ -92,6 +92,49 @@ app.get("/api/routes/status/:userId", async (req, res) => {
 });
 
 
+
+// passenger screen status gatewaykeeper 
+
+// 🎯 DEDICATED PASSENGER STATUS LIFECYCLE ENDPOINT
+app.get("/api/passenger/status/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  if (!userId) {
+    return res.status(400).json({ error: "Missing user identification query path." });
+  }
+
+  try {
+    // Read ONLY from route_pool, sorted by latest activity
+    const currentPoolQuery = await pool.query(
+      `SELECT id, matched_ride_offer_id, status, route_id
+       FROM route_pool 
+       WHERE user_id = $1 AND status IN ('searching', 'matched', 'accepted', 'arrived', 'in_trip', 'completed') 
+       ORDER BY joined_at DESC LIMIT 1`,
+      [parseInt(userId, 10)]
+    );
+
+    // If no row exists at all, treat them as idle
+    if (currentPoolQuery.rows.length === 0) {
+      return res.json({ status: "idle" });
+    }
+
+    const activeRow = currentPoolQuery.rows[0];
+
+    // Return the clean structural snapshot directly from route_pool
+    return res.json({
+      status: activeRow.status, // 'searching', 'matched', 'accepted', 'arrived', 'in_trip', 'completed'
+      matched_ride_offer_id: activeRow.matched_ride_offer_id,
+      routeId: activeRow.route_id
+    });
+
+  } catch (err) {
+    console.error("❌ PURE PASSENGER ROUTE POOL RECOVERY ERROR:", err.stack);
+    return res.status(500).json({ error: "Internal exception executing pure passenger status checks." });
+  }
+});
+
+
+
 /* ===========================================================================
    👥 3. CENTRAL CONTINUOUS MATCHING ENGINE (Headcount-Based Allocation)
 =========================================================================== */
@@ -351,7 +394,7 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
 /* ---------------- PASSENGER SIDE: JOIN CORRIDOR WAITING POOL ---------------- */
 // POST /api/routes/join
 app.post("/api/routes/join", async (req, res) => {
-  const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
+  const { route_id, user_id, pickup_hub_id, dropoff_hub_id, ride_offer_id } = req.body;
 
   if (!route_id || !user_id) {
     return res.status(400).json({ error: "Missing required fields: route_id and user_id" });
@@ -361,32 +404,39 @@ app.post("/api/routes/join", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // 🛡️ DOUBLE-MATCH GUARD: Prevents duplicate records if passenger is active or on a rolling trip
-    const existingActiveUser = await client.query(
+    // 🛡️ STAGE 1: DETECT AND BLOCK DUPLICATE REGISTRATIONS FOR ACTIVE/ONGOING TRIPS ONLY
+    // 💡 FIX: Added "AND TRIM(LOWER(status)) != 'completed'" so old finished records are safely ignored.
+    const strictDuplicateCheck = await client.query(
       `SELECT id, status, route_id, pickup_hub_id, dropoff_hub_id, matched_ride_offer_id 
        FROM route_pool 
-       WHERE user_id = $1 AND TRIM(LOWER(status)) IN ('searching', 'arrived', 'matched', 'in_trip')
+       WHERE user_id = $1 
+         AND TRIM(LOWER(status)) != 'completed'
+         AND (
+           (matched_ride_offer_id = $2 AND matched_ride_offer_id IS NOT NULL) 
+           OR 
+           TRIM(LOWER(status)) IN ('searching', 'accepted', 'arrived', 'matched', 'in_trip', 'intransit')
+         )
        LIMIT 1 FOR UPDATE;`, 
-      [user_id]
+      [parseInt(user_id, 10), ride_offer_id ? parseInt(ride_offer_id, 10) : null]
     );
 
-    if (existingActiveUser.rows.length > 0) {
-      const activeRecord = existingActiveUser.rows[0];
-      await client.query("ROLLBACK");
+    if (strictDuplicateCheck.rows.length > 0) {
+      const activeRecord = strictDuplicateCheck.rows[0];
+      await client.query("ROLLBACK"); // Instantly kill transaction, freeing resource threads
 
       const normalizedStatus = activeRecord.status.trim().toLowerCase();
-      console.log(`⚠️ App recovery: User ${user_id} is already active in state [${normalizedStatus}]`);
+      console.log(`🛑 [Duplicate Guard] Blocked double registration. User ${user_id} already exists in active row ID: ${activeRecord.id} [State: ${normalizedStatus}]`);
       
-      // Dynamic App State Recovery routing
+      // Dynamic App State Recovery routing parameters based on current lifecycle stage
       let targetScreen = "MatchingScreen"; 
-      if (normalizedStatus === "matched") {
+      if (["matched", "accepted", "arrived"].includes(normalizedStatus)) {
         targetScreen = "LiveTrackingScreen"; 
-      } else if (normalizedStatus === "in_trip") {
+      } else if (["in_trip", "intransit"].includes(normalizedStatus)) {
         targetScreen = "TripInProgressPassengerScreen"; 
       }
 
       return res.status(200).json({
-        message: "User is already active in an ongoing corridor pool.",
+        message: "User registration already active in an ongoing corridor pool matrix.",
         alreadyActive: true,
         navigateTo: targetScreen, 
         pool: {
@@ -401,7 +451,7 @@ app.post("/api/routes/join", async (req, res) => {
       });
     }
 
-    // Resolve hub destinations if missing
+    // STAGE 2: RESOLVE HUB STATIONS IF MISSING FROM PAYLOAD
     let finalPickup = pickup_hub_id;
     let finalDropoff = dropoff_hub_id;
 
@@ -419,7 +469,7 @@ app.post("/api/routes/join", async (req, res) => {
       }
     }
 
-    // 🎯 FIX: Removed updated_at column to respect your exact schema design and utilize joined_at
+    // STAGE 3: EXECUTE CLEAN POOL ENTRY GENERATION FOR THE NEW TRIP
     const newEntry = await client.query(
       `INSERT INTO route_pool (route_id, user_id, pickup_hub_id, dropoff_hub_id, status, joined_at)
        VALUES ($1, $2, $3, $4, 'searching', NOW())
@@ -427,7 +477,7 @@ app.post("/api/routes/join", async (req, res) => {
       [route_id, user_id, finalPickup, finalDropoff]
     );
 
-    // Fire the matching engine with our strict 3-max / 2-min cluster logic
+    // Fire matching automation engine
     const matchPipeline = await executeCorridorAutoMatch(client, route_id, finalPickup);
 
     await client.query("COMMIT");
@@ -448,65 +498,6 @@ app.post("/api/routes/join", async (req, res) => {
   }
 });
 
-/* ---------------- PASSENGER JOINS THE POOL (BOOK A SEAT) ---------------- */
-app.post("/api/rides/join-pool", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { ride_id, passenger_id, pickup_hub_id, dropoff_hub_id, seats_booked } = req.body;
-
-    if (!ride_id || !passenger_id || !pickup_hub_id || !dropoff_hub_id || !seats_booked) {
-      return res.status(400).json({ error: "Missing required booking details." });
-    }
-
-    await client.query("BEGIN");
-
-    const rideCheck = await client.query(
-      `SELECT available_seats, total_seats, status FROM rides WHERE id = $1 FOR UPDATE`,
-      [ride_id]
-    );
-
-    if (rideCheck.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Active ride run not found." });
-    }
-
-    const { available_seats, status: currentRideStatus } = rideCheck.rows[0];
-
-    if (available_seats < seats_booked) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "Not enough seats available in this pool." });
-    }
-
-    await client.query(
-      `UPDATE rides SET available_seats = available_seats - $1 WHERE id = $2`,
-      [seats_booked, ride_id]
-    );
-
-    // 🎯 UPGRADE 3: Dynamically set initial booking layout if joining a ride that is already rolling
-    const normalizedRideStatus = (currentRideStatus || "").trim().toLowerCase();
-    const initialBookingStatus = (normalizedRideStatus === "in_trip" || normalizedRideStatus === "in_transit") ? "in_trip" : "booked";
-
-    const bookingResult = await client.query(
-      `INSERT INTO ride_bookings (ride_id, passenger_id, pickup_hub_id, dropoff_hub_id, seats_booked, status, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW()) RETURNING id AS booking_id, status;`,
-      [ride_id, passenger_id, pickup_hub_id, dropoff_hub_id, seats_booked, initialBookingStatus]
-    );
-
-    await client.query("COMMIT");
-    return res.status(201).json({
-      message: "Successfully joined the corridor ride pool!",
-      booking_id: bookingResult.rows[0].booking_id,
-      status: bookingResult.rows[0].status.trim()
-    });
-
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ Error joining pool manifest:", err.message);
-    return res.status(500).json({ error: "Server error joining the pool." });
-  } finally {
-    client.release();
-  }
-});
 
 
 /* ---------------- START TRIP LIFECYCLE CONTROLLER ---------------- */
@@ -524,7 +515,7 @@ app.post("/api/rides/start-trip", async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1. Update the ride offer's state (ride_offers does have an updated_at column)
+    // 1. Update the master ride offer's state
     const updateOffer = await client.query(
       `UPDATE ride_offers 
        SET status = 'in_trip',
@@ -545,16 +536,18 @@ app.post("/api/rides/start-trip", async (req, res) => {
     const activeOffer = updateOffer.rows[0];
     console.log(`✅ [START TRIP] ride_offers row #${activeOffer.id} successfully updated to [${activeOffer.status}]`);
 
-    // 🎯 FIX: Removed the non-existent 'updated_at' column assignment to respect your schema footprint
+    // 🎯 FIX: Updated where clause to look for passengers who are 'accepted' or 'arrived' 
+    // 🎯 NOTE: Ensure 'in_trip' (or 'inprogress') is whitelisted in your check_route_pool_status table constraint!
     const poolUpdate = await client.query(
       `UPDATE route_pool 
        SET status = 'in_trip'
-       WHERE matched_ride_offer_id = $1 AND TRIM(LOWER(status)) = 'matched'
-       RETURNING id;`,
+       WHERE matched_ride_offer_id = $1 
+         AND TRIM(LOWER(status)) IN ('accepted', 'arrived', 'matched')
+       RETURNING id, status;`,
       [parsedRideId]
     );
 
-    console.log(`👥 [START TRIP] Synchronized ${poolUpdate.rows.length} passenger pool entries to 'in_trip' matrix.`);
+    console.log(`👥 [START TRIP] Synchronized ${poolUpdate.rows.length} passenger pool matrix records to 'in_trip'.`);
 
     await client.query("COMMIT");
 
@@ -566,18 +559,27 @@ app.post("/api/rides/start-trip", async (req, res) => {
         status: activeOffer.status.trim(),
         routeId: activeOffer.route_id,
         driverId: activeOffer.driver_id
-      }
+      },
+      synchronizedRidersCount: poolUpdate.rows.length
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ TRANSACTION ARREST: START TRIP FAULT:", err.message);
-    return res.status(500).json({ error: "Internal database state validation exception starting trip." });
+    
+    // Sniff for constraint failures to output exact debugging tips in logs
+    if (err.message.includes("violates check constraint")) {
+      console.error("💡 DB SCHEMA ALERT: You need to run an ALTER TABLE statement to add 'in_trip' to your constraint enum array!");
+    }
+
+    return res.status(500).json({ 
+      error: "Internal database state validation exception starting trip.",
+      details: err.message 
+    });
   } finally {
     client.release();
   }
 });
-
 /* ---------------- PASSENGER JOINS THE POOL (BOOK A SEAT) ---------------- */
 app.post("/api/rides/join-pool", async (req, res) => {
   const client = await pool.connect();
@@ -1699,26 +1701,28 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
 
     const offer = offerQuery.rows[0];
 
-    // 2. Fetch all co-riders currently linked to this offer inside route_pool
+    // 2. 🎯 FIX: Added explicit status filter matrix to pick up ONLY active passengers
     const passengersQuery = await pool.query(
       `SELECT user_id, status 
        FROM route_pool 
-       WHERE matched_ride_offer_id = $1`,
+       WHERE matched_ride_offer_id = $1
+         AND TRIM(LOWER(status)) IN ('accepted', 'arrived', 'in_trip', 'intransit')`,
       [rideOfferId]
     );
 
-    // 3. Format payload payload structure matching your client JSON specifications exactly
+    // 3. 🎯 FIX: Providing twin key mappings (userId AND user_id) so your front-end parser maps successfully
     const trackingPayload = {
       rideOfferId: offer.id,
-      rideStatus: offer.status, // e.g. 'accepted', 'arrived', 'completed'
+      rideStatus: offer.status, 
       price_per_seat: offer.price_per_seat,
       driverLocation: {
         latitude: parseFloat(offer.pickup_lat) || 9.0106,
         longitude: parseFloat(offer.pickup_lng) || 38.7894
       },
       passengers: passengersQuery.rows.map(row => ({
-        userId: parseInt(row.user_id, 10),
-        status: row.status // e.g. 'matched', 'arrived'
+        userId: parseInt(row.user_id, 10),  // camelCase context
+        user_id: parseInt(row.user_id, 10), // snake_case backward compatibility protection
+        status: row.status ? row.status.toString().trim() : "accepted" 
       }))
     };
 
@@ -1729,7 +1733,6 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
     return res.status(500).json({ error: "Internal server telemetry data retrieval error." });
   }
 });
-
 /**
  * 🔄 1. GET ACTIVE ASSIGNMENT PROPOSAL FOR DRIVER
  * Route: GET /api/rides/driver-proposal/:driverId
@@ -1842,6 +1845,8 @@ app.post("/api/rides/driver-accept", async (req, res) => {
     }
 
     const finalAvailableSeats = total_seats - confirmedPassengerIds.length;
+    
+    // 1. Update the master ride offer state to 'accepted'
     const updateOfferQuery = `
       UPDATE ride_offers 
       SET status = 'accepted', available_seats = $1 
@@ -1849,10 +1854,21 @@ app.post("/api/rides/driver-accept", async (req, res) => {
     `;
     await client.query(updateOfferQuery, [finalAvailableSeats, ride_offer_id]);
 
+    // 2. 🎯 SYNCING STATUS: Also switch the active manifest pairs inside route_pool to 'accepted'
+    if (confirmedPassengerIds.length > 0) {
+      const updatePassengerPoolQuery = `
+        UPDATE route_pool 
+        SET status = 'accepted' 
+        WHERE matched_ride_offer_id = $1 
+        AND user_id IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
+      `;
+      await client.query(updatePassengerPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
+    }
+
     const deleteQueueQuery = `DELETE FROM driver_queue WHERE driver_id = $1`;
     await client.query(deleteQueueQuery, [driver_id]);
 
-    // 🎯 Dynamically resolve active hub assignment parameters from the route pool data
+    // Dynamically resolve active hub assignment parameters from the route pool data
     let targetHubId = 1; 
     const hubLookupQuery = `SELECT pickup_hub_id FROM route_pool WHERE matched_ride_offer_id = $1 LIMIT 1`;
     const hubRes = await client.query(hubLookupQuery, [ride_offer_id]);
@@ -1860,7 +1876,7 @@ app.post("/api/rides/driver-accept", async (req, res) => {
       targetHubId = parseInt(hubRes.rows[0].pickup_hub_id, 10);
     }
 
-    // 🎯 Recycle unaccepted entries inside route_pool table mapping relationships
+    // Recycle unaccepted entries inside route_pool table mapping relationships
     if (confirmedPassengerIds.length > 0) {
       const resetLeftoverPoolQuery = `
         UPDATE route_pool 
@@ -1883,7 +1899,7 @@ app.post("/api/rides/driver-accept", async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: "Manifest locked in successfully. Leftover riders recycled.",
+      message: "Manifest and passenger pool locked in as 'accepted'. Leftover riders recycled.",
       rideOfferId: ride_offer_id,
       acceptedCount: confirmedPassengerIds.length,
       availableSeats: finalAvailableSeats
@@ -1897,6 +1913,157 @@ app.post("/api/rides/driver-accept", async (req, res) => {
     client.release();
   }
 });
+
+// 🎯 ADD THIS TO YOUR BACKEND CONTROLLERS
+
+
+app.get("/api/rides/active-accepted-offer", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    // Looks for the most recent offer that has been accepted but hasn't started the trip yet
+    const queryText = `
+      SELECT id, route_id, user_id, status 
+      FROM route_pool 
+      WHERE TRIM(LOWER(status)) IN ('accepted', 'arrived')
+      ORDER BY id DESC 
+      LIMIT 1;
+    `;
+    const result = await client.query(queryText);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "No currently active accepted ride offers found." });
+    }
+
+    return res.status(200).json(result.rows[0]);
+  } catch (err) {
+    console.error("❌ DISCOVERY ENDPOINT FAULT:", err.message);
+    return res.status(500).json({ error: "Internal database lookup exception for active allocations." });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
+
+app.post("/api/rides/driver-accept", async (req, res) => {
+  const { ride_offer_id, driver_id } = req.body;
+
+  if (!ride_offer_id || !driver_id) {
+    return res.status(400).json({ error: "Missing ride_offer_id or driver_id parameters." });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Fetch details using actual schema column fields
+    const offerQuery = `
+      SELECT id, route_id, accepted_passengers, total_seats 
+      FROM ride_offers 
+      WHERE id = $1 AND driver_id = $2 FOR UPDATE
+    `;
+    const offerRes = await client.query(offerQuery, [ride_offer_id, driver_id]);
+
+    if (offerRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Active dispatch offer not found or driver allocation mismatch." });
+    }
+
+    const offer = offerRes.rows[0];
+    const { route_id, total_seats } = offer;
+
+    let confirmedPassengerIds = [];
+    if (offer.accepted_passengers) {
+      if (Array.isArray(offer.accepted_passengers)) {
+        confirmedPassengerIds = offer.accepted_passengers.map(id => parseInt(id, 10));
+      } else if (typeof offer.accepted_passengers === "string") {
+        confirmedPassengerIds = offer.accepted_passengers
+          .replace(/{|}/g, "")
+          .split(",")
+          .map(id => parseInt(id.trim(), 10))
+          .filter(id => !isNaN(id));
+      }
+    }
+
+    if (confirmedPassengerIds.length < 2) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Cannot accept dispatch. Minimum core passenger threshold not met." });
+    }
+
+    const finalAvailableSeats = total_seats - confirmedPassengerIds.length;
+    
+    // 1. Update the master ride offer state to 'accepted'
+    const updateOfferQuery = `
+      UPDATE ride_offers 
+      SET status = 'accepted', available_seats = $1 
+      WHERE id = $2
+    `;
+    await client.query(updateOfferQuery, [finalAvailableSeats, ride_offer_id]);
+
+    // 2. 🎯 SYNCING STATUS: Also switch the active manifest pairs inside route_pool to 'accepted'
+    if (confirmedPassengerIds.length > 0) {
+      const updatePassengerPoolQuery = `
+        UPDATE route_pool 
+        SET status = 'accepted' 
+        WHERE matched_ride_offer_id = $1 
+        AND user_id IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
+      `;
+      await client.query(updatePassengerPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
+    }
+
+    const deleteQueueQuery = `DELETE FROM driver_queue WHERE driver_id = $1`;
+    await client.query(deleteQueueQuery, [driver_id]);
+
+    // Dynamically resolve active hub assignment parameters from the route pool data
+    let targetHubId = 1; 
+    const hubLookupQuery = `SELECT pickup_hub_id FROM route_pool WHERE matched_ride_offer_id = $1 LIMIT 1`;
+    const hubRes = await client.query(hubLookupQuery, [ride_offer_id]);
+    if (hubRes.rows.length > 0 && hubRes.rows[0].pickup_hub_id) {
+      targetHubId = parseInt(hubRes.rows[0].pickup_hub_id, 10);
+    }
+
+    // Recycle unaccepted entries inside route_pool table mapping relationships
+    if (confirmedPassengerIds.length > 0) {
+      const resetLeftoverPoolQuery = `
+        UPDATE route_pool 
+        SET status = 'searching', matched_ride_offer_id = NULL 
+        WHERE matched_ride_offer_id = $1 
+        AND user_id NOT IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
+        RETURNING user_id
+      `;
+      
+      const resetRes = await client.query(resetLeftoverPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
+      console.log(`[Corridor Dispatch] Locked ${confirmedPassengerIds.length} riders. Kicked out ${resetRes.rows.length} pending riders back to searching stack.`);
+    }
+
+    await client.query("COMMIT");
+
+    // Invoke matching engine asynchronously
+    executeCorridorAutoMatch(pool, route_id, targetHubId)
+      .then(() => console.log(`[AutoMatch] Execution loop context processed cleanly for Route ${route_id}`))
+      .catch((err) => console.error("[AutoMatch Error] Async dispatch node loop failure:", err));
+
+    return res.status(200).json({
+      success: true,
+      message: "Manifest and passenger pool locked in as 'accepted'. Leftover riders recycled.",
+      rideOfferId: ride_offer_id,
+      acceptedCount: confirmedPassengerIds.length,
+      availableSeats: finalAvailableSeats
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Critical failure during driver-accept execution sequence:", error);
+    return res.status(500).json({ error: "Internal transaction failure inside processing node." });
+  } finally {
+    client.release();
+  }
+});
+
+
 app.post('/api/rides/driver-decline', async (req, res) => {
   const { ride_offer_id, driver_id } = req.body;
 
