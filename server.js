@@ -78,7 +78,7 @@ app.post("/api/auth/verify-otp", upload.single("photo"), async (req, res) => {
 
     const targetRole = role.trim().toLowerCase();
     const cleanName = full_name.trim();
-    const cleanEmail = email ? email.trim() : "";
+    const cleanEmail = email && email.trim() !== "" ? email.trim() : null;
     const profilePhotoUrl = req.file ? `/uploads/${req.file.filename}` : "https://placehold.co/150";
 
     console.log(`✨ Executing database insertion block for user: [${cleanName}] as [${targetRole}]`);
