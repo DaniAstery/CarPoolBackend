@@ -6,9 +6,135 @@ const pool = require('./db');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+const multer = require("multer");
+const path = require("path");
+
 // ⚡ Global Parsers & Middlewares
 app.use(cors());
 app.use(express.json());
+
+
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+// Configure disk storage architecture for profile images
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, "uploads/"); // Make sure to create a folder named 'uploads' in your project root!
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+const upload = multer({ storage: storage });
+
+
+
+// 🎯 TRENDING OTP VERIFY / ONBOARDING INTEGRATION
+// 🎯 TRENDING OTP VERIFY / ONBOARDING INTEGRATION
+app.post("/api/auth/verify-otp", upload.single("photo"), async (req, res) => {
+  // 🔬 IMMEDIATE DIAGNOSTIC TRACE
+  console.log("-----------------------------------------");
+  console.log("Incoming request body payload parsed:", req.body);
+  console.log("Incoming file upload stream metadata:", req.file);
+  console.log("-----------------------------------------");
+
+  const client = await pool.connect();
+  try {
+    const { phone_number, full_name, role, email, license_number, vehicle_model, license_plate } = req.body;
+    
+    if (!phone_number) {
+      console.log("🛑 REJECTED: phone_number string parameter missing from parsed body state.");
+      return res.status(400).json({ error: "Missing required parameter: phone_number." });
+    }
+
+    const cleanPhone = phone_number.trim();
+    await client.query("BEGIN");
+
+    // 1. Check if user already exists (Login Routine Handshake)
+    const userLookup = await client.query("SELECT * FROM users WHERE TRIM(phone_number) = $1", [cleanPhone]);
+    
+    if (userLookup.rows.length > 0) {
+      const existingUser = userLookup.rows[0];
+      await client.query("COMMIT");
+      
+      console.log(`🔑 Login Handshake Verified: Existing user [${existingUser.full_name}] logged in.`);
+      return res.status(200).json({
+        success: true,
+        message: "Handshake verified. Existing user logged in successfully.",
+        isNewUser: false,
+        user: existingUser
+      });
+    }
+
+    // 2. Registration Phase Validation Check
+    if (!role || !full_name) {
+      await client.query("ROLLBACK");
+      console.log("🛑 REJECTED: New profile layout flagged, but missing role or full_name.");
+      return res.status(400).json({ 
+        error: "New user profile detected. full_name and role fields are strictly required to initialize registration." 
+      });
+    }
+
+    const targetRole = role.trim().toLowerCase();
+    const cleanName = full_name.trim();
+    const cleanEmail = email ? email.trim() : "";
+    const profilePhotoUrl = req.file ? `/uploads/${req.file.filename}` : "https://placehold.co/150";
+
+    console.log(`✨ Executing database insertion block for user: [${cleanName}] as [${targetRole}]`);
+
+    // 3. Write into your established users table layout
+    const userInsert = await client.query(
+      `INSERT INTO users (full_name, phone_number, email, role, profile_photo_url, rating) 
+       VALUES ($1, $2, $3, $4, $5, 5.00) RETURNING *`,
+      [cleanName, cleanPhone, cleanEmail, targetRole, profilePhotoUrl]
+    );
+    const newUser = userInsert.rows[0];
+    console.log(`✅ Core User row inserted cleanly. Generated User ID: ${newUser.id}`);
+
+    // 4. Populate Driver Profile Metadata if string condition balances
+    if (targetRole === "driver") {
+      if (!license_number || !vehicle_model || !license_plate) {
+        await client.query("ROLLBACK");
+        console.log("🛑 REJECTED: Driver profile requested but compliance sub-fields missing.");
+        return res.status(400).json({ 
+          error: "Missing driver compliance fields: license_number, vehicle_model, or license_plate are required for role: driver." 
+        });
+      }
+
+      console.log(`🗂️ Writing fields into driver_profiles table for User ID: ${newUser.id}`);
+
+      await client.query(
+        `INSERT INTO driver_profiles (driver_id, license_number, vehicle_model, license_plate) 
+         VALUES ($1, $2, $3, $4)`,
+        [newUser.id, license_number.trim(), vehicle_model.trim(), license_plate.trim()]
+      );
+      console.log(`✅ Driver profile row initialized.`);
+    }
+
+    await client.query("COMMIT");
+    console.log(`🏁 Onboarding Sequence committed to disk for User ID ${newUser.id}`);
+
+    return res.status(201).json({
+      success: true,
+      message: "New user registered and synchronized successfully.",
+      isNewUser: true,
+      user: newUser
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ CRITICAL AUTH MATRIX EXCEPTION:", error.stack);
+    return res.status(500).json({ error: `Authentication engine pipeline failure: ${error.message}` });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
+
 
 /* ===========================================================================
    🚀 1. BASE ROOT IDENTITY HANDLERS
