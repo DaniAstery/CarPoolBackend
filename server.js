@@ -1687,7 +1687,6 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
   }
 
   try {
-    // 1. Fetch current macro metrics for the target offering instance row
     const offerQuery = await pool.query(
       `SELECT id, status, price_per_seat, pickup_lat, pickup_lng 
        FROM ride_offers 
@@ -1701,16 +1700,15 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
 
     const offer = offerQuery.rows[0];
 
-    // 2. 🎯 FIX: Added explicit status filter matrix to pick up ONLY active passengers
+    // 🎯 FIXED: Added 'matched' into the string matrix query loop block
     const passengersQuery = await pool.query(
       `SELECT user_id, status 
        FROM route_pool 
        WHERE matched_ride_offer_id = $1
-         AND TRIM(LOWER(status)) IN ('accepted', 'arrived', 'in_trip', 'intransit')`,
+         AND TRIM(LOWER(status)) IN ('matched', 'accepted', 'arrived', 'in_trip', 'intransit')`,
       [rideOfferId]
     );
 
-    // 3. 🎯 FIX: Providing twin key mappings (userId AND user_id) so your front-end parser maps successfully
     const trackingPayload = {
       rideOfferId: offer.id,
       rideStatus: offer.status, 
@@ -1720,9 +1718,9 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
         longitude: parseFloat(offer.pickup_lng) || 38.7894
       },
       passengers: passengersQuery.rows.map(row => ({
-        userId: parseInt(row.user_id, 10),  // camelCase context
-        user_id: parseInt(row.user_id, 10), // snake_case backward compatibility protection
-        status: row.status ? row.status.toString().trim() : "accepted" 
+        userId: parseInt(row.user_id, 10), 
+        user_id: parseInt(row.user_id, 10), 
+        status: row.status ? row.status.toString().trim().toLowerCase() : "matched" 
       }))
     };
 
