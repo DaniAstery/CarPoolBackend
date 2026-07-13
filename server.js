@@ -1442,25 +1442,7 @@ app.get("/api/rides/active-proposal/:userId", async (req, res) => {
 });
 
 
-// 📤 Arrival Signal Handshake Route Handler
-app.post("/api/rides/signal-arrival", async (req, res) => {
-  const { ride_offer_id, user_id } = req.body;
-  
-  try {
-    // Flag the user's presence state directly within the pool table mapping for real-time aggregation checks
-    await pool.query(
-      `UPDATE route_pool 
-       SET status = 'arrived' 
-       WHERE user_id = $1 AND matched_ride_offer_id = $2 AND status = 'matched'`,
-      [parseInt(user_id, 10), parseInt(ride_offer_id, 10)]
-    );
-    
-    return res.json({ success: true, message: "Presence terminal handshake sequence verified." });
-  } catch (err) {
-    console.error("❌ HANDSHAKE WRITER BLOCKED:", err.stack);
-    return res.status(500).json({ error: "Database rejected transaction loop writing arrival matrix." });
-  }
-});
+
 /* =========================================================================
    2. 📍 ARRIVAL CHECKPOINT SIGNAL: Commit Passenger Presence Node Validation
    ========================================================================= */
@@ -1478,44 +1460,40 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
     const targetRideId = parseInt(ride_offer_id, 10);
     const targetUserId = parseInt(user_id, 10);
 
-    // 1. 🎯 ATOMIC UPDATE: Force values to lower-case and strip spaces to prevent hidden data type bugs
+    // 🎯 ENFORCE: Only update if the current status is strictly 'accepted' or already 'arrived'
     const result = await client.query(
       `UPDATE route_pool 
        SET status = 'arrived' 
-       WHERE parseInt(user_id) = $1 
-         AND parseInt(matched_ride_offer_id) = $2 
-       RETURNING id, status`,
+       WHERE user_id = $1 
+         AND matched_ride_offer_id = $2 
+         AND (TRIM(LOWER(status)) = 'accepted' OR TRIM(LOWER(status)) = 'arrived')
+       RETURNING id, status;`,
       [targetUserId, targetRideId]
     );
-
-    // Alternative query if your column definitions don't support explicit casting:
-    // WHERE user_id = $1 AND matched_ride_offer_id = $2
 
     if (result.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ 
-        error: `Passenger cluster matching context mismatch. No record found in route_pool for User ${targetUserId} matched to Ride Offer ${targetRideId}.` 
+        error: `State Transition Denied: No matching user tracking block found, or passenger status is not 'accepted'.` 
       });
     }
 
-    // 2. Fetch the macro state of the Driver's ride invitation offer record
+    // 2. Fetch driver's current macro state from ride_offers
     const driverQuery = await client.query(
       `SELECT TRIM(LOWER(status)) as status FROM ride_offers WHERE id = $1`,
       [targetRideId]
     );
     const driverStatus = driverQuery.rows[0]?.status || "accepted";
 
-    // 3. Collect updated data for all pooled co-riders assigned to this exact ride offer block matrix
+    // 3. Collect the updated passenger manifest for the UI co-rider matrix
     const passengersQuery = await client.query(
       `SELECT user_id, TRIM(LOWER(status)) as status FROM route_pool WHERE matched_ride_offer_id = $1`,
       [targetRideId]
     );
 
     await client.query("COMMIT");
+    console.log(`📍 Presence Verification Success: User ${targetUserId} transitioned from accepted -> arrived.`);
 
-    console.log(`📍 Presence Verification Success: User ${targetUserId} locked as 'arrived'. Driver macro state: [${driverStatus}]`);
-
-    // Return clean payloads normalized to lower-case so your React Native co-rider matrix matches cleanly
     return res.status(200).json({ 
       success: true, 
       message: "Arrival presence validated cleanly.",
@@ -1528,8 +1506,8 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
 
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("❌ CRITICAL SIGNAL ARRIVAL TRANSACTION FAILURE:", err.stack);
-    return res.status(500).json({ error: `Failed to register point arrival tracking metrics: ${err.message}` });
+    console.error("❌ SIGNAL ARRIVAL TRANSACTION FAILURE:", err.stack);
+    return res.status(500).json({ error: `Internal Server Error: ${err.message}` });
   } finally {
     client.release();
   }
