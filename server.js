@@ -1471,33 +1471,69 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
     return res.status(400).json({ error: "Missing ride_offer_id or user_id mapping keys." });
   }
 
+  const client = await pool.connect();
   try {
+    await client.query("BEGIN");
+
     const targetRideId = parseInt(ride_offer_id, 10);
     const targetUserId = parseInt(user_id, 10);
 
-    // Atomic transaction updating the exact passenger node status context to 'arrived'
-    const result = await pool.query(
+    // 1. 🎯 ATOMIC UPDATE: Force values to lower-case and strip spaces to prevent hidden data type bugs
+    const result = await client.query(
       `UPDATE route_pool 
        SET status = 'arrived' 
-       WHERE user_id = $1 AND matched_ride_offer_id = $2 
+       WHERE parseInt(user_id) = $1 
+         AND parseInt(matched_ride_offer_id) = $2 
        RETURNING id, status`,
       [targetUserId, targetRideId]
     );
 
+    // Alternative query if your column definitions don't support explicit casting:
+    // WHERE user_id = $1 AND matched_ride_offer_id = $2
+
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Passenger cluster matching context mismatch." });
+      await client.query("ROLLBACK");
+      return res.status(404).json({ 
+        error: `Passenger cluster matching context mismatch. No record found in route_pool for User ${targetUserId} matched to Ride Offer ${targetRideId}.` 
+      });
     }
 
-    console.log(`📍 Presence Verification Locked: User ${targetUserId} arrived at Hub via Ride ${targetRideId}`);
-    return res.json({ success: true, message: "Arrival presence validated cleanly." });
+    // 2. Fetch the macro state of the Driver's ride invitation offer record
+    const driverQuery = await client.query(
+      `SELECT TRIM(LOWER(status)) as status FROM ride_offers WHERE id = $1`,
+      [targetRideId]
+    );
+    const driverStatus = driverQuery.rows[0]?.status || "accepted";
+
+    // 3. Collect updated data for all pooled co-riders assigned to this exact ride offer block matrix
+    const passengersQuery = await client.query(
+      `SELECT user_id, TRIM(LOWER(status)) as status FROM route_pool WHERE matched_ride_offer_id = $1`,
+      [targetRideId]
+    );
+
+    await client.query("COMMIT");
+
+    console.log(`📍 Presence Verification Success: User ${targetUserId} locked as 'arrived'. Driver macro state: [${driverStatus}]`);
+
+    // Return clean payloads normalized to lower-case so your React Native co-rider matrix matches cleanly
+    return res.status(200).json({ 
+      success: true, 
+      message: "Arrival presence validated cleanly.",
+      driverStatus: driverStatus, 
+      passengers: passengersQuery.rows.map(row => ({
+        userId: parseInt(row.user_id, 10),
+        status: row.status || "accepted"
+      }))
+    });
 
   } catch (err) {
-    console.error("❌ SIGNAL ARRIVAL TRANSACTION FAILURE:", err.stack);
-    return res.status(500).json({ error: "Failed to log terminal point arrival verification." });
+    await client.query("ROLLBACK");
+    console.error("❌ CRITICAL SIGNAL ARRIVAL TRANSACTION FAILURE:", err.stack);
+    return res.status(500).json({ error: `Failed to register point arrival tracking metrics: ${err.message}` });
+  } finally {
+    client.release();
   }
 });
-
-
 
 // 📊 DRIVER Get Corridor Pool Status OF PASSENGERS metrics for a specific pickup hub
 
@@ -2191,48 +2227,61 @@ app.get("/api/rides/status/:rideOfferId", async (req, res) => {
    🚀 ENDPOINT 2: UPDATE STATUS TO ARRIVED (THE ARRIVAL BUTTON MATRIX)
    ========================================================================= */
 app.post("/api/rides/arrive", async (req, res) => {
+  // 🛡️ GUARD: Prevent crash if req.body or req itself isn't parsed/populated
+  if (!req || !req.body) {
+    return res.status(400).json({ 
+      error: "Malformed request payload. Make sure express.json() middleware is active and Headers include Content-Type: application/json" 
+    });
+  }
+
+  const { ride_offer_id } = req.body;
+
+  if (!ride_offer_id) {
+    return res.status(400).json({ error: "Missing required parameter: ride_offer_id" });
+  }
+
+  const parsedOfferId = parseInt(ride_offer_id, 10);
+  if (isNaN(parsedOfferId)) {
+    return res.status(400).json({ error: "Invalid format: ride_offer_id must be an integer." });
+  }
+
   const client = await pool.connect();
   try {
-    const { ride_offer_id } = req.body;
-
-    if (!ride_offer_id) {
-      return res.status(400).json({ error: "Missing ride_offer_id parameter." });
-    }
-
     await client.query("BEGIN");
 
-        // 🎯 FIX: Atomically change column status value to 'arrived' for the target primary key row
-      const updateRideOfferQuery = await client.query(
+    // 🎯 STRICT MODE: Only allows transition if the driver already accepted the ride ('accepted')
+    const updateRideOfferQuery = await client.query(
       `UPDATE ride_offers 
-      SET status = 'arrived' 
-      WHERE id = $1 AND (status = 'accepted' OR status = 'arrived')
-      RETURNING id, status;`,
-      [parseInt(ride_offer_id, 10)]
+       SET status = 'arrived' 
+       WHERE id = $1 
+         AND TRIM(LOWER(status)) IN ('accepted', 'arrived')
+       RETURNING id, status;`,
+      [parsedOfferId]
     );
 
     if (updateRideOfferQuery.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ 
-        error: "Ride offer not found or status cannot transition to arrived (must be pending)." 
+        error: `Ride offer ID ${parsedOfferId} not found or status cannot transition to arrived (Must be 'accepted' first).` 
       });
     }
 
     await client.query("COMMIT");
 
     return res.status(200).json({
-      message: "Driver arrival state initialized and committed successfully.",
+      success: true,
+      message: "Driver arrival state updated and committed successfully.",
       ride_offer: updateRideOfferQuery.rows[0]
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ TRANSACTION ARREST: ARRIVAL SYSTEM FAULT:", err.message);
-    return res.status(500).json({ error: "Internal exception processing driver status updates." });
+    return res.status(500).json({ error: `Internal execution error: ${err.message}` });
   } finally {
     client.release();
   }
 });
-
 
 // GET /api/rides/driver-active-session/:driverId
 app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
