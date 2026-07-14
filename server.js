@@ -627,6 +627,9 @@ app.post("/api/routes/join", async (req, res) => {
 
 
 /* ---------------- START TRIP LIFECYCLE CONTROLLER ---------------- */
+// 🎯 Import or reference your matching engine runner here
+// const { runMatchingEngine } = require("./matcher"); 
+
 app.post("/api/rides/start-trip", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -641,7 +644,7 @@ app.post("/api/rides/start-trip", async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 1. Update the master ride offer's state
+    // 1. Update the master ride offer's state from 'arrived' to 'in_trip'
     const updateOffer = await client.query(
       `UPDATE ride_offers 
        SET status = 'in_trip',
@@ -662,42 +665,75 @@ app.post("/api/rides/start-trip", async (req, res) => {
     const activeOffer = updateOffer.rows[0];
     console.log(`✅ [START TRIP] ride_offers row #${activeOffer.id} successfully updated to [${activeOffer.status}]`);
 
-    // 🎯 FIX: Updated where clause to look for passengers who are 'accepted' or 'arrived' 
-    // 🎯 NOTE: Ensure 'in_trip' (or 'inprogress') is whitelisted in your check_route_pool_status table constraint!
-    const poolUpdate = await client.query(
+    // 2. 🟢 COMMIT COMMITTED RIDERS: Transition 'accepted' or 'arrived' riders to 'in_trip'
+    const poolUpdateInTrip = await client.query(
       `UPDATE route_pool 
        SET status = 'in_trip'
        WHERE matched_ride_offer_id = $1 
-         AND TRIM(LOWER(status)) IN ('accepted', 'arrived', 'matched')
-       RETURNING id, status;`,
+         AND TRIM(LOWER(status)) IN ('accepted', 'arrived')
+       RETURNING id, user_id, status;`,
       [parsedRideId]
     );
 
-    console.log(`👥 [START TRIP] Synchronized ${poolUpdate.rows.length} passenger pool matrix records to 'in_trip'.`);
+    console.log(`👥 [START TRIP] Upgraded ${poolUpdateInTrip.rows.length} committed passenger records to 'in_trip'.`);
 
+    // 3. 🔄 RECYCLE UNCOMMITTED RIDERS: Boot 'matched' passengers back to 'searching' and unlink this offer
+    const poolResetMatched = await client.query(
+      `UPDATE route_pool 
+       SET status = 'searching',
+           matched_ride_offer_id = NULL
+       WHERE matched_ride_offer_id = $1 
+         AND TRIM(LOWER(status)) = 'matched'
+       RETURNING id, user_id, status;`,
+      [parsedRideId]
+    );
+
+    const recycledCount = poolResetMatched.rows.length;
+    console.log(`♻️ [START TRIP] Recycled ${recycledCount} uncommitted ('matched') passengers back to 'searching'.`);
+
+    // Commit the database transaction *before* calling the matching engine
+    // to ensure the recycled users are safely back in 'searching' state in DB.
     await client.query("COMMIT");
+
+    // 4. 🚀 TRIGGER MATCHING ENGINE
+    // Run this asynchronously so it doesn't block the driver's client response.
+    if (recycledCount > 0) {
+      console.log(`⚡ [START TRIP] Triggering Corridor Matching Engine to re-assign ${recycledCount} passenger(s)...`);
+      
+      // OPTION A: Internal Function Call (Fastest & cleanest)
+      if (typeof runMatchingEngine === "function") {
+        runMatchingEngine().catch(err => {
+          console.error("❌ [Matching Engine Process Error]:", err.message);
+        });
+      } 
+      // OPTION B: Loopback API Trigger (Use if matching engine is mapped to an endpoint)
+      else {
+        fetch(`api/rides/match`, { 
+          method: "POST",
+          headers: { "Content-Type": "application/json" }
+        }).catch(err => {
+          console.error("❌ [Matching Engine Network Trigger Failed]:", err.message);
+        });
+      }
+    }
 
     return res.status(200).json({
       success: true,
-      message: "Corridor trip successfully transitioned to transit matrix.",
+      message: "Corridor trip started. Committed riders in transit; uncommitted matches recycled and sent back to matching queue.",
       ride_offer: {
         id: activeOffer.id,
         status: activeOffer.status.trim(),
         routeId: activeOffer.route_id,
         driverId: activeOffer.driver_id
       },
-      synchronizedRidersCount: poolUpdate.rows.length
+      synchronizedRidersCount: poolUpdateInTrip.rows.length,
+      recycledRidersCount: recycledCount
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ TRANSACTION ARREST: START TRIP FAULT:", err.message);
     
-    // Sniff for constraint failures to output exact debugging tips in logs
-    if (err.message.includes("violates check constraint")) {
-      console.error("💡 DB SCHEMA ALERT: You need to run an ALTER TABLE statement to add 'in_trip' to your constraint enum array!");
-    }
-
     return res.status(500).json({ 
       error: "Internal database state validation exception starting trip.",
       details: err.message 
