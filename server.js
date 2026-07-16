@@ -260,6 +260,135 @@ app.get("/api/passenger/status/:userId", async (req, res) => {
 });
 
 
+//this for fetching ride_offer_id for passenger to check which offer he is assigned to 
+app.get("/api/rides/status/:userId", async (req, res) => {
+  const { userId } = req.params;
+  
+  if (!userId || isNaN(userId)) {
+    return res.status(400).json({ error: "A valid numeric userId parameter is required." });
+  }
+
+  try {
+    // 🔍 1. Fetch the active pool matching state for this user
+    const poolCheck = await pool.query(
+      `SELECT matched_ride_offer_id, status 
+       FROM route_pool 
+       WHERE user_id = $1 
+       ORDER BY joined_at DESC LIMIT 1`,
+      [parseInt(userId, 10)]
+    );
+
+    // If no matching active record exists in route_pool
+    if (poolCheck.rows.length === 0) {
+      return res.json({
+        matched_ride_offer_id: null,
+        rideStatus: "pending",
+        passengers: []
+      });
+    }
+
+    const { matched_ride_offer_id, status: userStatus } = poolCheck.rows[0];
+
+    // If they aren't matched with an active ride offer yet, return early safely
+    if (!matched_ride_offer_id) {
+      return res.json({
+        matched_ride_offer_id: null,
+        rideStatus: "pending",
+        passengers: [{ userId: parseInt(userId, 10), status: userStatus }]
+      });
+    }
+
+    // 🔍 2. Fetch the actual status of the matched ride offer
+    const offerCheck = await pool.query(
+      `SELECT status, driver_id, accepted_passengers 
+       FROM ride_offers 
+       WHERE id = $1`,
+      [matched_ride_offer_id]
+    );
+
+    if (offerCheck.rows.length === 0) {
+      return res.json({
+        matched_ride_offer_id,
+        rideStatus: "pending",
+        passengers: [{ userId: parseInt(userId, 10), status: userStatus }]
+      });
+    }
+
+    const offer = offerCheck.rows[0];
+
+    // 🔍 3. Get all co-riders assigned to this exact pool cluster
+    const coRidersCheck = await pool.query(
+      `SELECT user_id, status 
+       FROM route_pool 
+       WHERE matched_ride_offer_id = $1`,
+      [matched_ride_offer_id]
+    );
+
+    const formattedPassengers = coRidersCheck.rows.map(row => ({
+      userId: row.user_id,
+      status: row.status
+    }));
+
+    // Send back the fully composed state
+    res.json({
+      matched_ride_offer_id: parseInt(matched_ride_offer_id, 10),
+      rideStatus: offer.status, // e.g., 'pending', 'accepted', 'completed'
+      passengers: formattedPassengers
+    });
+
+  } catch (err) {
+    // 🛡️ Prevent Express crash! Log the error and return a safe HTTP 500
+    console.error("❌ CRITICAL POLL ROUTE ERROR:", err.message);
+    res.status(500).json({ 
+      error: "Internal server error occurred resolving status check.",
+      details: err.message 
+    });
+  }
+});
+
+
+
+// Checking passenger Distance from requested hub 
+app.post("/api/passenger/validate-location", async (req, res) => {
+  const { user_lat, user_lng, user_id } = req.body;
+
+  // 1. Fetch all hubs
+  const hubs = await pool.query("SELECT id, name, latitude, longitude FROM hubs");
+
+  // 2. Calculate Haversine distance for all hubs
+  const validHubs = hubs.rows.filter(hub => {
+    const distance = getDistanceFromLatLonInKm(
+      user_lat, user_lng, 
+      hub.latitude, hub.longitude
+    );
+    return distance <= 1.0; // 1km threshold
+  });
+
+  if (validHubs.length === 0) {
+    return res.status(403).json({ 
+      error: "OUT_OF_RANGE", 
+      message: "You are not within 1km of any pickup corridor hub." 
+    });
+  }
+
+  // 3. Return the nearest hub context
+  res.json({ status: "VALID", nearestHub: validHubs[0] });
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* ===========================================================================
    👥 3. CENTRAL CONTINUOUS MATCHING ENGINE (Headcount-Based Allocation)
@@ -1463,219 +1592,82 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
 
 
 
+app.post("/api/rides/accept-active-proposal", async (req, res) => {
+  const { user_id } = req.body;
 
-app.get("/api/rides/active-proposal/:userId", async (req, res) => {
-  const { userId } = req.params;
-
-  if (!userId) {
-    return res.status(400).json({ error: "Missing userId parameter path." });
+  if (!user_id) {
+    return res.status(400).json({ error: "Missing user_id parameter." });
   }
+
+  const client = await pool.connect();
 
   try {
-    // Step A: Find the active matched ride for this user from the route pool
-    const poolQuery = await pool.query(
-      `SELECT matched_ride_offer_id 
-       FROM route_pool 
-       WHERE user_id = $1 AND status = 'matched' 
-       ORDER BY joined_at DESC LIMIT 1`,
-      [parseInt(userId, 10)]
-    );
+    // Start a SQL transaction to keep things atomic and secure
+    await client.query("BEGIN");
 
-    // If the passenger isn't matched yet, return a clean 404 so the app can handle the loading/waiting state
-    if (poolQuery.rows.length === 0 || !poolQuery.rows[0].matched_ride_offer_id) {
-      return res.status(404).json({ error: "No active matched trip allocation found for this user." });
-    }
-
-    const activeRideOfferId = poolQuery.rows[0].matched_ride_offer_id;
-
-    // Step B: Pull the acceptance tracking array directly from the resolved ride offer row
-    const rideQuery = await pool.query(
-      `SELECT id, route_id, accepted_passengers 
-       FROM ride_offers 
-       WHERE id = $1`,
-      [activeRideOfferId]
-    );
-
-    if (rideQuery.rows.length === 0) {
-      return res.status(404).json({ error: "The allocated ride run records are missing from the cluster." });
-    }
-
-    const { id, route_id, accepted_passengers } = rideQuery.rows[0];
-
-    // Step C: Gather the complete passenger manifest group bound to this exact same trip
-    const manifestQuery = await pool.query(
-      `SELECT user_id 
-       FROM route_pool 
-       WHERE matched_ride_offer_id = $1 AND status = 'matched'`,
-      [activeRideOfferId]
-    );
-
-    const manifestUserIds = manifestQuery.rows.map(row => row.user_id);
-
-    // Return everything to the phone layout cleanly
-    return res.json({
-      rideOfferId: id,
-      routeId: route_id,
-      manifestPassengers: manifestUserIds,          // Array of all passenger IDs (e.g., [1, 2])
-      acceptedPassengers: accepted_passengers || []  // Array of IDs who tapped accept (e.g., [2])
-    });
-
-  } catch (err) {
-    console.error("❌ BACKEND STATE RESOLVER ERROR:", err.stack);
-    return res.status(500).json({ error: "Internal transactional exception mapping execution matrices." });
-  }
-});
-
-
-/* =========================================================================
-   1. 📡 LIVE TRACKING ENGINE: Fetch Passenger Manifest Status & Driver GPS Coordinates
-/* ========================================================================= 
-   📦 LIVE TRACKING STREAM CONTROLLER (FIXED FOR ARRIVED SESSION RECOVERY)
-   ========================================================================= */
-app.get("/api/rides/active-proposal/:userId", async (req, res) => {
-  const { userId } = req.params;
-
-  if (!userId) {
-    return res.status(400).json({ error: "Missing userId parameter path." });
-  }
-
-  try {
-    // 🎯 Step A: Updated to find active allocations whether status is 'matched' OR 'arrived'
-    const poolQuery = await pool.query(
-      `SELECT matched_ride_offer_id, status
+    // 🕵️‍♂️ Step 1: Scan route_pool to find the active ride_offer_id for this passenger
+    const poolQuery = await client.query(
+      `SELECT matched_ride_offer_id, status 
        FROM route_pool 
        WHERE user_id = $1 AND status IN ('matched', 'arrived') 
        ORDER BY joined_at DESC LIMIT 1`,
-      [parseInt(userId, 10)]
+      [parseInt(user_id, 10)]
     );
 
-    // If the passenger isn't matched or arrived yet, return a clean 404
-    if (poolQuery.rows.length === 0 || !poolQuery.rows[0].matched_ride_offer_id) {
-      return res.status(404).json({ error: "No active matched trip allocation found for this user." });
+    if (poolQuery.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ 
+        error: "No active matched proposal found for this user in the route pool." 
+      });
     }
 
-    const activeRideOfferId = poolQuery.rows[0].matched_ride_offer_id;
-    const userCurrentPoolStatus = poolQuery.rows[0].status;
+    const activePoolRow = poolQuery.rows[0];
+    const resolvedRideOfferId = activePoolRow.matched_ride_offer_id;
 
-    // Step B: Pull the acceptance tracking array directly from the resolved ride offer row
-    const rideQuery = await pool.query(
-      `SELECT id, route_id, accepted_passengers 
-       FROM ride_offers 
+    if (!resolvedRideOfferId) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ 
+        error: "User is matched, but no ride offer ID is registered to this cluster." 
+      });
+    }
+
+    // 📝 Step 2: Append user_id safely to accepted_passengers in ride_offers
+    await client.query(
+      `UPDATE ride_offers 
+       SET accepted_passengers = array_append(
+         array_remove(accepted_passengers, $2), $2
+       ) 
        WHERE id = $1`,
-      [activeRideOfferId]
+      [resolvedRideOfferId, parseInt(user_id, 10)]
     );
 
-    if (rideQuery.rows.length === 0) {
-      return res.status(404).json({ error: "The allocated ride run records are missing from the cluster." });
-    }
-
-    const { id, route_id, accepted_passengers } = rideQuery.rows[0];
-
-    // 🎯 Step C: Gather the complete passenger manifest group bound to this exact same trip (both matched and arrived riders)
-    const manifestQuery = await pool.query(
-      `SELECT user_id, status 
-       FROM route_pool 
-       WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived')`,
-      [activeRideOfferId]
+    // 📝 Step 3: Update passenger status to 'accepted' in route_pool
+    await client.query(
+      `UPDATE route_pool 
+       SET status = 'accepted' 
+       WHERE user_id = $1 AND matched_ride_offer_id = $2`,
+      [parseInt(user_id, 10), resolvedRideOfferId]
     );
 
-    // Build a structured list of passengers with their real-time statuses so the frontend matrix can map them easily
-    const passengersWithStatus = manifestQuery.rows.map(row => ({
-      userId: row.user_id,
-      status: row.status // Will return 'matched' or 'arrived'
-    }));
+    // Commit transaction if all steps succeeded
+    await client.query("COMMIT");
 
-    const manifestUserIds = manifestQuery.rows.map(row => row.user_id);
+    console.log(`✅ [PROPOSAL COMMITTED] User ${user_id} added to Offer ${resolvedRideOfferId}`);
 
-    // Return everything to the phone layout cleanly
-    return res.json({
-      rideOfferId: id,
-      routeId: route_id,
-      currentUserPoolStatus: userCurrentPoolStatus,  // 🌟 Tells frontend if 'this' specific user is already 'arrived'
-      manifestPassengers: manifestUserIds,          
-      acceptedPassengers: accepted_passengers || [],
-      passengers: passengersWithStatus               // 🌟 Complete status ledger for the co-rider matrix rendering
+    res.json({ 
+      success: true, 
+      matched_ride_offer_id: resolvedRideOfferId,
+      message: "Successfully matched, accepted, and recorded against the ledger!" 
     });
 
   } catch (err) {
-    console.error("❌ BACKEND STATE RESOLVER ERROR:", err.stack);
-    return res.status(500).json({ error: "Internal transactional exception mapping execution matrices." });
+    await client.query("ROLLBACK");
+    console.error("❌ ERROR RECORDING PROPOSAL ACCEPTANCE:", err.stack);
+    res.status(500).json({ error: "Failed to post acceptance state changes." });
+  } finally {
+    client.release();
   }
 });
-
-
-
-
-// 🎯 DEDICATED ENDPOINT FOR THE PROPOSAL SCREEN (Prevents breaking other screens)
-app.get("/api/rides/proposal-flow/:userId", async (req, res) => {
-  const { userId } = req.params;
-
-  if (!userId) {
-    return res.status(400).json({ error: "Missing userId parameter path." });
-  }
-
-  try {
-    // Step A: Find active allocations
-    const poolQuery = await pool.query(
-      `SELECT matched_ride_offer_id, status
-       FROM route_pool 
-       WHERE user_id = $1 AND status IN ('matched', 'arrived') 
-       ORDER BY joined_at DESC LIMIT 1`,
-      [parseInt(userId, 10)]
-    );
-
-    if (poolQuery.rows.length === 0 || !poolQuery.rows[0].matched_ride_offer_id) {
-      return res.status(404).json({ error: "No active matched trip allocation found." });
-    }
-
-    const activeRideOfferId = poolQuery.rows[0].matched_ride_offer_id;
-    const userCurrentPoolStatus = poolQuery.rows[0].status;
-
-    // 🎯 Step B: Explicitly select the "status" of the ride offer to check if the driver accepted
-    const rideQuery = await pool.query(
-      `SELECT id, route_id, status AS driver_status, accepted_passengers 
-       FROM ride_offers 
-       WHERE id = $1`,
-      [activeRideOfferId]
-    );
-
-    if (rideQuery.rows.length === 0) {
-      return res.status(404).json({ error: "The allocated ride run records are missing." });
-    }
-
-    const { id, route_id, driver_status, accepted_passengers } = rideQuery.rows[0];
-
-    // Step C: Gather the complete passenger manifest group
-    const manifestQuery = await pool.query(
-      `SELECT user_id, status 
-       FROM route_pool 
-       WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived')`,
-      [activeRideOfferId]
-    );
-
-    const passengersWithStatus = manifestQuery.rows.map(row => ({
-      userId: row.user_id,
-      status: row.status 
-    }));
-
-    const manifestUserIds = manifestQuery.rows.map(row => row.user_id);
-
-    return res.json({
-      rideOfferId: id,
-      routeId: route_id,
-      rideOfferStatus: driver_status || "pending", // 🌟 Captured explicitly from ride_offers status column
-      currentUserPoolStatus: userCurrentPoolStatus,  
-      manifestPassengers: manifestUserIds,          
-      acceptedPassengers: accepted_passengers || [],
-      passengers: passengersWithStatus               
-    });
-
-  } catch (err) {
-    console.error("❌ BACKEND PROPOSAL FLOW RESOLVER ERROR:", err.stack);
-    return res.status(500).json({ error: "Internal transactional exception." });
-  }
-});
-
 
 
 
