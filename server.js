@@ -669,12 +669,7 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
 /* ---------------- PASSENGER SIDE: JOIN CORRIDOR WAITING POOL ---------------- */
 // POST /api/routes/join  
 app.post("/api/routes/join", async (req, res) => {
-  const { 
-    route_id, 
-    user_id, 
-    pickup_hub_id, 
-    dropoff_hub_id
-  } = req.body;
+  const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
 
   if (!route_id || !user_id) {
     return res.status(400).json({ 
@@ -696,63 +691,50 @@ app.post("/api/routes/join", async (req, res) => {
     );
 
     if (duplicateCheck.rows.length > 0) {
-      console.log(`🔄 User ${user_id} is already in an active pool session.`);
       const existingPool = duplicateCheck.rows[0];
       await client.query("COMMIT");
-      
       return res.status(200).json({
         success: true,
         alreadyActive: true,
         navigateTo: "MatchingScreen",
-        pool: {
-          id: existingPool.id,
-          status: existingPool.status
-        }
+        pool: { id: existingPool.id, status: existingPool.status }
       });
     }
 
-    // 🎯 2. DYNAMIC LOOKUP: Resolve dropoff_hub_id using the highest stop_order
+    // 2. DYNAMIC LOOKUP: Resolve dropoff_hub_id
     let finalDropoffHubId = dropoff_hub_id;
-
     if (!finalDropoffHubId) {
-      console.log(`🔍 Looking up final stop for Route ID: ${route_id} from route_stops table...`);
-      
-      // Query gets the stop with the highest stop_order for this route
       const destinationLookup = await client.query(
-        `SELECT hub_id FROM route_stops 
-         WHERE route_id = $1 
-         ORDER BY stop_order DESC 
-         LIMIT 1;`,
+        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order DESC LIMIT 1;`,
         [parseInt(route_id, 10)]
       );
-
-      if (destinationLookup.rows.length > 0 && destinationLookup.rows[0].hub_id) {
-        finalDropoffHubId = destinationLookup.rows[0].hub_id;
-        console.log(`🎯 Dynamically resolved destination dropoff_hub_id: ${finalDropoffHubId} (Max stop_order)`);
-      } else {
-        // Fallback if Route 3 has issues (Megenagna Hub ID is 1 according to your hubs table)
-        finalDropoffHubId = 1; 
-        console.log(`⚠️ Route sequence query returned empty. Falling back dropoff_hub_id to: ${finalDropoffHubId}`);
-      }
+      finalDropoffHubId = destinationLookup.rows[0]?.hub_id || 1;
     }
 
-    // 3. Insert Entry with resolved variables
     const targetPickupHubId = pickup_hub_id || 7; 
+
+    // 3. Insert Entry
     const insertRes = await client.query(
       `INSERT INTO route_pool (user_id, route_id, pickup_hub_id, dropoff_hub_id, status, joined_at)
        VALUES ($1, $2, $3, $4, 'searching', NOW()) RETURNING id, status;`,
-      [
-        parseInt(user_id, 10), 
-        parseInt(route_id, 10), 
-        targetPickupHubId, 
-        finalDropoffHubId
-      ]
+      [parseInt(user_id, 10), parseInt(route_id, 10), targetPickupHubId, finalDropoffHubId]
     );
 
     const newPool = insertRes.rows[0];
+
+    // ⚡ UPGRADE: Trigger the Matching Engine immediately upon join
+    console.log(`⚡ Triggering Auto-Match for newly joined passenger: ${user_id}...`);
+    
+    // We pass null for forcedRideOfferId so the engine scans for ANY active driver
+    const matchPipelineResult = await executeCorridorAutoMatch(
+      client, 
+      parseInt(route_id, 10), 
+      targetPickupHubId
+    );
+
     await client.query("COMMIT");
     
-    console.log(`✅ User ${user_id} added to route_pool ID: ${newPool.id}`);
+    console.log(`✅ User ${user_id} registered and pipeline evaluated. Match Status: ${matchPipelineResult.status}`);
     
     return res.status(200).json({
       success: true,
@@ -761,21 +743,20 @@ app.post("/api/routes/join", async (req, res) => {
       pool: {
         id: newPool.id,
         status: newPool.status
-      }
+      },
+      match_pipeline: matchPipelineResult
     });
     
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("❌ Database operation failed inside join endpoint:", err.message);
+    console.error("❌ Database operation failed:", err.message);
     return res.status(500).json({ error: "DATABASE_ERROR", message: err.message });
   } finally {
     client.release();
   }
 });
-
 /* ---------------- START TRIP LIFECYCLE CONTROLLER ---------------- */
 // 🎯 Import or reference your matching engine runner here
-// const { runMatchingEngine } = require("./matcher"); 
 
 app.post("/api/rides/start-trip", async (req, res) => {
   const client = await pool.connect();
@@ -1262,21 +1243,25 @@ app.post("/api/rides/create", async (req, res) => {
     let activeOfferData = rideOfferQuery.rows[0];
     let matchPipelineResult = { status: "no_passengers_waiting", matchedCount: 0 };
 
-    // 🔍 DEMAND GUARD: Query route_pool first to see if there are actual waiting passengers
+    // 🔍 DEMAND GUARD: Check if passengers are actually waiting for this route at this hub
     const activeDemandQuery = await client.query(
       `SELECT COUNT(*) FROM route_pool 
        WHERE route_id = $1 
          AND pickup_hub_id = $2 
-         AND status = 'searching';`,
+         AND (
+           TRIM(LOWER(status)) = 'searching' 
+           OR (TRIM(LOWER(status)) = 'matched' AND matched_ride_offer_id IS NULL)
+         );`,
       [parseInt(route_id, 10), routeData.start_hub_id]
     );
 
     const waitingCount = parseInt(activeDemandQuery.rows[0].count, 10);
 
-    // ⚡ RUN MATCH PIPELINE ONLY IF DEMAND EXISTS
+    // ⚡ RUN THE ENGINE MATCH LOOP ONLY IF DEMAND EXISTS
     if (waitingCount > 0) {
       console.log(`⚡ ${waitingCount} passenger(s) waiting. Executing direct matching loop for Offer ID #${activeOfferData.offer_id}...`);
       
+      // Invoke your Central Matching Engine
       matchPipelineResult = await executeCorridorAutoMatch(
         client, 
         parseInt(route_id, 10), 
@@ -1284,10 +1269,11 @@ app.post("/api/rides/create", async (req, res) => {
         activeOfferData.offer_id
       );
 
-      // If matching succeeded, pull the updated seat capacity and seat pricing metrics
-      if (matchPipelineResult.status === "success" && matchPipelineResult.ride_id === activeOfferData.offer_id) {
-        console.log(`🎉 Instant Match Executed! ${matchPipelineResult.matchedCount} riders synchronized directly into the new trip run.`);
+      // Verify success from your auto-match output
+      if (matchPipelineResult.status === "success") {
+        console.log(`🎉 Instant Match Executed! ${matchPipelineResult.matchedCount} riders synchronized.`);
         
+        // Always refresh the seat and price state directly from database after engine run
         const refreshedOfferQuery = await client.query(
           `SELECT available_seats, price_per_seat FROM ride_offers WHERE id = $1;`,
           [activeOfferData.offer_id]
