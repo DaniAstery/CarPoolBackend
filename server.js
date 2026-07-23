@@ -1883,6 +1883,7 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
 });
 
 
+// 🔄 1. TRACK LIVE OFFER TELEMETRY ENDPOINT
 app.get("/api/rides/track-live/offer/:id", async (req, res) => {
   const rideOfferId = parseInt(req.params.id, 10);
 
@@ -1892,7 +1893,7 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
 
   try {
     const offerQuery = await pool.query(
-      `SELECT id, status, price_per_seat, pickup_lat, pickup_lng 
+      `SELECT id, status, price_per_seat, pickup_lat, pickup_lng, route_id 
        FROM ride_offers 
        WHERE id = $1`,
       [rideOfferId]
@@ -1904,18 +1905,21 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
 
     const offer = offerQuery.rows[0];
 
-    // 🎯 FIXED: Added 'matched' into the string matrix query loop block
+    // 🎯 UPGRADE: Join 'users' table to fetch real passenger names and contact info
     const passengersQuery = await pool.query(
-      `SELECT user_id, status 
-       FROM route_pool 
-       WHERE matched_ride_offer_id = $1
-         AND TRIM(LOWER(status)) IN ('matched', 'accepted', 'arrived', 'in_trip', 'intransit')`,
+      `SELECT rp.user_id, rp.status, u.full_name, u.phone_number 
+       FROM route_pool rp
+       JOIN users u ON rp.user_id = u.id
+       WHERE rp.matched_ride_offer_id = $1
+         AND TRIM(LOWER(rp.status)) IN ('matched', 'accepted', 'arrived', 'in_trip', 'intransit')`,
       [rideOfferId]
     );
 
     const trackingPayload = {
       rideOfferId: offer.id,
       rideStatus: offer.status, 
+      status: offer.status, // Support both casing variations for frontend resilience
+      route_id: offer.route_id,
       price_per_seat: offer.price_per_seat,
       driverLocation: {
         latitude: parseFloat(offer.pickup_lat) || 9.0106,
@@ -1924,6 +1928,8 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
       passengers: passengersQuery.rows.map(row => ({
         userId: parseInt(row.user_id, 10), 
         user_id: parseInt(row.user_id, 10), 
+        full_name: row.full_name || `Rider ${row.user_id}`,
+        phone_number: row.phone_number || "",
         status: row.status ? row.status.toString().trim().toLowerCase() : "matched" 
       }))
     };
@@ -1935,10 +1941,100 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
     return res.status(500).json({ error: "Internal server telemetry data retrieval error." });
   }
 });
+
+
 /**
- * 🔄 1. GET ACTIVE ASSIGNMENT PROPOSAL FOR DRIVER
+ * 🔄 GET ACTIVE ASSIGNMENT PROPOSAL FOR DRIVER
  * Route: GET /api/rides/driver-proposal/:driverId
  */
+app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
+  const driverId = parseInt(req.params.driverId, 10);
+
+  if (isNaN(driverId)) {
+    return res.status(400).json({ error: "Invalid driver identification parameter." });
+  }
+
+  try {
+    // 1. Fetch active ride offer for this driver including the accepted_passengers array column
+    const proposalQuery = await pool.query(
+      `SELECT id, route_id, status, start_location, end_location, departure_time, 
+              total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng,
+              accepted_passengers
+       FROM ride_offers 
+       WHERE driver_id = $1 
+         AND status IN ('pending', 'accepted', 'arrived', 'matched', 'in_trip', 'inprogress')
+       ORDER BY created_at DESC 
+       LIMIT 1`,
+      [driverId]
+    );
+
+    if (proposalQuery.rows.length === 0) {
+      return res.status(404).json({ hasActiveProposal: false, message: "No active proposals found." });
+    }
+
+    const offer = proposalQuery.rows[0];
+
+    // 2. Parse accepted_passengers array (handles Postgres array format or standard JS arrays)
+    let rawAcceptedIds = offer.accepted_passengers || [];
+    let acceptedIdsArray = [];
+
+    if (Array.isArray(rawAcceptedIds)) {
+      acceptedIdsArray = rawAcceptedIds.map(id => parseInt(id, 10)).filter(id => !isNaN(id));
+    } else if (typeof rawAcceptedIds === "string") {
+      acceptedIdsArray = rawAcceptedIds
+        .replace(/{|}/g, "")
+        .split(",")
+        .map(id => parseInt(id.trim(), 10))
+        .filter(id => !isNaN(id));
+    }
+
+    // 3. Fetch user details for the accepted passenger IDs from the users table
+    let passengerRows = [];
+    if (acceptedIdsArray.length > 0) {
+      const usersQuery = await pool.query(
+        `SELECT id AS user_id, full_name AS passenger_name, phone_number, 'accepted' AS status 
+         FROM users 
+         WHERE id = ANY($1::int[])`,
+        [acceptedIdsArray]
+      );
+      passengerRows = usersQuery.rows;
+    } else {
+      // Fallback: check route_pool if accepted_passengers array is empty
+      const routePoolQuery = await pool.query(
+        `SELECT rp.user_id, rp.status, u.full_name AS passenger_name, u.phone_number 
+         FROM route_pool rp
+         JOIN users u ON rp.user_id = u.id
+         WHERE rp.matched_ride_offer_id = $1`,
+        [offer.id]
+      );
+      passengerRows = routePoolQuery.rows;
+    }
+
+    return res.status(200).json({
+      hasActiveProposal: true,
+      id: offer.id,
+      ride_offer_id: offer.id,
+      route_id: offer.route_id,
+      status: offer.status,
+      start_location: offer.start_location,
+      end_location: offer.end_location,
+      departure_time: offer.departure_time,
+      total_seats: offer.total_seats,
+      available_seats: offer.available_seats,
+      price_per_seat: offer.price_per_seat,
+      pickup_lat: offer.pickup_lat,
+      pickup_lng: offer.pickup_lng,
+      accepted_passengers: acceptedIdsArray,
+      passengers: passengerRows
+    });
+
+  } catch (err) {
+    console.error("Driver proposal fetch error:", err);
+    return res.status(500).json({ error: "Internal server error retrieving driver proposal." });
+  }
+});
+
+
 app.get('/api/rides/driver-proposal/:driverId', async (req, res) => {
   const { driverId } = req.params;
   
@@ -2131,32 +2227,45 @@ app.post("/api/rides/driver-accept", async (req, res) => {
 // 🎯 ADD THIS TO YOUR BACKEND CONTROLLERS
 
 
+// Express Endpoint: GET /api/rides/active-accepted-offer
 app.get("/api/rides/active-accepted-offer", async (req, res) => {
-  const client = await pool.connect();
   try {
-    // Looks for the most recent offer that has been accepted but hasn't started the trip yet
-    const queryText = `
-      SELECT id, route_id, user_id, status 
-      FROM route_pool 
-      WHERE TRIM(LOWER(status)) IN ('accepted', 'arrived')
-      ORDER BY id DESC 
+    // 1. Get current active offer for driver (returns 'accepted' OR 'arrived')
+    const offerQuery = `
+      SELECT id, route_id, status 
+      FROM ride_offers 
+      WHERE status IN ('accepted', 'arrived') 
+      ORDER BY created_at DESC 
       LIMIT 1;
     `;
-    const result = await client.query(queryText);
+    const offerRes = await pool.query(offerQuery);
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "No currently active accepted ride offers found." });
+    if (offerRes.rows.length === 0) {
+      return res.status(404).json({ message: "No active offer found." });
     }
 
-    return res.status(200).json(result.rows[0]);
+    const offer = offerRes.rows[0];
+
+    // 2. Fetch all joined passengers for this offer from route_pool
+    const passengersQuery = `
+      SELECT rp.id, rp.user_id, u.full_name, u.phone_number, u.profile_photo_url, rp.status
+      FROM route_pool rp
+      JOIN users u ON rp.user_id = u.id
+      WHERE rp.matched_ride_offer_id = $1 AND rp.status IN ('accepted', 'arrived', 'matched');
+    `;
+    const passRes = await pool.query(passengersQuery, [offer.id]);
+
+    return res.json({
+      id: offer.id,
+      route_id: offer.route_id,
+      status: offer.status, // 👈 CRITICAL: returning 'arrived' if already pressed
+      passengers: passRes.rows // 👈 CRITICAL: returning the actual rider count
+    });
   } catch (err) {
-    console.error("❌ DISCOVERY ENDPOINT FAULT:", err.message);
-    return res.status(500).json({ error: "Internal database lookup exception for active allocations." });
-  } finally {
-    client.release();
+    console.error("Error fetching active offer state:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
-
 
 
 
