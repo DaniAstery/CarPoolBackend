@@ -265,89 +265,74 @@ app.get("/api/passenger/status/:userId", async (req, res) => {
 //this for fetching ride_offer_id for passenger to check which offer he is assigned to 
 app.get("/api/rides/status/:userId", async (req, res) => {
   const { userId } = req.params;
-  
-  if (!userId || isNaN(userId)) {
+  const cleanUserId = parseInt(userId, 10);
+
+  if (!userId || isNaN(cleanUserId)) {
     return res.status(400).json({ error: "A valid numeric userId parameter is required." });
   }
 
   try {
-    // 🔍 1. Fetch the active pool matching state for this user
-    const poolCheck = await pool.query(
-      `SELECT matched_ride_offer_id, status 
-       FROM route_pool 
-       WHERE user_id = $1 
-       ORDER BY joined_at DESC LIMIT 1`,
-      [parseInt(userId, 10)]
-    );
+    // 🚀 SINGLE-QUERY EXECUTION: Gets active pool, offer status, and co-riders in ONE database hop
+    const singleQuery = `
+      SELECT 
+        rp.matched_ride_offer_id,
+        rp.status AS my_status,
+        ro.status AS offer_status,
+        (
+          SELECT json_agg(json_build_object(
+            'userId', p.user_id,
+            'user_id', p.user_id,
+            'status', p.status
+          ))
+          FROM route_pool p
+          WHERE p.matched_ride_offer_id = rp.matched_ride_offer_id
+        ) AS passengers
+      FROM route_pool rp
+      LEFT JOIN ride_offers ro ON ro.id = rp.matched_ride_offer_id
+      WHERE rp.user_id = $1
+        AND rp.status NOT IN ('cancelled', 'completed')
+      ORDER BY rp.joined_at DESC
+      LIMIT 1;
+    `;
 
-    // If no matching active record exists in route_pool
-    if (poolCheck.rows.length === 0) {
+    const { rows } = await pool.query(singleQuery, [cleanUserId]);
+
+    // Case 1: User has no active pool or ride
+    if (rows.length === 0) {
       return res.json({
+        id: null,
+        ride_offer_id: null,
         matched_ride_offer_id: null,
         rideStatus: "pending",
+        driver_status: "pending",
         passengers: []
       });
     }
 
-    const { matched_ride_offer_id, status: userStatus } = poolCheck.rows[0];
+    const data = rows[0];
+    const offerId = data.matched_ride_offer_id ? parseInt(data.matched_ride_offer_id, 10) : null;
 
-    // If they aren't matched with an active ride offer yet, return early safely
-    if (!matched_ride_offer_id) {
-      return res.json({
-        matched_ride_offer_id: null,
-        rideStatus: "pending",
-        passengers: [{ userId: parseInt(userId, 10), status: userStatus }]
-      });
-    }
-
-    // 🔍 2. Fetch the actual status of the matched ride offer
-    const offerCheck = await pool.query(
-      `SELECT status, driver_id, accepted_passengers 
-       FROM ride_offers 
-       WHERE id = $1`,
-      [matched_ride_offer_id]
-    );
-
-    if (offerCheck.rows.length === 0) {
-      return res.json({
-        matched_ride_offer_id,
-        rideStatus: "pending",
-        passengers: [{ userId: parseInt(userId, 10), status: userStatus }]
-      });
-    }
-
-    const offer = offerCheck.rows[0];
-
-    // 🔍 3. Get all co-riders assigned to this exact pool cluster
-    const coRidersCheck = await pool.query(
-      `SELECT user_id, status 
-       FROM route_pool 
-       WHERE matched_ride_offer_id = $1`,
-      [matched_ride_offer_id]
-    );
-
-    const formattedPassengers = coRidersCheck.rows.map(row => ({
-      userId: row.user_id,
-      status: row.status
-    }));
-
-    // Send back the fully composed state
-    res.json({
-      matched_ride_offer_id: parseInt(matched_ride_offer_id, 10),
-      rideStatus: offer.status, // e.g., 'pending', 'accepted', 'completed'
-      passengers: formattedPassengers
+    // Case 2: Standard response normalized for ALL frontend formats (Driver + Passenger)
+    return res.json({
+      id: offerId,
+      ride_offer_id: offerId,
+      matched_ride_offer_id: offerId,
+      rideStatus: data.offer_status || "pending",
+      driver_status: data.offer_status || "pending", // Fixed: Added driver_status key
+      status: data.my_status,                         // Individual passenger's status
+      passengers: data.passengers || [
+        { userId: cleanUserId, user_id: cleanUserId, status: data.my_status }
+      ]
     });
 
   } catch (err) {
-    // 🛡️ Prevent Express crash! Log the error and return a safe HTTP 500
     console.error("❌ CRITICAL POLL ROUTE ERROR:", err.message);
-    res.status(500).json({ 
+    return res.status(500).json({ 
       error: "Internal server error occurred resolving status check.",
       details: err.message 
     });
   }
 });
-
 
 
 // Checking passenger Distance from requested hub 
@@ -1576,8 +1561,51 @@ app.post("/api/rides/accept-active-proposal", async (req, res) => {
 
 
 
+app.post('/api/rides/accept', async (req, res) => {
+  const { userId, rideOfferId } = req.body;
 
+  if (!userId || !rideOfferId) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
 
+  try {
+    // 1. Update the user's specific status in the pool to 'accepted'
+    const updateQuery = `
+      UPDATE route_pool
+      SET status = 'accepted', updated_at = NOW()
+      WHERE user_id = $1 AND ride_offer_id = $2
+      RETURNING *;
+    `;
+    const { rowCount } = await pool.query(updateQuery, [userId, rideOfferId]);
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: "Passenger record not found" });
+    }
+
+    // 2. (Optional but recommended) Check if everyone in the pool has accepted
+    // If yes, you can automatically update ride_offers.pool_status = 'ready' here.
+    const poolCheckQuery = `
+      SELECT COUNT(*) as total, 
+             SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END) as accepted_count
+      FROM route_pool 
+      WHERE ride_offer_id = $1;
+    `;
+    const poolCheck = await pool.query(poolCheckQuery, [rideOfferId]);
+    
+    if (poolCheck.rows[0].total === poolCheck.rows[0].accepted_count) {
+      await pool.query(`UPDATE ride_offers SET pool_status = 'ready' WHERE id = $1`, [rideOfferId]);
+    }
+
+    return res.status(200).json({ 
+      success: true, 
+      message: "Pickup proposal accepted" 
+    });
+
+  } catch (error) {
+    console.error("Error accepting pickup:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 
 
@@ -1915,35 +1943,44 @@ app.get('/api/rides/driver-proposal/:driverId', async (req, res) => {
   const { driverId } = req.params;
   
   try {
-    const query = `
-      SELECT 
-        ro.id, ro.driver_id, ro.vehicle_id, ro.start_location, ro.end_location, 
-        ro.total_seats, ro.available_seats, ro.price_per_seat, ro.status, ro.route_id,
-        ro.accepted_passengers,
-        COALESCE(
-          json_agg(
-            json_build_object(
-              'user_id', rp.user_id::integer,
-              'status', rp.status::text
-            )
-          ) FILTER (WHERE rp.user_id IS NOT NULL), '[]'
-        ) AS route_pool_passengers
-      FROM ride_offers ro
-      LEFT JOIN route_pool rp ON rp.matched_ride_offer_id = ro.id
-      WHERE ro.driver_id = $1 AND ro.status IN ('pending', 'accepted', 'inprogress')
-      GROUP BY ro.id
-      ORDER BY ro.created_at DESC
+    // 1. First, grab the driver's active ride offer
+    const offerQuery = `
+      SELECT id, driver_id, vehicle_id, start_location, end_location, 
+             total_seats, available_seats, price_per_seat, status, route_id,
+             accepted_passengers
+      FROM ride_offers
+      WHERE driver_id = $1 AND status IN ('pending', 'accepted', 'inprogress')
+      ORDER BY created_at DESC
       LIMIT 1;
     `;
     
-    const result = await pool.query(query, [parseInt(driverId, 10)]);
+    const offerResult = await pool.query(offerQuery, [parseInt(driverId, 10)]);
     
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: "No active dispatch assignment found for this driver." });
+    if (offerResult.rows.length === 0) {
+      return res.status(200).json({ 
+        hasActiveProposal: false, 
+        message: "No active dispatch assignment found for this driver." 
+      });
     }
     
-    const offer = result.rows[0];
+    const offer = offerResult.rows[0];
+    const rideOfferId = offer.id;
+
+    // 2. Query route_pool - Updated with u.full_name!
+    const poolQuery = `
+      SELECT 
+        rp.user_id::integer,
+        rp.status::text,
+        COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS passenger_name
+      FROM route_pool rp
+      LEFT JOIN users u ON u.id = rp.user_id
+      WHERE rp.matched_ride_offer_id = $1;
+    `;
     
+    const poolResult = await pool.query(poolQuery, [rideOfferId]);
+    const routePoolPassengers = poolResult.rows;
+
+    // 3. Sanitize accepted passengers list
     let passengerArray = [];
     if (offer.accepted_passengers) {
       passengerArray = Array.isArray(offer.accepted_passengers) 
@@ -1951,8 +1988,11 @@ app.get('/api/rides/driver-proposal/:driverId', async (req, res) => {
         : offer.accepted_passengers.replace(/{|}/g, '').split(',').map(Number);
     }
 
+    // 4. Send the accurate structure back to React Native
     res.json({
+      hasActiveProposal: true,
       id: offer.id,
+      ride_offer_id: offer.id,
       driver_id: offer.driver_id,
       vehicle_id: offer.vehicle_id,
       start_location: offer.start_location,
@@ -1963,7 +2003,7 @@ app.get('/api/rides/driver-proposal/:driverId', async (req, res) => {
       status: offer.status, 
       route_id: offer.route_id,
       accepted_passengers: passengerArray, 
-      route_pool_passengers: offer.route_pool_passengers
+      route_pool_passengers: routePoolPassengers
     });
 
   } catch (err) {
