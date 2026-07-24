@@ -2108,119 +2108,87 @@ app.get('/api/rides/driver-proposal/:driverId', async (req, res) => {
   }
 });
 
-app.post("/api/rides/driver-accept", async (req, res) => {
-  const { ride_offer_id, driver_id } = req.body;
+/**
+ * 🔄 GET ACTIVE ASSIGNMENT PROPOSAL FOR DRIVER
+ * Route: GET /api/rides/driver-proposal/:driverId
+ */
+/**
+ * 🔄 GET ACTIVE ASSIGNMENT PROPOSAL FOR DRIVER
+ * Route: GET /api/rides/driver-proposal/:driverId
+ */
+app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
+  const driverId = parseInt(req.params.driverId, 10);
 
-  if (!ride_offer_id || !driver_id) {
-    return res.status(400).json({ error: "Missing ride_offer_id or driver_id parameters." });
+  if (isNaN(driverId)) {
+    return res.status(400).json({ error: "Invalid driver identification parameter." });
   }
 
-  const client = await pool.connect();
-
   try {
-    await client.query("BEGIN");
+    // 1. Fetch active ride offer for this driver
+    const proposalQuery = await pool.query(
+      `SELECT id, route_id, status, start_location, end_location, departure_time, 
+              total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng,
+              accepted_passengers
+       FROM ride_offers 
+       WHERE driver_id = $1 
+         AND status IN ('pending', 'accepted', 'arrived', 'matched', 'in_trip', 'inprogress')
+       ORDER BY created_at DESC 
+       LIMIT 1`,
+      [driverId]
+    );
 
-    // Fetch details using actual schema column fields
-    const offerQuery = `
-      SELECT id, route_id, accepted_passengers, total_seats 
-      FROM ride_offers 
-      WHERE id = $1 AND driver_id = $2 FOR UPDATE
-    `;
-    const offerRes = await client.query(offerQuery, [ride_offer_id, driver_id]);
-
-    if (offerRes.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Active dispatch offer not found or driver allocation mismatch." });
+    if (proposalQuery.rows.length === 0) {
+      return res.status(404).json({ hasActiveProposal: false, message: "No active proposals found." });
     }
 
-    const offer = offerRes.rows[0];
-    const { route_id, total_seats } = offer;
+    const offer = proposalQuery.rows[0];
 
-    let confirmedPassengerIds = [];
-    if (offer.accepted_passengers) {
-      if (Array.isArray(offer.accepted_passengers)) {
-        confirmedPassengerIds = offer.accepted_passengers.map(id => parseInt(id, 10));
-      } else if (typeof offer.accepted_passengers === "string") {
-        confirmedPassengerIds = offer.accepted_passengers
-          .replace(/{|}/g, "")
-          .split(",")
-          .map(id => parseInt(id.trim(), 10))
-          .filter(id => !isNaN(id));
-      }
+    // 2. Parse accepted_passengers array safely
+    let rawAcceptedIds = offer.accepted_passengers || [];
+    let acceptedIdsArray = [];
+
+    if (Array.isArray(rawAcceptedIds)) {
+      acceptedIdsArray = rawAcceptedIds.map(id => parseInt(id, 10)).filter(id => !isNaN(id));
+    } else if (typeof rawAcceptedIds === "string") {
+      acceptedIdsArray = rawAcceptedIds
+        .replace(/{|}/g, "")
+        .split(",")
+        .map(id => parseInt(id.trim(), 10))
+        .filter(id => !isNaN(id));
     }
 
-    if (confirmedPassengerIds.length < 2) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "Cannot accept dispatch. Minimum core passenger threshold not met." });
-    }
-
-    const finalAvailableSeats = total_seats - confirmedPassengerIds.length;
-    
-    // 1. Update the master ride offer state to 'accepted'
-    const updateOfferQuery = `
-      UPDATE ride_offers 
-      SET status = 'accepted', available_seats = $1 
-      WHERE id = $2
-    `;
-    await client.query(updateOfferQuery, [finalAvailableSeats, ride_offer_id]);
-
-    // 2. 🎯 SYNCING STATUS: Also switch the active manifest pairs inside route_pool to 'accepted'
-    if (confirmedPassengerIds.length > 0) {
-      const updatePassengerPoolQuery = `
-        UPDATE route_pool 
-        SET status = 'accepted' 
-        WHERE matched_ride_offer_id = $1 
-        AND user_id IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
-      `;
-      await client.query(updatePassengerPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
-    }
-
-    const deleteQueueQuery = `DELETE FROM driver_queue WHERE driver_id = $1`;
-    await client.query(deleteQueueQuery, [driver_id]);
-
-    // Dynamically resolve active hub assignment parameters from the route pool data
-    let targetHubId = 1; 
-    const hubLookupQuery = `SELECT pickup_hub_id FROM route_pool WHERE matched_ride_offer_id = $1 LIMIT 1`;
-    const hubRes = await client.query(hubLookupQuery, [ride_offer_id]);
-    if (hubRes.rows.length > 0 && hubRes.rows[0].pickup_hub_id) {
-      targetHubId = parseInt(hubRes.rows[0].pickup_hub_id, 10);
-    }
-
-    // Recycle unaccepted entries inside route_pool table mapping relationships
-    if (confirmedPassengerIds.length > 0) {
-      const resetLeftoverPoolQuery = `
-        UPDATE route_pool 
-        SET status = 'searching', matched_ride_offer_id = NULL 
-        WHERE matched_ride_offer_id = $1 
-        AND user_id NOT IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
-        RETURNING user_id
-      `;
-      
-      const resetRes = await client.query(resetLeftoverPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
-      console.log(`[Corridor Dispatch] Locked ${confirmedPassengerIds.length} riders. Kicked out ${resetRes.rows.length} pending riders back to searching stack.`);
-    }
-
-    await client.query("COMMIT");
-
-    // Invoke matching engine asynchronously
-    executeCorridorAutoMatch(pool, route_id, targetHubId)
-      .then(() => console.log(`[AutoMatch] Execution loop context processed cleanly for Route ${route_id}`))
-      .catch((err) => console.error("[AutoMatch Error] Async dispatch node loop failure:", err));
+    // 3. 🎯 FIX: Use LEFT JOIN and COALESCE so route_pool records return even if user profiles fail/miss join
+    const passengersQuery = await pool.query(
+      `SELECT rp.user_id, rp.status, 
+              COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS passenger_name, 
+              u.phone_number 
+       FROM route_pool rp
+       LEFT JOIN users u ON rp.user_id = u.id
+       WHERE rp.matched_ride_offer_id = $1`,
+      [offer.id]
+    );
 
     return res.status(200).json({
-      success: true,
-      message: "Manifest and passenger pool locked in as 'accepted'. Leftover riders recycled.",
-      rideOfferId: ride_offer_id,
-      acceptedCount: confirmedPassengerIds.length,
-      availableSeats: finalAvailableSeats
+      hasActiveProposal: true,
+      id: offer.id,
+      ride_offer_id: offer.id,
+      route_id: offer.route_id,
+      status: offer.status,
+      start_location: offer.start_location,
+      end_location: offer.end_location,
+      departure_time: offer.departure_time,
+      total_seats: offer.total_seats,
+      available_seats: offer.available_seats,
+      price_per_seat: offer.price_per_seat,
+      pickup_lat: offer.pickup_lat,
+      pickup_lng: offer.pickup_lng,
+      accepted_passengers: acceptedIdsArray,
+      passengers: passengersQuery.rows
     });
 
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("Critical failure during driver-accept execution sequence:", error);
-    return res.status(500).json({ error: "Internal transaction failure inside processing node." });
-  } finally {
-    client.release();
+  } catch (err) {
+    console.error("Driver proposal fetch error:", err);
+    return res.status(500).json({ error: "Internal server error retrieving driver proposal." });
   }
 });
 
