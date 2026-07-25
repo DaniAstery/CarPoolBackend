@@ -391,242 +391,147 @@ app.post("/api/test/distance", (req, res) => {
 });
 
 
-/* ========================================================================= 
-   🚀 ENGINE: UNIFIED RELATIONAL STOP-ORDER CORRIDOR AUTO-MATCH & RECOVERY
-   ========================================================================= */
-async function executeCorridorAutoMatch(client, route_id, forcedRideOfferId = null) {
-  console.log(`🎬 Relational Stop-Order Matching Engine Invoked: Route [${route_id}]`);
 
-  // -------------------------------------------------------------------------
-  // STEP 1: FETCH ELIGIBLE PASSENGERS USING STRICT ROUTE_STOPS MAPPING (PICKUP & DROPOFF)
-  // -------------------------------------------------------------------------
+async function executeCorridorAutoMatch(client, route_id, param3 = null, param4 = null) {
+  let forcedRideOfferId = param4 !== null ? param4 : (param3 !== null ? param3 : null);
+
+  console.log(`\n🎬 [ENGINE START] Route [${route_id}] | ForcedOffer: ${forcedRideOfferId || 'None'}`);
+
+  // 1. FETCH ELIGIBLE SEARCHING PASSENGERS WITH STOP ORDERS (Explicit Casting)
   const waitingPassengersQuery = await client.query(
-    `SELECT rp.id, 
-            rp.user_id, 
-            rp.route_id, 
-            rp.pickup_hub_id, 
-            rp.dropoff_hub_id, 
-            rp.status, 
+    `SELECT rp.id, rp.user_id, rp.status, 
+            rp.pickup_hub_id, rp.dropoff_hub_id,
             rs_pickup.stop_order AS pickup_stop_order,
             rs_dropoff.stop_order AS dropoff_stop_order
      FROM route_pool rp
-     -- Validate and map pickup_hub_id against route_stops for this route_id
-     JOIN route_stops rs_pickup 
-       ON rs_pickup.route_id = rp.route_id 
-       AND rs_pickup.hub_id = rp.pickup_hub_id
-     -- Validate and map dropoff_hub_id against route_stops for this route_id
-     JOIN route_stops rs_dropoff 
-       ON rs_dropoff.route_id = rp.route_id 
-       AND rs_dropoff.hub_id = rp.dropoff_hub_id
+     JOIN route_stops rs_pickup ON rs_pickup.route_id = rp.route_id AND rs_pickup.hub_id::int = rp.pickup_hub_id::int
+     JOIN route_stops rs_dropoff ON rs_dropoff.route_id = rp.route_id AND rs_dropoff.hub_id::int = rp.dropoff_hub_id::int
      WHERE rp.route_id = $1 
-       -- Enforce directional integrity: dropoff must happen after pickup in stop sequence
        AND rs_dropoff.stop_order > rs_pickup.stop_order
        AND (
          TRIM(LOWER(rp.status)) = 'searching' 
          OR (TRIM(LOWER(rp.status)) = 'matched' AND rp.matched_ride_offer_id IS NULL)
        )
-     -- Order strictly by route direction (stop_order) then arrival time (FIFO)
      ORDER BY rs_pickup.stop_order ASC, rp.joined_at ASC 
-     FOR UPDATE OF rp SKIP LOCKED;`,
+     FOR UPDATE OF rp;`,
     [route_id]
   );
 
   let availableRiders = waitingPassengersQuery.rows;
+  console.log(`👥 Eligible Passengers Found: ${availableRiders.length}`);
+
   if (availableRiders.length === 0) {
-    console.log(`ℹ️ No eligible relational passengers found for Route [${route_id}].`);
-    return { status: "idle", matchedCount: 0, message: "Passenger pool empty for route stops." };
+    return { status: "idle", matchedCount: 0, message: "No eligible searching passengers found." };
   }
 
-  // -------------------------------------------------------------------------
-  // STEP 2: TARGETED RECOVERY & TOP-UP FOR EXISTING RIDE OFFERS
-  // -------------------------------------------------------------------------
+  // 2. FETCH OPEN RIDE OFFERS (Explicit Numeric Casting)
   let openOffers = [];
-
   if (forcedRideOfferId) {
     const forcedOfferQuery = await client.query(
-      `SELECT id, available_seats, total_seats FROM ride_offers WHERE id = $1 FOR UPDATE;`,
+      `SELECT ro.id, ro.driver_id, ro.total_seats, ro.available_seats, ro.price_per_seat, ro.status,
+              rs_start.stop_order AS start_stop_order,
+              rs_end.stop_order AS end_stop_order
+       FROM ride_offers ro
+       LEFT JOIN route_stops rs_start ON rs_start.route_id = ro.route_id AND rs_start.hub_id::text = ro.start_location::text
+       LEFT JOIN route_stops rs_end ON rs_end.route_id = ro.route_id AND rs_end.hub_id::text = ro.end_location::text
+       WHERE ro.id = $1 FOR UPDATE;`,
       [forcedRideOfferId]
     );
-    if (forcedOfferQuery.rows.length > 0) {
-      openOffers = forcedOfferQuery.rows;
-    }
+    if (forcedOfferQuery.rows.length > 0) openOffers = forcedOfferQuery.rows;
   } else {
     const openOffersQuery = await client.query(
-      `SELECT id, available_seats, total_seats FROM ride_offers
-       WHERE route_id = $1 AND TRIM(LOWER(status)) IN ('pending', 'accepted', 'arrived', 'in_trip') AND available_seats > 0
-       ORDER BY created_at ASC FOR UPDATE;`,
+      `SELECT ro.id, ro.driver_id, ro.total_seats, ro.available_seats, ro.price_per_seat, ro.status,
+              rs_start.stop_order AS start_stop_order,
+              rs_end.stop_order AS end_stop_order
+       FROM ride_offers ro
+       LEFT JOIN route_stops rs_start ON rs_start.route_id = ro.route_id AND rs_start.hub_id::text = ro.start_location::text
+       LEFT JOIN route_stops rs_end ON rs_end.route_id = ro.route_id AND rs_end.hub_id::text = ro.end_location::text
+       WHERE ro.route_id = $1 
+         AND TRIM(LOWER(ro.status)) IN ('pending', 'accepted', 'arrived') 
+         AND ro.available_seats > 0
+       ORDER BY ro.created_at ASC FOR UPDATE;`,
       [route_id]
     );
     openOffers = openOffersQuery.rows;
   }
 
-  let passengerIndex = 0;
+  console.log(`🚗 Open Ride Offers Available: ${openOffers.length}`);
 
+  if (openOffers.length === 0) {
+    return { status: "no_offers", matchedCount: 0, message: "No active ride offers with available seats." };
+  }
+
+  let totalMatchedCount = 0;
+
+  // 3. MATCHING LOOP: Segment Validation & Capacity Allocation
   for (const offer of openOffers) {
     let seatsAvailable = offer.available_seats; 
     let matchedInThisCycle = 0;
-    const batchPassengerUserIds = [];
+    
+    const offerStartStop = offer.start_stop_order || 1;
+    const offerEndStop = offer.end_stop_order || 999;
 
-    while (seatsAvailable > 0 && passengerIndex < availableRiders.length) {
-      const targetPassenger = availableRiders[passengerIndex];
-      
-      console.log(`⚡ Relational Bind: Passenger Row ID ${targetPassenger.id} (Pickup Stop Order: ${targetPassenger.pickup_stop_order}) -> Ride Offer ${offer.id}`);
+    let unassignedThisOffer = [];
 
-      await client.query(
-        `UPDATE route_pool 
-         SET status = 'matched', matched_ride_offer_id = $1 
-         WHERE id = $2;`,
-        [offer.id, targetPassenger.id]
-      );
+    for (const passenger of availableRiders) {
+      const isValidSegment = 
+        passenger.pickup_stop_order >= offerStartStop && 
+        passenger.dropoff_stop_order <= offerEndStop &&
+        seatsAvailable > 0;
 
-      batchPassengerUserIds.push(targetPassenger.user_id);
-      seatsAvailable--;
-      passengerIndex++;
-      matchedInThisCycle++;
+      if (isValidSegment) {
+        console.log(`⚡ MATCHED: Passenger ID ${passenger.user_id} (Stops ${passenger.pickup_stop_order}-${passenger.dropoff_stop_order}) -> Ride Offer #${offer.id}`);
+
+        // Update route_pool status to matched and bind offer ID
+        await client.query(
+          `UPDATE route_pool 
+           SET status = 'matched', matched_ride_offer_id = $1 
+           WHERE id = $2;`,
+          [offer.id, passenger.id]
+        );
+
+        seatsAvailable--;
+        matchedInThisCycle++;
+        totalMatchedCount++;
+      } else {
+        unassignedThisOffer.push(passenger);
+      }
     }
 
+    availableRiders = unassignedThisOffer;
+
+    // 4. UPDATE RIDE OFFER CAPACITY & DYNAMIC PRICING
     if (matchedInThisCycle > 0) {
-      const totalMatchedNow = offer.total_seats - seatsAvailable;
-      const finalPrice = totalMatchedNow >= 3 ? 80 : 100; 
+      const totalFilled = offer.total_seats - seatsAvailable;
+      const finalPrice = totalFilled >= 3 ? 80.00 : offer.price_per_seat; 
 
       await client.query(
         `UPDATE ride_offers 
-         SET available_seats = $1, 
-             price_per_seat = $2, 
-             accepted_passengers = array_cat(accepted_passengers, $4::int[]) 
+         SET available_seats = $1, price_per_seat = $2 
          WHERE id = $3;`,
-        [seatsAvailable, finalPrice, offer.id, batchPassengerUserIds]
+        [seatsAvailable, finalPrice, offer.id]
       );
+      
+      console.log(`✅ Offer #${offer.id} Updated: ${seatsAvailable} seats remaining @ ${finalPrice} ETB`);
     }
 
-    if (passengerIndex >= availableRiders.length) break;
+    if (availableRiders.length === 0) break;
   }
 
-  const totalMatchedCount = passengerIndex;
-  availableRiders = availableRiders.slice(passengerIndex);
-
-  if (forcedRideOfferId) {
-    return {
-      status: "success",
-      ride_id: forcedRideOfferId,
-      matchedCount: totalMatchedCount,
-      message: "Relational stop-order match execution completed successfully."
-    };
+  // 5. OVERFLOW HANDLING
+  if (availableRiders.length > 0 && forcedRideOfferId) {
+    for (const overflowPassenger of availableRiders) {
+      await client.query(
+        `UPDATE route_pool 
+         SET status = 'searching', matched_ride_offer_id = NULL 
+         WHERE id = $1;`,
+        [overflowPassenger.id]
+      );
+    }
   }
 
-  // -------------------------------------------------------------------------
-  // STEP 3: INITIALIZE NEW CORRIDOR BATCH / DRIVER QUEUE DISPATCH
-  // -------------------------------------------------------------------------
-  if (availableRiders.length < 2 && !forcedRideOfferId) {
-    return { 
-      status: "buffering", 
-      matchedCount: totalMatchedCount, 
-      message: "Awaiting baseline relational pairs for driver dispatch." 
-    };
-  }
-
-  const topDriverQuery = await client.query(
-    `SELECT id, driver_id, vehicle_id, capacity FROM driver_queue 
-     WHERE route_id = $1 AND TRIM(LOWER(status)) IN ('queued', 'waiting')
-     ORDER BY entered_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED;`,
-    [route_id]
-  );
-
-  const activeDriver = topDriverQuery.rows[0];
-
-  if (!activeDriver) {
-    return { 
-      status: "buffering_no_driver", 
-      matchedCount: totalMatchedCount, 
-      message: "Riders grouped via relational stop-order; awaiting driver queue entry." 
-    };
-  }
-
-  // -------------------------------------------------------------------------
-  // STEP 4: STANDARD DISPATCH MATCHING FOR AVAILABLE DRIVER (CORRIDOR WIDE)
-  // -------------------------------------------------------------------------
-  const maxBatchSize = Math.min(activeDriver.capacity, 3); 
-  const initialBatch = availableRiders.slice(0, maxBatchSize);
-  const matchedCount = initialBatch.length;
-
-  if (matchedCount === 0) {
-    return { status: "idle", matchedCount: 0, message: "No unassigned riders to dispatch." };
-  }
-
-  const routeMetaData = await client.query(`SELECT base_price FROM routes WHERE id = $1;`, [route_id]);
-  const basePrice = parseFloat(routeMetaData.rows[0]?.base_price) || 100;
-
-  // Fetch full corridor terminal stops from route_stops for accurate ride offer naming/coordinates
-  const routeStopsQuery = await client.query(
-    `SELECT h.name, h.latitude, h.longitude 
-     FROM route_stops rs JOIN hubs h ON h.id = rs.hub_id 
-     WHERE rs.route_id = $1 ORDER BY rs.stop_order ASC;`,
-    [route_id]
-  );
-
-  const stops = routeStopsQuery.rows;
-  const startLoc = stops[0]?.name || "Terminal Start";
-  const endLoc = stops[stops.length - 1]?.name || "Terminal End";
-  const startLat = stops[0]?.latitude || 9.0106;
-  const startLng = stops[0]?.longitude || 38.7894;
-
-  const finalPricePerSeat = matchedCount >= 3 ? 80 : basePrice;
-  const remainingSeats = activeDriver.capacity - matchedCount;
-  const passengerIds = initialBatch.map(p => p.id);
-  const passengerUserIds = initialBatch.map(p => p.user_id);
-
-  const matchTransactionQuery = await client.query(
-    `WITH inserted_ride AS (
-      INSERT INTO ride_offers (
-        driver_id, vehicle_id, route_id, start_location, end_location, 
-        total_seats, available_seats, price_per_seat, status, departure_time, created_at, accepted_passengers, pickup_lat, pickup_lng
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW(), $10::int[], $11, $12)
-      RETURNING id
-    )
-    UPDATE route_pool 
-    SET status = 'matched', matched_ride_offer_id = (SELECT id FROM inserted_ride) 
-    WHERE id = ANY($9::int[])
-    RETURNING (SELECT id FROM inserted_ride) AS new_ride_offer_id;`,
-    [
-      activeDriver.driver_id, activeDriver.vehicle_id, route_id, startLoc, endLoc,
-      activeDriver.capacity, remainingSeats, finalPricePerSeat, passengerIds, passengerUserIds, startLat, startLng
-    ]
-  );
-
-  const generatedRideOfferId = matchTransactionQuery.rows[0]?.new_ride_offer_id;
-
-  await client.query(
-    `UPDATE driver_queue SET status = 'disrupted' WHERE vehicle_id = $1;`,
-    [activeDriver.vehicle_id]
-  );
-
-  return {
-    status: "success",
-    ride_id: generatedRideOfferId,
-    matchedCount: matchedCount,
-    finalPrice: finalPricePerSeat
-  };
+  return { status: "success", matchedCount: totalMatchedCount };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -717,7 +622,24 @@ app.post("/api/routes/join", async (req, res) => {
       });
     }
 
-    // 2. DYNAMIC LOOKUP: Resolve dropoff_hub_id
+    // 2. DYNAMIC LOOKUP: Resolve pickup_hub_id if missing
+    let targetPickupHubId = pickup_hub_id;
+    if (!targetPickupHubId) {
+      const pickupLookup = await client.query(
+        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order ASC LIMIT 1;`,
+        [parseInt(route_id, 10)]
+      );
+      targetPickupHubId = pickupLookup.rows[0]?.hub_id;
+      if (!targetPickupHubId) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "MISSING_PICKUP_HUB",
+          message: "pickup_hub_id is required and could not be resolved from route stops."
+        });
+      }
+    }
+
+    // 3. DYNAMIC LOOKUP: Resolve dropoff_hub_id if missing
     let finalDropoffHubId = dropoff_hub_id;
     if (!finalDropoffHubId) {
       const destinationLookup = await client.query(
@@ -727,30 +649,18 @@ app.post("/api/routes/join", async (req, res) => {
       finalDropoffHubId = destinationLookup.rows[0]?.hub_id || 1;
     }
 
-    const targetPickupHubId = pickup_hub_id ; 
-
-    // 3. Insert Entry
+    // 4. Insert Entry strictly into route_pool with 'searching' status (NO ride_offers interaction)
     const insertRes = await client.query(
       `INSERT INTO route_pool (user_id, route_id, pickup_hub_id, dropoff_hub_id, status, joined_at)
        VALUES ($1, $2, $3, $4, 'searching', NOW()) RETURNING id, status;`,
-      [parseInt(user_id, 10), parseInt(route_id, 10), targetPickupHubId, finalDropoffHubId]
+      [parseInt(user_id, 10), parseInt(route_id, 10), parseInt(targetPickupHubId, 10), parseInt(finalDropoffHubId, 10)]
     );
 
     const newPool = insertRes.rows[0];
 
-    // ⚡ UPGRADE: Trigger the Matching Engine immediately upon join
-    console.log(`⚡ Triggering Auto-Match for newly joined passenger: ${user_id}...`);
-    
-    // We pass null for forcedRideOfferId so the engine scans for ANY active driver
-    const matchPipelineResult = await executeCorridorAutoMatch(
-      client, 
-      parseInt(route_id, 10), 
-      targetPickupHubId
-    );
-
     await client.query("COMMIT");
     
-    console.log(`✅ User ${user_id} registered and pipeline evaluated. Match Status: ${matchPipelineResult.status}`);
+    console.log(`✅ User ${user_id} registered into route_pool queue (searching).`);
     
     return res.status(200).json({
       success: true,
@@ -759,8 +669,7 @@ app.post("/api/routes/join", async (req, res) => {
       pool: {
         id: newPool.id,
         status: newPool.status
-      },
-      match_pipeline: matchPipelineResult
+      }
     });
     
   } catch (err) {
@@ -771,6 +680,112 @@ app.post("/api/routes/join", async (req, res) => {
     client.release();
   }
 });
+
+app.post("/api/routes/join", async (req, res) => {
+  const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
+
+  if (!route_id || !user_id) {
+    return res.status(400).json({ 
+      error: "MISSING_FIELDS", 
+      message: "Required mapping references (route_id, user_id) are missing." 
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1. Duplicate Verification Loop
+    const duplicateCheck = await client.query(
+      `SELECT id, status FROM route_pool 
+       WHERE user_id = $1 AND TRIM(LOWER(status)) != 'completed' 
+       AND status != 'cancelled' LIMIT 1 FOR UPDATE;`, 
+      [parseInt(user_id, 10)]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      const existingPool = duplicateCheck.rows[0];
+      await client.query("COMMIT");
+      return res.status(200).json({
+        success: true,
+        alreadyActive: true,
+        navigateTo: "MatchingScreen",
+        pool: { id: existingPool.id, status: existingPool.status }
+      });
+    }
+
+    // 2. DYNAMIC LOOKUP: Resolve pickup_hub_id if missing
+    let targetPickupHubId = pickup_hub_id;
+    if (!targetPickupHubId) {
+      const pickupLookup = await client.query(
+        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order ASC LIMIT 1;`,
+        [parseInt(route_id, 10)]
+      );
+      targetPickupHubId = pickupLookup.rows[0]?.hub_id;
+      if (!targetPickupHubId) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "MISSING_PICKUP_HUB",
+          message: "pickup_hub_id is required and could not be resolved from route stops."
+        });
+      }
+    }
+
+    // 3. DYNAMIC LOOKUP: Resolve dropoff_hub_id if missing
+    let finalDropoffHubId = dropoff_hub_id;
+    if (!finalDropoffHubId) {
+      const destinationLookup = await client.query(
+        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order DESC LIMIT 1;`,
+        [parseInt(route_id, 10)]
+      );
+      finalDropoffHubId = destinationLookup.rows[0]?.hub_id || 1;
+    }
+
+    // 4. Insert Entry strictly into route_pool with 'searching' status (NO ride_offers interaction)
+    const insertRes = await client.query(
+      `INSERT INTO route_pool (user_id, route_id, pickup_hub_id, dropoff_hub_id, status, joined_at)
+       VALUES ($1, $2, $3, $4, 'searching', NOW()) RETURNING id, status;`,
+      [parseInt(user_id, 10), parseInt(route_id, 10), parseInt(targetPickupHubId, 10), parseInt(finalDropoffHubId, 10)]
+    );
+
+    const newPool = insertRes.rows[0];
+
+    await client.query("COMMIT");
+    
+    console.log(`✅ User ${user_id} registered into route_pool queue (searching).`);
+    
+    return res.status(200).json({
+      success: true,
+      message: "Successfully registered into match queue.",
+      alreadyActive: false,
+      pool: {
+        id: newPool.id,
+        status: newPool.status
+      }
+    });
+    
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Database operation failed:", err.message);
+    return res.status(500).json({ error: "DATABASE_ERROR", message: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /* ---------------- START TRIP LIFECYCLE CONTROLLER ---------------- */
 // 🎯 Import or reference your matching engine runner here
 
@@ -1102,11 +1117,19 @@ app.get("/api/rides/:rideId/pool-manifest", async (req, res) => {
 
 // ---------------- DRIVER SIDE: CREATE A NEW RIDE OFFER ----------------
 
-// POST /api/rides/create
 app.post("/api/rides/create", async (req, res) => {
   const client = await pool.connect();
   try {
-    const { driver_id, route_id, total_seats } = req.body;
+    // 🎯 1. Extract fields from frontend payload
+    const { 
+      driver_id, 
+      route_id, 
+      total_seats,
+      start_location, // Expects Hub ID number (e.g., 1 or "1")
+      end_location,   // Expects Hub ID number (e.g., 4 or "4")
+      pickup_lat,     
+      pickup_lng      
+    } = req.body;
 
     if (!driver_id || !route_id) {
       return res.status(400).json({ 
@@ -1133,7 +1156,7 @@ app.post("/api/rides/create", async (req, res) => {
       [parseInt(driver_id, 10)]
     );
 
-    // 🚨 VEHICLE CONSTRAINT GUARD: Prevents matching engine rollback crashes
+    // 🚨 VEHICLE CONSTRAINT GUARD
     if (vehicleQuery.rows.length === 0) {
       return res.status(400).json({ 
         error: "VEHICLE_REQUIRED", 
@@ -1142,7 +1165,7 @@ app.post("/api/rides/create", async (req, res) => {
     }
 
     const driverName = driverProfileQuery.rows[0].full_name;
-    const resolvedVehicleId = vehicleQuery.rows[0].id; // Guaranteed safe
+    const resolvedVehicleId = vehicleQuery.rows[0].id;
     const carMake = vehicleQuery.rows[0].make || "Corridor";
     const carModel = vehicleQuery.rows[0].model || "Vehicle";
     const vehicleCapacity = vehicleQuery.rows[0].capacity || total_seats || 4;
@@ -1166,10 +1189,11 @@ app.post("/api/rides/create", async (req, res) => {
       });
     }
 
-    // 3. Collect Route, Geometry, and Hub Information
+    // 3. Collect Route, Geometry, and Hub IDs
     const routeGeomQuery = await client.query(
       `SELECT r.base_price, 
-              ARRAY_AGG(h.name ORDER BY rs.stop_order) AS stops,
+              ARRAY_AGG(h.id ORDER BY rs.stop_order) AS hub_ids,
+              ARRAY_AGG(h.name ORDER BY rs.stop_order) AS hub_names,
               (ARRAY_AGG(h.id ORDER BY rs.stop_order))[1] AS start_hub_id,
               (ARRAY_AGG(h.name ORDER BY rs.stop_order))[1] AS start_hub_name,
               (ARRAY_AGG(h.latitude ORDER BY rs.stop_order))[1] AS start_lat,
@@ -1183,7 +1207,7 @@ app.post("/api/rides/create", async (req, res) => {
     );
     
     const routeData = routeGeomQuery.rows[0];
-    if (!routeData || !routeData.stops || routeData.stops.length < 2) {
+    if (!routeData || !routeData.hub_ids || routeData.hub_ids.length < 2) {
       await client.query("ROLLBACK");
       return res.status(400).json({ 
         error: "INCOMPLETE_ROUTE", 
@@ -1191,11 +1215,14 @@ app.post("/api/rides/create", async (req, res) => {
       });
     }
 
-    const startLoc = routeData.stops[0];
-    const endLoc = routeData.stops[routeData.stops.length - 1];
+    // 🎯 4. Enforce saving Hub ID numbers (e.g., "1" and "4") instead of alphabet string names
+    const finalStartLoc = start_location !== undefined && start_location !== null ? String(start_location) : String(routeData.hub_ids[0]);
+    const finalEndLoc = end_location !== undefined && end_location !== null ? String(end_location) : String(routeData.hub_ids[routeData.hub_ids.length - 1]);
+    const finalPickupLat = pickup_lat || routeData.start_lat;
+    const finalPickupLng = pickup_lng || routeData.start_lng;
     const pricePerSeat = routeData.base_price;
 
-    // 4. SYNCHRONIZE DRIVER QUEUE STATE
+    // 5. SYNCHRONIZE DRIVER QUEUE STATE
     const queueCheck = await client.query(
       `SELECT id FROM driver_queue WHERE driver_id = $1 LIMIT 1;`,
       [parseInt(driver_id, 10)]
@@ -1212,31 +1239,17 @@ app.post("/api/rides/create", async (req, res) => {
              capacity = $5, 
              entered_at = CURRENT_TIMESTAMP
          WHERE driver_id = $6;`,
-        [
-          resolvedVehicleId, 
-          parseInt(route_id, 10), 
-          routeData.start_hub_id, 
-          routeData.start_hub_name, 
-          vehicleCapacity, 
-          parseInt(driver_id, 10)
-        ]
+        [resolvedVehicleId, parseInt(route_id, 10), routeData.start_hub_id, routeData.start_hub_name, vehicleCapacity, parseInt(driver_id, 10)]
       );
     } else {
       await client.query(
         `INSERT INTO driver_queue (driver_id, vehicle_id, route_id, current_hub_id, current_hub_name, status, capacity, entered_at)
          VALUES ($1, $2, $3, $4, $5, 'queued', $6, CURRENT_TIMESTAMP);`,
-        [
-          parseInt(driver_id, 10), 
-          resolvedVehicleId, 
-          parseInt(route_id, 10), 
-          routeData.start_hub_id, 
-          routeData.start_hub_name, 
-          vehicleCapacity
-        ]
+        [parseInt(driver_id, 10), resolvedVehicleId, parseInt(route_id, 10), routeData.start_hub_id, routeData.start_hub_name, vehicleCapacity]
       );
     }
 
-    // 5. GENERATE THE NEW RIDE OFFER
+    // 🎯 6. GENERATE THE NEW RIDE OFFER (Storing Hub ID numbers in start_location and end_location)
     const rideOfferQuery = await client.query(
       `INSERT INTO ride_offers (driver_id, vehicle_id, route_id, start_location, end_location, 
         departure_time, total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng, status, accepted_passengers, created_at)
@@ -1246,20 +1259,20 @@ app.post("/api/rides/create", async (req, res) => {
         parseInt(driver_id, 10), 
         resolvedVehicleId, 
         parseInt(route_id, 10), 
-        startLoc, 
-        endLoc, 
+        finalStartLoc,     // Stores Hub ID number string (e.g., "1")
+        finalEndLoc,       // Stores Hub ID number string (e.g., "4")
         vehicleCapacity, 
         vehicleCapacity, 
         pricePerSeat, 
-        routeData.start_lat, 
-        routeData.start_lng
+        finalPickupLat,    
+        finalPickupLng     
       ]
     );
     
     let activeOfferData = rideOfferQuery.rows[0];
     let matchPipelineResult = { status: "no_passengers_waiting", matchedCount: 0 };
 
-    // 🔍 DEMAND GUARD: Check if passengers are actually waiting for this route at this hub
+    // 🔍 DEMAND GUARD
     const activeDemandQuery = await client.query(
       `SELECT COUNT(*) FROM route_pool 
        WHERE route_id = $1 
@@ -1277,19 +1290,15 @@ app.post("/api/rides/create", async (req, res) => {
     if (waitingCount > 0) {
       console.log(`⚡ ${waitingCount} passenger(s) waiting. Executing direct matching loop for Offer ID #${activeOfferData.offer_id}...`);
       
-      // Invoke your Central Matching Engine
       matchPipelineResult = await executeCorridorAutoMatch(
         client, 
         parseInt(route_id, 10), 
-        routeData.start_hub_id, 
         activeOfferData.offer_id
       );
 
-      // Verify success from your auto-match output
       if (matchPipelineResult.status === "success") {
         console.log(`🎉 Instant Match Executed! ${matchPipelineResult.matchedCount} riders synchronized.`);
         
-        // Always refresh the seat and price state directly from database after engine run
         const refreshedOfferQuery = await client.query(
           `SELECT available_seats, price_per_seat FROM ride_offers WHERE id = $1;`,
           [activeOfferData.offer_id]
@@ -1303,17 +1312,16 @@ app.post("/api/rides/create", async (req, res) => {
       console.log(`ℹ️ Bypassing matching engine: 0 passengers waiting at Hub #${routeData.start_hub_id} for Route #${route_id}.`);
     }
 
-    // Commit changes to all tables atomically
     await client.query("COMMIT");
 
     const filledCount = vehicleCapacity - activeOfferData.available_seats;
 
     return res.status(201).json({
-      message: "Corridor pool initialized dynamically and driver queue synced.",
+      message: "Corridor pool initialized with Hub ID numbers.",
       ride_id: activeOfferData.offer_id,
       status: activeOfferData.status,
-      start_location: startLoc,
-      end_location: endLoc,
+      start_location: finalStartLoc, // Returns Hub ID number string
+      end_location: finalEndLoc,     // Returns Hub ID number string
       total_seats: vehicleCapacity,
       filled: filledCount, 
       price_per_seat: activeOfferData.price_per_seat,
