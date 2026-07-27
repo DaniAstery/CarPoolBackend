@@ -442,56 +442,63 @@ app.post("/api/routes/join", async (req, res) => {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // Checking passenger Distance from requested hub 
 app.post("/api/passenger/validate-location", async (req, res) => {
- //const { user_lat, user_lng, user_id } = req.body;
-  const { user_id } = req.body;
-  const user_lat = parseFloat(9.0106);
-  const user_lng = parseFloat(38.7894);
+  const { user_lat, user_lng, user_id } = req.body;
 
-  // 1. Fetch all hubs
-  const hubs = await pool.query("SELECT id, name, latitude, longitude FROM hubs");
+  // Fallback to Ayat (9.0220, 38.8450) if coordinates are missing from request body
+  const lat = user_lat !== undefined ? parseFloat(user_lat) : 9.0220;
+  const lng = user_lng !== undefined ? parseFloat(user_lng) : 38.8450;
 
-  // 2. Calculate Haversine distance for all hubs
-  const validHubs = hubs.rows.filter(hub => {
-    const distance = getDistanceFromLatLonInKm(
-      user_lat, user_lng, 
-      hub.latitude, hub.longitude
-    );
-    return distance <= 1.0; // 1km threshold
-  });
+  try {
+    // 1. Fetch all hubs from database
+    const hubs = await pool.query("SELECT id, name, latitude, longitude FROM hubs");
 
-  if (validHubs.length === 0) {
-    return res.status(403).json({ 
-      error: "OUT_OF_RANGE", 
-      message: "You are not within 1km of any pickup corridor hub." 
+    if (hubs.rows.length === 0) {
+      return res.status(404).json({ error: "No hubs registered in database." });
+    }
+
+    // 2. Calculate distance to all hubs and find the closest one
+    let nearestHub = null;
+    let minDistance = Infinity;
+
+    for (const hub of hubs.rows) {
+      const distance = getDistanceFromLatLonInKm(
+        lat, lng, 
+        parseFloat(hub.latitude), parseFloat(hub.longitude)
+      );
+
+      if (distance < minDistance) {
+        minDistance = distance;
+        nearestHub = { 
+          ...hub, 
+          distanceInMeters: Math.round(distance * 1000) 
+        };
+      }
+    }
+
+    // 3. Optional 1km Range Gatekeeper (Increase threshold slightly during development if needed, e.g., 2.0km)
+    if (minDistance > 2.0) {
+      return res.status(403).json({ 
+        error: "OUT_OF_RANGE", 
+        message: `You are too far from any corridor hub. Nearest is ${nearestHub.name} (${Math.round(minDistance * 1000)}m away).` 
+      });
+    }
+
+    // 4. Return the nearest hub context successfully
+    return res.status(200).json({ 
+      status: "VALID", 
+      nearestHub: nearestHub,
+      distanceInMeters: nearestHub.distanceInMeters 
     });
-  }
 
-  // 3. Return the nearest hub context
-  res.json({ status: "VALID", nearestHub: validHubs[0] });
+  } catch (err) {
+    console.error("Error validating passenger location:", err);
+    return res.status(500).json({ error: "Internal server error validating location." });
+  }
 });
+
+
 
 
 app.post("/api/test/distance", (req, res) => {
