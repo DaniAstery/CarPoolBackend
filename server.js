@@ -523,132 +523,90 @@ app.get("/api/hubs/search/:term", async (req, res) => {
 });
 
 /* ---------------- SELECT HUB → GET VALID CORRIDORS ---------------- */
+/* ---------------- SELECT HUB → GET SLICED SEPARATE CORRIDORS ---------------- */
 app.get("/api/routes/from/:pickupHub", async (req, res) => {
   try {
     const { pickupHub } = req.params;
+    
     const result = await pool.query(
-      `SELECT
-        r.id AS route_id,
-        r.capacity,
-        r.base_price,
-        ARRAY_AGG(h2.name ORDER BY rs2.stop_order) AS stops
-      FROM routes r
-      JOIN route_stops rs ON rs.route_id = r.id
-      JOIN hubs h ON h.id = rs.hub_id
-      JOIN route_stops rs2 ON rs2.route_id = r.id
-      JOIN hubs h2 ON h2.id = rs2.hub_id
-      WHERE LOWER(h.name) = LOWER($1)
-      GROUP BY r.id, r.capacity, r.base_price;`,
+      `WITH pickup_info AS (
+        SELECT 
+          r.id AS route_id,
+          r.capacity,
+          r.base_price,
+          rs.hub_id AS pickup_hub_id,
+          rs.stop_order AS pickup_order
+        FROM routes r
+        JOIN route_stops rs ON rs.route_id = r.id
+        JOIN hubs h ON h.id = rs.hub_id
+        WHERE LOWER(h.name) = LOWER($1)
+      )
+      SELECT 
+        pi.route_id,
+        pi.capacity,
+        pi.base_price,
+        pi.pickup_hub_id AS start_hub_id,
+        rs_drop.hub_id AS end_hub_id,
+        h_drop.name AS destination_name,
+        -- Dynamically slice the stops array from pickup up to this specific drop-off
+        (
+          SELECT ARRAY_AGG(h_all.name ORDER BY rs_all.stop_order)
+          FROM route_stops rs_all
+          JOIN hubs h_all ON h_all.id = rs_all.hub_id
+          WHERE rs_all.route_id = pi.route_id
+            AND rs_all.stop_order >= pi.pickup_order
+            AND rs_all.stop_order <= rs_drop.stop_order
+        ) AS stops
+      FROM pickup_info pi
+      -- Find all downstream drop-off stops that occur AFTER the pickup stop
+      JOIN route_stops rs_drop ON rs_drop.route_id = pi.route_id 
+        AND rs_drop.stop_order > pi.pickup_order
+      JOIN hubs h_drop ON h_drop.id = rs_drop.hub_id
+      ORDER BY pi.route_id, rs_drop.stop_order;`,
       [pickupHub]
     );
+
     res.json(result.rows);
   } catch (err) {
-    console.error("❌ Error fetching routes from hub:", err.message);
+    console.error("❌ Error fetching corridors from hub:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 
 /* ---------------- PASSENGER SIDE: JOIN CORRIDOR WAITING POOL ---------------- */
-// POST /api/routes/join  
-app.post("/api/routes/join", async (req, res) => {
-  const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
-
-  if (!route_id || !user_id) {
-    return res.status(400).json({ 
-      error: "MISSING_FIELDS", 
-      message: "Required mapping references (route_id, user_id) are missing." 
-    });
-  }
-
-  const client = await pool.connect();
+/* ---------------- SELECT HUB → GET ALL ROUTES PASSING THROUGH ---------------- */
+app.get("/api/routes/from/:pickupHub", async (req, res) => {
   try {
-    await client.query("BEGIN");
-
-    // 1. Duplicate Verification Loop
-    const duplicateCheck = await client.query(
-      `SELECT id, status FROM route_pool 
-       WHERE user_id = $1 AND TRIM(LOWER(status)) != 'completed' 
-       AND status != 'cancelled' LIMIT 1 FOR UPDATE;`, 
-      [parseInt(user_id, 10)]
-    );
-
-    if (duplicateCheck.rows.length > 0) {
-      const existingPool = duplicateCheck.rows[0];
-      await client.query("COMMIT");
-      return res.status(200).json({
-        success: true,
-        alreadyActive: true,
-        navigateTo: "MatchingScreen",
-        pool: { id: existingPool.id, status: existingPool.status }
-      });
-    }
-
-    // 2. DYNAMIC LOOKUP: Resolve pickup_hub_id if missing
-    let targetPickupHubId = pickup_hub_id;
-    if (!targetPickupHubId) {
-      const pickupLookup = await client.query(
-        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order ASC LIMIT 1;`,
-        [parseInt(route_id, 10)]
-      );
-      targetPickupHubId = pickupLookup.rows[0]?.hub_id;
-      if (!targetPickupHubId) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          error: "MISSING_PICKUP_HUB",
-          message: "pickup_hub_id is required and could not be resolved from route stops."
-        });
-      }
-    }
-
-    // 3. DYNAMIC LOOKUP: Resolve dropoff_hub_id if missing
-    let finalDropoffHubId = dropoff_hub_id;
-    if (!finalDropoffHubId) {
-      const destinationLookup = await client.query(
-        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order DESC LIMIT 1;`,
-        [parseInt(route_id, 10)]
-      );
-      finalDropoffHubId = destinationLookup.rows[0]?.hub_id || 1;
-    }
-
-    // 4. Insert Entry strictly into route_pool with 'searching' status
-    const insertRes = await client.query(
-      `INSERT INTO route_pool (user_id, route_id, pickup_hub_id, dropoff_hub_id, status, joined_at)
-       VALUES ($1, $2, $3, $4, 'searching', NOW()) RETURNING id, status;`,
-      [parseInt(user_id, 10), parseInt(route_id, 10), parseInt(targetPickupHubId, 10), parseInt(finalDropoffHubId, 10)]
-    );
-
-    const newPool = insertRes.rows[0];
-    console.log(`✅ User ${user_id} registered into route_pool queue (searching). Triggering matching engine...`);
-
-    // ⚡ 5. INVOKE UNIFIED MATCHING ENGINE INSTANTLY
-    // (Make sure executeCorridorAutoMatch is imported at the top of your file!)
-    const matchPipelineResult = await executeCorridorAutoMatch(
-      client, 
-      parseInt(route_id, 10)
-    );
-
-    console.log(`⚡ Match Pipeline Result for Route #${route_id}:`, matchPipelineResult);
-
-    await client.query("COMMIT");
+    const { pickupHub } = req.params;
     
-    return res.status(200).json({
-      success: true,
-      message: "Successfully registered into match queue and evaluated by engine.",
-      alreadyActive: false,
-      pool: {
-        id: newPool.id,
-        status: newPool.status
-      },
-      match_pipeline: matchPipelineResult
-    });
-    
+    const result = await pool.query(
+      `SELECT
+        r.id AS route_id,
+        r.capacity,
+        r.base_price,
+        (SELECT rs_first.hub_id FROM route_stops rs_first WHERE rs_first.route_id = r.id ORDER BY rs_first.stop_order ASC LIMIT 1) AS start_hub_id,
+        (SELECT rs_last.hub_id FROM route_stops rs_last WHERE rs_last.route_id = r.id ORDER BY rs_last.stop_order DESC LIMIT 1) AS end_hub_id,
+        (
+          SELECT ARRAY_AGG(h.name ORDER BY rs.stop_order)
+          FROM route_stops rs
+          JOIN hubs h ON h.id = rs.hub_id
+          WHERE rs.route_id = r.id
+        ) AS stops
+      FROM routes r
+      WHERE r.id IN (
+        SELECT rs_check.route_id 
+        FROM route_stops rs_check
+        JOIN hubs h_check ON h_check.id = rs_check.hub_id
+        WHERE LOWER(h_check.name) = LOWER($1)
+      );`,
+      [pickupHub]
+    );
+
+    res.json(result.rows);
   } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ Database operation failed:", err.message);
-    return res.status(500).json({ error: "DATABASE_ERROR", message: err.message });
-  } finally {
-    client.release();
+    console.error("❌ Error fetching routes from hub:", err.message);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
