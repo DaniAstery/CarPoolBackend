@@ -337,6 +337,92 @@ app.get("/api/rides/status/:userId", async (req, res) => {
   }
 });
 
+
+
+// Dedicated endpoint to fetch precise passenger and ride status for a user
+app.get("/api/rides/pool-status/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // 1. Query the route_pool table for this user to get exact status & matched offer
+    const poolQuery = `
+      rp.id, rp.route_id, rp.user_id, rp.status as passenger_status, rp.matched_ride_offer_id
+      FROM route_pool rp
+      WHERE rp.user_id = $1
+      ORDER BY rp.joined_at DESC
+      LIMIT 1
+    `;
+    const poolResult = await pool.query(`SELECT ${poolQuery}`, [userId]);
+
+    if (poolResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found in route pool" });
+    }
+
+    const poolRow = poolResult.rows[0];
+    const rideOfferId = poolRow.matched_ride_offer_id;
+
+    // 2. Fetch all co-passengers in the same matched ride offer or route pool
+    const coPassengersQuery = `
+      rp.user_id, rp.status, rp.pickup_hub_id
+      FROM route_pool rp
+      WHERE rp.matched_ride_offer_id = $1 OR rp.route_id = $2
+    `;
+    const coPassengersResult = await pool.query(`SELECT ${coPassengersQuery}`, [
+      rideOfferId || 0,
+      poolRow.route_id,
+    ]);
+
+    // 3. Fetch ride offer details if available
+    let rideOffer = null;
+    if (rideOfferId) {
+      const rideQuery = `SELECT id, driver_id, status as driver_status, available_seats, accepted_passengers FROM ride_offers WHERE id = $1`;
+      const rideResult = await pool.query(rideQuery, [rideOfferId]);
+      rideOffer = rideResult.rows[0] || null;
+    }
+
+    // 4. Return precise structured status payload
+    return res.json({
+      user_id: parseInt(userId, 10),
+      status: poolRow.passenger_status, // 'matched', 'accepted', etc.
+      ride_offer_id: rideOfferId,
+      driver_status: rideOffer ? rideOffer.driver_status : "pending",
+      passengers: coPassengersResult.rows.map(row => ({
+        user_id: row.user_id,
+        status: row.status,
+      })),
+    });
+  } catch (err) {
+    console.error("❌ Error in /api/rides/pool-status:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 app.post("/api/routes/join", async (req, res) => {
   const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
 
