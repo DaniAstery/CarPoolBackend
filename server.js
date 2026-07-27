@@ -427,8 +427,7 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   if (availableRiders.length === 0) return { status: "idle", matchedCount: 0 };
 
-  // 3. FETCH PENDING RIDE OFFERS (WITH TRIMMED JOINS)
-  // We apply TRIM() to ensure hidden spaces like '4 ' don't break the join.
+  // 3. FETCH PENDING RIDE OFFERS (Explicitly locking ONLY 'ro' to bypass outer join lock error)
   const openOffersQuery = await client.query(
     `SELECT ro.id, ro.driver_id, ro.total_seats, ro.available_seats,
             LEAST(rs_start.stop_order, rs_end.stop_order) AS start_stop_order,
@@ -439,7 +438,8 @@ async function executeCorridorAutoMatch(client, route_id) {
      WHERE ro.route_id = $1 
        AND TRIM(LOWER(ro.status)) = 'pending' 
        AND ro.available_seats > 0
-     ORDER BY ro.created_at ASC FOR UPDATE;`,
+     ORDER BY ro.created_at ASC 
+     FOR UPDATE OF ro;`, // 👈 Fixed: Explicitly targets 'ro' instead of locking nullable outer joins
     [route_id]
   );
 
@@ -454,7 +454,6 @@ async function executeCorridorAutoMatch(client, route_id) {
     let seatsAvailable = Number(offer.available_seats);
     let matchesMadeThisOffer = 0;
 
-    // Safely cast to Numbers to prevent string mapping bugs
     const offerStartStop = offer.start_stop_order !== null ? Number(offer.start_stop_order) : 1;
     const offerEndStop = offer.end_stop_order !== null ? Number(offer.end_stop_order) : 999;
 
@@ -467,7 +466,6 @@ async function executeCorridorAutoMatch(client, route_id) {
         paxDropoff <= offerEndStop &&
         seatsAvailable > 0;
 
-      // This log is the silver bullet. If they don't match, this tells you EXACTLY why.
       console.log(`   [DEBUG] Rider ${pax.user_id}: Needs ${paxPickup}->${paxDropoff} | Driver #${offer.id} covers ${offerStartStop}->${offerEndStop} | Valid: ${isValidSegment}`);
 
       if (isValidSegment) {
@@ -499,7 +497,6 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   return { status: "success", matchedCount: totalMatchedCount };
 }
-
 
 
 
