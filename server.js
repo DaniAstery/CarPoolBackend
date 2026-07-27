@@ -2025,17 +2025,29 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
     );
 
     // 5. Map passengers and prioritize 'accepted' state if present in accepted_passengers array
-    const formattedPassengers = passengersQuery.rows.map(passenger => {
-      const pId = parseInt(passenger.user_id, 10);
-      const isAccepted = acceptedIdsArray.includes(pId);
 
-      return {
-        user_id: pId,
-        status: isAccepted ? "accepted" : (passenger.status || "matched"),
-        name: passenger.passenger_name,
-        phone_number: passenger.phone_number
-      };
-    });
+        const formattedPassengers = passengersQuery.rows.map(passenger => {
+        const pId = parseInt(passenger.user_id, 10);
+        const dbStatus = passenger.status ? passenger.status.trim().toLowerCase() : "";
+        const isAccepted = acceptedIdsArray.includes(pId);
+
+        // Preserve advanced statuses (like 'arrived', 'picked_up', 'completed') from route_pool
+        let finalStatus = dbStatus;
+        if (!dbStatus || dbStatus === "pending" || dbStatus === "matched") {
+          if (isAccepted) {
+            finalStatus = "accepted";
+          } else {
+            finalStatus = "matched";
+          }
+        }
+
+        return {
+          user_id: pId,
+          status: finalStatus,
+          name: passenger.passenger_name,
+          phone_number: passenger.phone_number
+        };
+      });
 
     const totalSeats = parseInt(offer.total_seats, 10) || 4;
     const computedAvailableSeats = Math.max(0, totalSeats - acceptedIdsArray.length);
