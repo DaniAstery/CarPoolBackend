@@ -337,6 +337,131 @@ app.get("/api/rides/status/:userId", async (req, res) => {
   }
 });
 
+app.post("/api/routes/join", async (req, res) => {
+  const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
+
+  if (!route_id || !user_id) {
+    return res.status(400).json({ 
+      error: "MISSING_FIELDS", 
+      message: "Required mapping references (route_id, user_id) are missing." 
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1. Duplicate Verification Loop
+    const duplicateCheck = await client.query(
+      `SELECT id, status FROM route_pool 
+       WHERE user_id = $1 AND TRIM(LOWER(status)) != 'completed' 
+       AND status != 'cancelled' LIMIT 1 FOR UPDATE;`, 
+      [parseInt(user_id, 10)]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      const existingPool = duplicateCheck.rows[0];
+      await client.query("COMMIT");
+      return res.status(200).json({
+        success: true,
+        alreadyActive: true,
+        navigateTo: "MatchingScreen",
+        pool: { id: existingPool.id, status: existingPool.status }
+      });
+    }
+
+    // 2. DYNAMIC LOOKUP: Resolve pickup_hub_id if missing
+    let targetPickupHubId = pickup_hub_id;
+    if (!targetPickupHubId) {
+      const pickupLookup = await client.query(
+        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order ASC LIMIT 1;`,
+        [parseInt(route_id, 10)]
+      );
+      targetPickupHubId = pickupLookup.rows[0]?.hub_id;
+      if (!targetPickupHubId) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "MISSING_PICKUP_HUB",
+          message: "pickup_hub_id is required and could not be resolved from route stops."
+        });
+      }
+    }
+
+    // 3. DYNAMIC LOOKUP: Resolve dropoff_hub_id if missing
+    let finalDropoffHubId = dropoff_hub_id;
+    if (!finalDropoffHubId) {
+      const destinationLookup = await client.query(
+        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order DESC LIMIT 1;`,
+        [parseInt(route_id, 10)]
+      );
+      finalDropoffHubId = destinationLookup.rows[0]?.hub_id || 1;
+    }
+
+    // 4. Insert Entry strictly into route_pool with 'searching' status
+    const insertRes = await client.query(
+      `INSERT INTO route_pool (user_id, route_id, pickup_hub_id, dropoff_hub_id, status, joined_at)
+       VALUES ($1, $2, $3, $4, 'searching', NOW()) RETURNING id, status;`,
+      [parseInt(user_id, 10), parseInt(route_id, 10), parseInt(targetPickupHubId, 10), parseInt(finalDropoffHubId, 10)]
+    );
+
+    const newPool = insertRes.rows[0];
+    console.log(`✅ User ${user_id} registered into route_pool queue (searching). Triggering matching engine...`);
+
+    // ⚡ 5. INVOKE UNIFIED MATCHING ENGINE INSTANTLY
+    // (Make sure executeCorridorAutoMatch is imported at the top of your file!)
+    const matchPipelineResult = await executeCorridorAutoMatch(
+      client, 
+      parseInt(route_id, 10)
+    );
+
+    console.log(`⚡ Match Pipeline Result for Route #${route_id}:`, matchPipelineResult);
+
+    await client.query("COMMIT");
+    
+    return res.status(200).json({
+      success: true,
+      message: "Successfully registered into match queue and evaluated by engine.",
+      alreadyActive: false,
+      pool: {
+        id: newPool.id,
+        status: newPool.status
+      },
+      match_pipeline: matchPipelineResult
+    });
+    
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Database operation failed:", err.message);
+    return res.status(500).json({ error: "DATABASE_ERROR", message: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // Checking passenger Distance from requested hub 
 app.post("/api/passenger/validate-location", async (req, res) => {
