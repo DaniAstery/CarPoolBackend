@@ -1070,10 +1070,12 @@ app.post("/api/rides/create", async (req, res) => {
     // 🚨 BEGIN DATABASE TRANSACTION
     await client.query("BEGIN");
 
-    // 2. CONSTRAINT CHECK: Prevent overlapping active states for this driver
+    // 2. CONSTRAINT CHECK: Strictly target active operational statuses only
+    // Ensures 'rejected', 'declined', 'cancelled', 'completed', and 'expired' offers NEVER block going online.
     const activeOfferCheck = await client.query(
       `SELECT id, status FROM ride_offers 
-       WHERE driver_id = $1 AND TRIM(LOWER(status)) NOT IN ('completed', 'cancelled')
+       WHERE driver_id = $1 
+         AND TRIM(LOWER(status)) IN ('pending', 'proposed', 'accepted', 'arrived', 'inprogress')
        LIMIT 1;`,
       [parseInt(driver_id, 10)]
     );
@@ -1112,7 +1114,7 @@ app.post("/api/rides/create", async (req, res) => {
       });
     }
 
-    // 🎯 4. Enforce saving Hub ID numbers (e.g., "1" and "4") instead of alphabet string names
+    // 🎯 4. Enforce saving Hub ID numbers (e.g., "1" and "4") instead of string names
     const finalStartLoc = start_location !== undefined && start_location !== null ? String(start_location) : String(routeData.hub_ids[0]);
     const finalEndLoc = end_location !== undefined && end_location !== null ? String(end_location) : String(routeData.hub_ids[routeData.hub_ids.length - 1]);
     const finalPickupLat = pickup_lat || routeData.start_lat;
@@ -1146,7 +1148,7 @@ app.post("/api/rides/create", async (req, res) => {
       );
     }
 
-    // 🎯 6. GENERATE THE NEW RIDE OFFER (Storing Hub ID numbers in start_location and end_location)
+    // 🎯 6. GENERATE THE NEW RIDE OFFER
     const rideOfferQuery = await client.query(
       `INSERT INTO ride_offers (driver_id, vehicle_id, route_id, start_location, end_location, 
         departure_time, total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng, status, accepted_passengers, created_at)
@@ -1156,8 +1158,8 @@ app.post("/api/rides/create", async (req, res) => {
         parseInt(driver_id, 10), 
         resolvedVehicleId, 
         parseInt(route_id, 10), 
-        finalStartLoc,     // Stores Hub ID number string (e.g., "1")
-        finalEndLoc,       // Stores Hub ID number string (e.g., "4")
+        finalStartLoc,     
+        finalEndLoc,       
         vehicleCapacity, 
         vehicleCapacity, 
         pricePerSeat, 
@@ -1214,11 +1216,11 @@ app.post("/api/rides/create", async (req, res) => {
     const filledCount = vehicleCapacity - activeOfferData.available_seats;
 
     return res.status(201).json({
-      message: "Corridor pool initialized with Hub ID numbers.",
+      message: "Corridor pool initialized successfully.",
       ride_id: activeOfferData.offer_id,
       status: activeOfferData.status,
-      start_location: finalStartLoc, // Returns Hub ID number string
-      end_location: finalEndLoc,     // Returns Hub ID number string
+      start_location: finalStartLoc,
+      end_location: finalEndLoc,    
       total_seats: vehicleCapacity,
       filled: filledCount, 
       price_per_seat: activeOfferData.price_per_seat,
@@ -2259,19 +2261,52 @@ app.post("/api/rides/driver-accept", async (req, res) => {
 app.post('/api/rides/driver-decline', async (req, res) => {
   const { ride_offer_id, driver_id } = req.body;
 
+  if (!ride_offer_id || !driver_id) {
+    return res.status(400).json({ error: "Missing required ride_offer_id or driver_id parameters." });
+  }
+
+  const client = await pool.connect();
   try {
-    const query = `
+    // Start transaction to guarantee atomic rollbacks if anything fails
+    await client.query('BEGIN');
+
+    // 1. Mark the ride offer as rejected for this driver
+    const offerQuery = `
       UPDATE ride_offers
       SET status = 'rejected'
       WHERE id = $1 AND driver_id = $2
       RETURNING id;
     `;
-    await pool.query(query, [ride_offer_id, driver_id]);
+    const offerResult = await client.query(offerQuery, [ride_offer_id, driver_id]);
+
+    if (offerResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: "Active ride offer not found or unauthorized driver." });
+    }
+
+    // 2. Release pooled passengers: clear their matched offer ID and return them to the search queue
+    const releasePoolQuery = `
+      UPDATE route_pool
+      SET matched_ride_offer_id = NULL,
+          status = 'searching'
+      WHERE matched_ride_offer_id = $1;
+    `;
+    await client.query(releasePoolQuery, [ride_offer_id]);
+
+    // Commit changes
+    await client.query('COMMIT');
     
-    res.json({ success: true, message: "Offer cluster declined cleanly." });
+    return res.status(200).json({ 
+      success: true, 
+      message: "Offer cluster declined cleanly and passengers returned to the matching queue." 
+    });
+
   } catch (err) {
-    console.error("Error writing driver rejection metrics:", err);
-    res.status(500).json({ error: "Internal Write Process Failure" });
+    await client.query('ROLLBACK');
+    console.error("Error handling driver decline & queue release:", err);
+    return res.status(500).json({ error: "Internal Write Process Failure during driver decline." });
+  } finally {
+    client.release();
   }
 });
 
