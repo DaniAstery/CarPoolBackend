@@ -1669,7 +1669,6 @@ app.post('/api/rides/accept', async (req, res) => {
    2. 📍 ARRIVAL CHECKPOINT SIGNAL: Commit Passenger Presence Node Validation
    ========================================================================= */
 app.post("/api/rides/signal-arrival", async (req, res) => {
-  // Read user_id directly from AuthContext payload / Auth middleware
   const { user_id, userId } = req.body;
   const targetUserId = parseInt(user_id || userId, 10);
 
@@ -1677,36 +1676,43 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
     return res.status(400).json({ error: "Missing or invalid user_id." });
   }
 
-  const client = await pool.connect();
+  const client = await db.connect();
   try {
     await client.query("BEGIN");
 
-    // 🎯 Find the active route_pool record for user_id and transition to 'arrived'
-    const updateResult = await client.query(
-      `UPDATE route_pool 
-       SET status = 'arrived' 
-       WHERE user_id = $1 
-         AND TRIM(LOWER(status)) IN ('matched', 'accepted', 'confirmed', 'arrived')
-       RETURNING id, matched_ride_offer_id, status;`,
-      [targetUserId]
-    );
+    // 1. Find active route_pool record for the user and check its matched ride offer
+    const poolCheckQuery = `
+      SELECT rp.id, rp.matched_ride_offer_id, rp.status, ro.status AS ride_status, ro.accepted_passengers
+      FROM route_pool rp
+      JOIN ride_offers ro ON rp.matched_ride_offer_id = ro.id
+      WHERE rp.user_id = $1 
+        AND LOWER(TRIM(rp.status)) NOT IN ('completed', 'cancelled', 'idle', 'expired')
+        AND LOWER(TRIM(ro.status)) = 'pending'
+        AND $1 = ANY(ro.accepted_passengers)
+      ORDER BY rp.joined_at DESC
+      LIMIT 1;
+    `;
 
-    if (updateResult.rows.length === 0) {
+    const poolResult = await client.query(poolCheckQuery, [targetUserId]);
+
+    if (poolResult.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ 
-        error: `No active ride pool match found for user ${targetUserId} in 'matched' or 'accepted' state.` 
+        error: `No active ride pool match found for user ${targetUserId} with a pending ride offer and valid accepted status.` 
       });
     }
 
-    // Automatically resolve matched_ride_offer_id from DB
-    const targetRideId = updateResult.rows[0].matched_ride_offer_id;
+    const activePoolRow = poolResult.rows[0];
+    const targetRideId = activePoolRow.matched_ride_offer_id;
+    const poolRowId = activePoolRow.id;
 
-    // 2. Fetch driver state from ride_offers
-    const driverQuery = await client.query(
-      `SELECT TRIM(LOWER(status)) as status FROM ride_offers WHERE id = $1`,
-      [targetRideId]
+    // 2. Update the active route_pool record status to 'arrived'
+    await client.query(
+      `UPDATE route_pool 
+       SET status = 'arrived' 
+       WHERE id = $1;`,
+      [poolRowId]
     );
-    const driverStatus = driverQuery.rows[0]?.status || "accepted";
 
     // 3. Fetch co-riders manifest
     const passengersQuery = await client.query(
@@ -1721,7 +1727,7 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
       success: true, 
       message: "Arrival presence validated cleanly.",
       rideOfferId: targetRideId,
-      driverStatus: driverStatus, 
+      driverStatus: activePoolRow.ride_status.toLowerCase().trim(), 
       passengers: passengersQuery.rows.map(row => ({
         userId: parseInt(row.user_id, 10),
         status: row.status || "arrived"
