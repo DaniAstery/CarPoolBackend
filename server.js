@@ -343,6 +343,7 @@ app.get("/api/rides/status/:userId", async (req, res) => {
 app.get("/api/rides/pool-status/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
+    const parsedUserId = parseInt(userId, 10);
 
     // 1. Query the route_pool table for this user to get exact status & matched offer
     const poolQuery = `
@@ -352,7 +353,7 @@ app.get("/api/rides/pool-status/:userId", async (req, res) => {
       ORDER BY rp.joined_at DESC
       LIMIT 1
     `;
-    const poolResult = await pool.query(`SELECT ${poolQuery}`, [userId]);
+    const poolResult = await pool.query(`SELECT ${poolQuery}`, [parsedUserId]);
 
     if (poolResult.rows.length === 0) {
       return res.status(404).json({ error: "User not found in route pool" });
@@ -361,7 +362,29 @@ app.get("/api/rides/pool-status/:userId", async (req, res) => {
     const poolRow = poolResult.rows[0];
     const rideOfferId = poolRow.matched_ride_offer_id;
 
-    // 2. Fetch all co-passengers in the same matched ride offer or route pool
+    // 2. Fetch ride offer details & accepted_passengers array first
+    let rideOffer = null;
+    let acceptedList = [];
+    if (rideOfferId) {
+      const rideQuery = `SELECT id, driver_id, status as driver_status, available_seats, accepted_passengers FROM ride_offers WHERE id = $1`;
+      const rideResult = await pool.query(rideQuery, [rideOfferId]);
+      rideOffer = rideResult.rows[0] || null;
+
+      if (rideOffer && rideOffer.accepted_passengers) {
+        if (Array.isArray(rideOffer.accepted_passengers)) {
+          acceptedList = rideOffer.accepted_passengers.map(id => parseInt(id, 10));
+        } else if (typeof rideOffer.accepted_passengers === 'string') {
+          // Fallback parser if PG returns string representation like "{12,14}"
+          acceptedList = rideOffer.accepted_passengers
+            .replace(/[{}]/g, "")
+            .split(",")
+            .map(id => parseInt(id.trim(), 10))
+            .filter(id => !isNaN(id));
+        }
+      }
+    }
+
+    // 3. Fetch all co-passengers in the same matched ride offer or route pool
     const coPassengersQuery = `
       rp.user_id, rp.status, rp.pickup_hub_id
       FROM route_pool rp
@@ -372,56 +395,32 @@ app.get("/api/rides/pool-status/:userId", async (req, res) => {
       poolRow.route_id,
     ]);
 
-    // 3. Fetch ride offer details if available
-    let rideOffer = null;
-    if (rideOfferId) {
-      const rideQuery = `SELECT id, driver_id, status as driver_status, available_seats, accepted_passengers FROM ride_offers WHERE id = $1`;
-      const rideResult = await pool.query(rideQuery, [rideOfferId]);
-      rideOffer = rideResult.rows[0] || null;
-    }
+    // 4. Determine effective status (If user ID is in accepted_passengers, force 'accepted')
+    const isUserAccepted = acceptedList.includes(parsedUserId);
+    const effectivePassengerStatus = isUserAccepted ? "accepted" : poolRow.passenger_status;
 
-    // 4. Return precise structured status payload
+    // 5. Return precise structured status payload
     return res.json({
-      user_id: parseInt(userId, 10),
-      status: poolRow.passenger_status, // 'matched', 'accepted', etc.
+      user_id: parsedUserId,
+      status: effectivePassengerStatus, // Returns 'accepted' if present in ride_offers.accepted_passengers
       ride_offer_id: rideOfferId,
       driver_status: rideOffer ? rideOffer.driver_status : "pending",
-      passengers: coPassengersResult.rows.map(row => ({
-        user_id: row.user_id,
-        status: row.status,
-      })),
+      accepted_passengers: acceptedList,
+      ride_offer: rideOffer,
+      passengers: coPassengersResult.rows.map(row => {
+        const pId = parseInt(row.user_id, 10);
+        const isPassengerAccepted = acceptedList.includes(pId);
+        return {
+          user_id: pId,
+          status: isPassengerAccepted ? "accepted" : (row.status || "matched"),
+        };
+      }),
     });
   } catch (err) {
     console.error("❌ Error in /api/rides/pool-status:", err.message);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 app.post("/api/routes/join", async (req, res) => {
   const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
@@ -1668,60 +1667,62 @@ app.post('/api/rides/accept', async (req, res) => {
    2. 📍 ARRIVAL CHECKPOINT SIGNAL: Commit Passenger Presence Node Validation
    ========================================================================= */
 app.post("/api/rides/signal-arrival", async (req, res) => {
-  const { ride_offer_id, user_id } = req.body;
+  // Read user_id directly from AuthContext payload / Auth middleware
+  const { user_id, userId } = req.body;
+  const targetUserId = parseInt(user_id || userId, 10);
 
-  if (!ride_offer_id || !user_id) {
-    return res.status(400).json({ error: "Missing ride_offer_id or user_id mapping keys." });
+  if (!targetUserId || isNaN(targetUserId)) {
+    return res.status(400).json({ error: "Missing or invalid user_id." });
   }
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const targetRideId = parseInt(ride_offer_id, 10);
-    const targetUserId = parseInt(user_id, 10);
-
-    // 🎯 ENFORCE: Only update if the current status is strictly 'accepted' or already 'arrived'
-    const result = await client.query(
+    // 🎯 Find the active route_pool record for user_id and transition to 'arrived'
+    const updateResult = await client.query(
       `UPDATE route_pool 
        SET status = 'arrived' 
        WHERE user_id = $1 
-         AND matched_ride_offer_id = $2 
-         AND (TRIM(LOWER(status)) = 'accepted' OR TRIM(LOWER(status)) = 'arrived')
-       RETURNING id, status;`,
-      [targetUserId, targetRideId]
+         AND TRIM(LOWER(status)) IN ('matched', 'accepted', 'confirmed', 'arrived')
+       RETURNING id, matched_ride_offer_id, status;`,
+      [targetUserId]
     );
 
-    if (result.rows.length === 0) {
+    if (updateResult.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ 
-        error: `State Transition Denied: No matching user tracking block found, or passenger status is not 'accepted'.` 
+        error: `No active ride pool match found for user ${targetUserId} in 'matched' or 'accepted' state.` 
       });
     }
 
-    // 2. Fetch driver's current macro state from ride_offers
+    // Automatically resolve matched_ride_offer_id from DB
+    const targetRideId = updateResult.rows[0].matched_ride_offer_id;
+
+    // 2. Fetch driver state from ride_offers
     const driverQuery = await client.query(
       `SELECT TRIM(LOWER(status)) as status FROM ride_offers WHERE id = $1`,
       [targetRideId]
     );
     const driverStatus = driverQuery.rows[0]?.status || "accepted";
 
-    // 3. Collect the updated passenger manifest for the UI co-rider matrix
+    // 3. Fetch co-riders manifest
     const passengersQuery = await client.query(
       `SELECT user_id, TRIM(LOWER(status)) as status FROM route_pool WHERE matched_ride_offer_id = $1`,
       [targetRideId]
     );
 
     await client.query("COMMIT");
-    console.log(`📍 Presence Verification Success: User ${targetUserId} transitioned from accepted -> arrived.`);
+    console.log(`📍 Presence Verification Success: User ${targetUserId} set to 'arrived' for Ride Offer #${targetRideId}.`);
 
     return res.status(200).json({ 
       success: true, 
       message: "Arrival presence validated cleanly.",
+      rideOfferId: targetRideId,
       driverStatus: driverStatus, 
       passengers: passengersQuery.rows.map(row => ({
         userId: parseInt(row.user_id, 10),
-        status: row.status || "accepted"
+        status: row.status || "arrived"
       }))
     });
 
@@ -2676,7 +2677,79 @@ app.post("/api/rides/complete", async (req, res) => {
 });
 
 
+// GET /api/rides/passenger-tracking/:rideOfferId/:userId
+// GET /api/rides/passenger-tracking/:rideOfferId/:userId
+app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) => {
+  const { rideOfferId, userId } = req.params;
 
+  try {
+    // 1. Get the user's current active pool entry with Hub names
+    const userPoolQuery = `
+      SELECT 
+        rp.id, 
+        rp.route_id, 
+        rp.matched_ride_offer_id, 
+        rp.status as my_status,
+        ph.name as pickup_name,
+        dh.name as dropoff_name
+      FROM route_pool rp
+      LEFT JOIN hubs ph ON rp.pickup_hub_id = ph.id
+      LEFT JOIN hubs dh ON rp.dropoff_hub_id = dh.id
+      WHERE rp.user_id = $1 
+        AND rp.status IN ('matched', 'accepted', 'arrived', 'in_trip')
+      ORDER BY rp.joined_at DESC 
+      LIMIT 1;
+    `;
+    
+    const userResult = await pool.query(userPoolQuery, [userId]);
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "No active live tracking session found." });
+    }
+
+    const userData = userResult.rows[0];
+    
+    // We use the matched_ride_offer_id from the database to ensure accuracy,
+    // even if the frontend passed a different or missing rideOfferId.
+    const offerId = userData.matched_ride_offer_id;
+
+    // 2. Fetch Driver / Ride Offer Status
+    let driverStatus = 'pending';
+    if (offerId) {
+      const offerQuery = `SELECT status FROM ride_offers WHERE id = $1`;
+      const offerResult = await pool.query(offerQuery, [offerId]);
+      if (offerResult.rows.length > 0) {
+        driverStatus = offerResult.rows[0].status;
+      }
+    }
+
+    // 3. Fetch the Co-Rider Matrix (everyone sharing this specific ride offer or route)
+    const coRidersQuery = `
+      SELECT user_id, status 
+      FROM route_pool 
+      WHERE matched_ride_offer_id = $1 
+         OR (route_id = $2 AND matched_ride_offer_id IS NULL)
+      ORDER BY joined_at ASC;
+    `;
+    const coRidersResult = await pool.query(coRidersQuery, [offerId, userData.route_id]);
+
+    // 4. Construct the precise payload expected by LiveTrackingScreen.js
+    res.json({
+      pickup_hub: userData.pickup_name || `Hub #${userData.pickup_hub_id}`,
+      dropoff_hub: userData.dropoff_name || `Hub #${userData.dropoff_hub_id}`,
+      driver_status: driverStatus,
+      status: userData.my_status, // Overall ride context status
+      passengers: coRidersResult.rows.map(row => ({
+        user_id: row.user_id,
+        status: row.status
+      }))
+    });
+
+  } catch (error) {
+    console.error("Error fetching passenger tracking data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
