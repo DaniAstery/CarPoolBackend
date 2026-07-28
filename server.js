@@ -2761,6 +2761,91 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
   }
 });
 
+
+app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
+  const { userId } = req.params;
+  const targetUserId = parseInt(userId, 10);
+
+  if (isNaN(targetUserId)) {
+    return res.status(400).json({ error: "Invalid userId" });
+  }
+
+  try {
+    // 1. Use ILIKE wildcard to completely ignore trailing spaces or hidden characters
+    const myPoolRes = await pool.query(`
+      SELECT rp.matched_ride_offer_id, rp.status, h.name AS hub_name, h.latitude AS hub_lat, h.longitude AS hub_lng
+      FROM route_pool rp
+      LEFT JOIN hubs h ON rp.pickup_hub_id = h.id
+      WHERE rp.user_id = $1 
+        AND (rp.status ILIKE '%matched%' OR rp.status ILIKE '%accepted%')
+      ORDER BY rp.joined_at DESC 
+      LIMIT 1;
+    `, [targetUserId]);
+
+    if (myPoolRes.rows.length === 0) {
+      console.log(`⚠️ [Manifest] No active matched/accepted row found for User ${targetUserId}.`);
+      return res.status(404).json({ error: "No active proposal found for user." });
+    }
+
+    const activeRideOfferId = myPoolRes.rows[0].matched_ride_offer_id;
+    console.log(`✅ [Manifest] Found Active Pool for User ${targetUserId} -> Ride Offer #${activeRideOfferId}, Status: "${myPoolRes.rows[0].status}"`);
+
+    const hub = {
+      name: myPoolRes.rows[0].hub_name || "Designated Stop",
+      latitude: parseFloat(myPoolRes.rows[0].hub_lat || 0),
+      longitude: parseFloat(myPoolRes.rows[0].hub_lng || 0)
+    };
+
+    // 2. Fetch the corresponding ride_offer state
+    const offerRes = await pool.query(`
+      SELECT status AS driver_status, accepted_passengers 
+      FROM ride_offers 
+      WHERE id = $1;
+    `, [activeRideOfferId]);
+    
+    const rideOffer = offerRes.rows[0] || { driver_status: "pending", accepted_passengers: [] };
+
+    // 3. Fetch ONLY the co-riders for this EXACT ride offer who are actively matched/accepted
+    const passengersRes = await pool.query(`
+      SELECT user_id, status 
+      FROM route_pool 
+      WHERE matched_ride_offer_id = $1 
+        AND (status ILIKE '%matched%' OR status ILIKE '%accepted%')
+    `, [activeRideOfferId]);
+
+    return res.json({
+      rideOfferId: activeRideOfferId,
+      driver_status: rideOffer.driver_status,
+      accepted_passengers: rideOffer.accepted_passengers || [],
+      hub: hub,
+      passengers: passengersRes.rows
+    });
+
+  } catch (error) {
+    console.error("📍 Proposal Manifest Error:", error.stack || error);
+    return res.status(500).json({ error: "Failed to fetch proposal manifest" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
