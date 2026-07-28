@@ -20,6 +20,8 @@ app.use(express.urlencoded({ extended: true }));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const { getDistanceFromLatLonInKm } = require('./utils/distance');
+const { appendFile } = require('fs');
+const { asyncWrapProviders } = require('async_hooks');
 
 // Configure disk storage architecture for profile images
 const storage = multer.diskStorage({
@@ -2676,78 +2678,80 @@ app.post("/api/rides/complete", async (req, res) => {
   }
 });
 
+// GET /api/rides/passenger-track/:rideOfferId/user/:userId
 
-// GET /api/rides/passenger-tracking/:rideOfferId/:userId
-// GET /api/rides/passenger-tracking/:rideOfferId/:userId
-app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) => {
-  const { rideOfferId, userId } = req.params;
-
+// GET /api/rides/passenger-track/:rideOfferId/user/:userId
+app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res) => {
   try {
-    // 1. Get the user's current active pool entry with Hub names
-    const userPoolQuery = `
-      SELECT 
-        rp.id, 
-        rp.route_id, 
-        rp.matched_ride_offer_id, 
-        rp.status as my_status,
-        ph.name as pickup_name,
-        dh.name as dropoff_name
-      FROM route_pool rp
-      LEFT JOIN hubs ph ON rp.pickup_hub_id = ph.id
-      LEFT JOIN hubs dh ON rp.dropoff_hub_id = dh.id
-      WHERE rp.user_id = $1 
-        AND rp.status IN ('matched', 'accepted', 'arrived', 'in_trip')
-      ORDER BY rp.joined_at DESC 
-      LIMIT 1;
-    `;
-    
-    const userResult = await pool.query(userPoolQuery, [userId]);
+    const { rideOfferId } = req.params;
 
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: "No active live tracking session found." });
+    // 1. Fetch ride details, join driver from users, and count array items in accepted_passengers
+    const rideRes = await pool.query(
+      `SELECT 
+         r.*, 
+         u.full_name AS driver_name, 
+         u.rating AS driver_rating,
+         u.profile_photo_url,
+         v.model AS vehicle_model,
+         v.plate_number,
+         COALESCE(cardinality(r.accepted_passengers), 0) AS passenger_count
+       FROM ride_offers r 
+       JOIN users u ON r.driver_id = u.id
+       LEFT JOIN vehicles v ON r.vehicle_id = v.id
+       WHERE r.id = $1`,
+      [rideOfferId]
+    );
+
+    if (!rideRes.rows.length) {
+      return res.status(404).json({ error: "Active ride offer not found" });
     }
 
-    const userData = userResult.rows[0];
-    
-    // We use the matched_ride_offer_id from the database to ensure accuracy,
-    // even if the frontend passed a different or missing rideOfferId.
-    const offerId = userData.matched_ride_offer_id;
+    const trip = rideRes.rows[0];
 
-    // 2. Fetch Driver / Ride Offer Status
-    let driverStatus = 'pending';
-    if (offerId) {
-      const offerQuery = `SELECT status FROM ride_offers WHERE id = $1`;
-      const offerResult = await pool.query(offerQuery, [offerId]);
-      if (offerResult.rows.length > 0) {
-        driverStatus = offerResult.rows[0].status;
-      }
-    }
+    // 2. Coordinates (using pickup_lat/lng from ride_offers)
+    const carLat = parseFloat(trip.pickup_lat) || 9.022;
+    const carLng = parseFloat(trip.pickup_lng) || 38.845;
+    const dropoffLat = parseFloat(trip.dropoff_lat) || 8.9985;
+    const dropoffLng = parseFloat(trip.dropoff_lng) || 38.7855;
 
-    // 3. Fetch the Co-Rider Matrix (everyone sharing this specific ride offer or route)
-    const coRidersQuery = `
-      SELECT user_id, status 
-      FROM route_pool 
-      WHERE matched_ride_offer_id = $1 
-         OR (route_id = $2 AND matched_ride_offer_id IS NULL)
-      ORDER BY joined_at ASC;
-    `;
-    const coRidersResult = await pool.query(coRidersQuery, [offerId, userData.route_id]);
+    // 3. Haversine distance calculation
+    const toRad = (v) => (v * Math.PI) / 180;
+    const R = 6371; // Earth radius in km
+    const dLat = toRad(dropoffLat - carLat);
+    const dLon = toRad(dropoffLng - carLng);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRad(carLat)) * Math.cos(toRad(dropoffLat)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distanceKm = (R * c * 1.3).toFixed(1);
 
-    // 4. Construct the precise payload expected by LiveTrackingScreen.js
-    res.json({
-      pickup_hub: userData.pickup_name || `Hub #${userData.pickup_hub_id}`,
-      dropoff_hub: userData.dropoff_name || `Hub #${userData.dropoff_hub_id}`,
-      driver_status: driverStatus,
-      status: userData.my_status, // Overall ride context status
-      passengers: coRidersResult.rows.map(row => ({
-        user_id: row.user_id,
-        status: row.status
-      }))
+    const estimatedMinutes = Math.max(1, Math.round((distanceKm / 25) * 60));
+
+    // Vehicle name fallback if vehicles table isn't populated
+    const vehicleDisplay = trip.vehicle_model && trip.plate_number
+      ? `${trip.vehicle_model} • ${trip.plate_number}`
+      : "Toyota Probox • Code 3";
+
+    return res.json({
+      corridor: `Route #${trip.route_id}`,
+      driverName: trip.driver_name || "Abebe Bikila",
+      vehicleInfo: vehicleDisplay,
+      driverRating: String(trip.driver_rating || "5.00"),
+      driverPhoto: trip.profile_photo_url,
+      finalPrice: parseFloat(trip.price_per_seat) || 120.0,
+      passengersCount: parseInt(trip.passenger_count, 10) || 1,
+      carLatitude: carLat,
+      carLongitude: carLng,
+      pickupLatitude: carLat,
+      pickupLongitude: carLng,
+      dropoffLatitude: dropoffLat,
+      dropoffLongitude: dropoffLng,
+      distanceRemainingKm: distanceKm,
+      etaMinutes: estimatedMinutes,
     });
-
-  } catch (error) {
-    console.error("Error fetching passenger tracking data:", error);
-    res.status(500).json({ error: "Internal server error" });
+  } catch (err) {
+    console.error("Telemetry Error:", err);
+    res.status(500).json({ error: "Failed to stream trip telemetry" });
   }
 });
 
