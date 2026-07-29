@@ -1464,9 +1464,12 @@ app.get("/api/rides/proposal-status/:rideOfferId", async (req, res) => {
 
 
 /* ---------------- PASSENGER ACCEPTS PROPOSED PICKUP POINT ---------------- */
+// ==================================================================
+// PASSENGER ACCEPT PROPOSAL ENDPOINT
+// POST /api/rides/accept-proposal
+// ==================================================================
 app.post("/api/rides/accept-proposal", async (req, res) => {
   const { user_id, userId } = req.body;
-  // Support both snake_case and camelCase just to be safe
   const targetUserId = parseInt(user_id || userId, 10);
 
   if (!targetUserId || isNaN(targetUserId)) {
@@ -1474,41 +1477,38 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
   }
 
   try {
-    // 1. 🛡️ Find the active matched route_pool record for this user
-    // Using ILIKE '%matched%' to handle any database trailing spaces
+    // 1. Locate the active route_pool record in 'searching' status with an assigned offer
     const poolCheck = await pool.query(
       `SELECT id, matched_ride_offer_id, status 
        FROM route_pool 
        WHERE user_id = $1 
          AND status ILIKE '%matched%'
+         AND matched_ride_offer_id IS NOT NULL
        ORDER BY joined_at DESC
        LIMIT 1`,
       [targetUserId]
     );
 
-    // If no row is returned, they have no active matched ride to accept
     if (poolCheck.rows.length === 0) {
       return res.status(404).json({ 
-        error: "No active matched proposal found for this user." 
+        error: "No active matched proposal with a matched ride offer found for this user." 
       });
     }
 
     const activeRideOfferId = poolCheck.rows[0].matched_ride_offer_id;
     const poolRecordId = poolCheck.rows[0].id;
 
-    // 2. 📝 Execute Database Updates
-    // Thread the user_id securely into the tracking array without duplicates
+    // 2. Append user_id to accepted_passengers array in ride_offers without duplicates
     await pool.query(
       `UPDATE ride_offers 
        SET accepted_passengers = array_append(
-         array_remove(accepted_passengers, $2), $2
+         array_remove(COALESCE(accepted_passengers, '{}'), $2), $2
        ) 
        WHERE id = $1`,
       [activeRideOfferId, targetUserId]
     );
 
-    // 3. 🧹 Clean State: Update the user's route_pool status to 'accepted'
-    // This keeps the database perfectly synchronized with the ride_offers table
+    // 3. Update the user's route_pool status to 'accepted'
     await pool.query(
       `UPDATE route_pool 
        SET status = 'accepted' 
@@ -1516,17 +1516,17 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
       [poolRecordId]
     );
 
-    res.json({ 
+    return res.status(200).json({ 
       success: true, 
       ride_offer_id: activeRideOfferId,
-      message: "Pickup proposal accepted successfully and validated against route pool ledger." 
+      user_id: targetUserId,
+      message: "Proposal accepted successfully and added to accepted_passengers." 
     });
   } catch (err) {
     console.error("❌ ERROR RECORDING PROPOSAL ACCEPTANCE:", err.stack);
-    res.status(500).json({ error: "Failed to post acceptance state changes adjustment." });
+    return res.status(500).json({ error: "Failed to record proposal acceptance state." });
   }
 });
-
 
 
 app.post("/api/rides/accept-active-proposal", async (req, res) => {
