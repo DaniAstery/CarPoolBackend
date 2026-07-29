@@ -2234,13 +2234,15 @@ app.get("/api/rides/active-accepted-offer", async (req, res) => {
 });
 
 
-
-
+// ==================================================================
+// DRIVER ACCEPT DISPATCH MANIFEST ENDPOINT
+// POST /api/rides/driver-accept
+// ==================================================================
 app.post("/api/rides/driver-accept", async (req, res) => {
-  const { ride_offer_id, driver_id } = req.body;
+  const { driver_id } = req.body;
 
-  if (!ride_offer_id || !driver_id) {
-    return res.status(400).json({ error: "Missing ride_offer_id or driver_id parameters." });
+  if (!driver_id) {
+    return res.status(400).json({ error: "Missing required parameter: driver_id." });
   }
 
   const client = await pool.connect();
@@ -2248,97 +2250,116 @@ app.post("/api/rides/driver-accept", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Fetch details using actual schema column fields
-    const offerQuery = `
+    // 1. Identify and lock the active pending ride offer for this driver
+    const activeOfferQuery = `
       SELECT id, route_id, accepted_passengers, total_seats 
       FROM ride_offers 
-      WHERE id = $1 AND driver_id = $2 FOR UPDATE
+      WHERE driver_id = $1 
+        AND LOWER(TRIM(status)) = 'pending'
+      ORDER BY created_at DESC 
+      LIMIT 1 
+      FOR UPDATE
     `;
-    const offerRes = await client.query(offerQuery, [ride_offer_id, driver_id]);
+    const offerRes = await client.query(activeOfferQuery, [driver_id]);
 
     if (offerRes.rows.length === 0) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Active dispatch offer not found or driver allocation mismatch." });
+      return res.status(404).json({ 
+        error: "No active pending dispatch offer found for this driver." 
+      });
     }
 
     const offer = offerRes.rows[0];
+    const ride_offer_id = offer.id; // Resolved dynamically from DB
     const { route_id, total_seats } = offer;
 
+    // 2. Safely parse accepted_passengers (handles JS Array or Postgres string "{12,17}")
     let confirmedPassengerIds = [];
     if (offer.accepted_passengers) {
       if (Array.isArray(offer.accepted_passengers)) {
-        confirmedPassengerIds = offer.accepted_passengers.map(id => parseInt(id, 10));
+        confirmedPassengerIds = offer.accepted_passengers.map((id) => parseInt(id, 10));
       } else if (typeof offer.accepted_passengers === "string") {
         confirmedPassengerIds = offer.accepted_passengers
-          .replace(/{|}/g, "")
+          .replace(/[{}]/g, "")
           .split(",")
-          .map(id => parseInt(id.trim(), 10))
-          .filter(id => !isNaN(id));
+          .map((id) => parseInt(id.trim(), 10))
+          .filter((id) => !isNaN(id));
       }
     }
 
+    // 3. Minimum requirement validation
     if (confirmedPassengerIds.length < 2) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "Cannot accept dispatch. Minimum core passenger threshold not met." });
+      return res.status(400).json({ 
+        error: "Cannot accept dispatch. Minimum core passenger threshold (2) not met." 
+      });
     }
 
     const finalAvailableSeats = total_seats - confirmedPassengerIds.length;
     
-    // 1. Update the master ride offer state to 'accepted'
+    // 4. Update the master ride offer status to 'accepted'
     const updateOfferQuery = `
       UPDATE ride_offers 
-      SET status = 'accepted', available_seats = $1 
+      SET status = 'accepted', 
+          available_seats = $1 
       WHERE id = $2
     `;
     await client.query(updateOfferQuery, [finalAvailableSeats, ride_offer_id]);
 
-    // 2. 🎯 SYNCING STATUS: Also switch the active manifest pairs inside route_pool to 'accepted'
+    // 5. Sync active passenger roster in route_pool to 'accepted'
     if (confirmedPassengerIds.length > 0) {
       const updatePassengerPoolQuery = `
         UPDATE route_pool 
         SET status = 'accepted' 
         WHERE matched_ride_offer_id = $1 
-        AND user_id IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
+          AND user_id IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
       `;
       await client.query(updatePassengerPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
     }
 
+    // 6. Remove driver from queue since run is locked
     const deleteQueueQuery = `DELETE FROM driver_queue WHERE driver_id = $1`;
     await client.query(deleteQueueQuery, [driver_id]);
 
-    // Dynamically resolve active hub assignment parameters from the route pool data
+    // 7. Resolve pickup hub ID for auto-matching background engine
     let targetHubId = 1; 
-    const hubLookupQuery = `SELECT pickup_hub_id FROM route_pool WHERE matched_ride_offer_id = $1 LIMIT 1`;
+    const hubLookupQuery = `
+      SELECT pickup_hub_id 
+      FROM route_pool 
+      WHERE matched_ride_offer_id = $1 
+      LIMIT 1
+    `;
     const hubRes = await client.query(hubLookupQuery, [ride_offer_id]);
     if (hubRes.rows.length > 0 && hubRes.rows[0].pickup_hub_id) {
       targetHubId = parseInt(hubRes.rows[0].pickup_hub_id, 10);
     }
 
-    // Recycle unaccepted entries inside route_pool table mapping relationships
+    // 8. Recipient recycle: reset unaccepted riders back to 'searching' pool
     if (confirmedPassengerIds.length > 0) {
       const resetLeftoverPoolQuery = `
         UPDATE route_pool 
         SET status = 'searching', matched_ride_offer_id = NULL 
         WHERE matched_ride_offer_id = $1 
-        AND user_id NOT IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
+          AND user_id NOT IN (${confirmedPassengerIds.map((_, i) => `$${i + 2}`).join(",")})
         RETURNING user_id
       `;
       
       const resetRes = await client.query(resetLeftoverPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
-      console.log(`[Corridor Dispatch] Locked ${confirmedPassengerIds.length} riders. Kicked out ${resetRes.rows.length} pending riders back to searching stack.`);
+      console.log(`[Corridor Dispatch] Locked Offer #${ride_offer_id} for Driver ${driver_id}. Confirmed: ${confirmedPassengerIds.length}, Recycled: ${resetRes.rows.length}`);
     }
 
     await client.query("COMMIT");
 
-    // Invoke matching engine asynchronously
+    // 9. Asynchronously trigger next matching cycle
     executeCorridorAutoMatch(pool, route_id, targetHubId)
       .then(() => console.log(`[AutoMatch] Execution loop context processed cleanly for Route ${route_id}`))
       .catch((err) => console.error("[AutoMatch Error] Async dispatch node loop failure:", err));
 
     return res.status(200).json({
       success: true,
-      message: "Manifest and passenger pool locked in as 'accepted'. Leftover riders recycled.",
+      message: "Manifest and passenger pool locked in as 'accepted'.",
       rideOfferId: ride_offer_id,
+      driverId: parseInt(driver_id, 10),
       acceptedCount: confirmedPassengerIds.length,
       availableSeats: finalAvailableSeats
     });
@@ -2351,6 +2372,11 @@ app.post("/api/rides/driver-accept", async (req, res) => {
     client.release();
   }
 });
+
+
+
+
+
 
 
 app.post('/api/rides/driver-decline', async (req, res) => {
@@ -2750,11 +2776,9 @@ app.get("/api/passenger-livetracking/status/:userId", async (req, res) => {
 // 2. PASSENGER LIVE TELEMETRY & TRACKING ENDPOINT
 // GET /api/rides/passenger-track/:rideOfferId/user/:userId
 // ==================================================================
-// ==================================================================
-// PASSENGER LIVE TELEMETRY & TRACKING ENDPOINT
-// GET /api/rides/passenger-track/:rideOfferId/user/:userId
-// ==================================================================
-app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res) => {
+
+
+app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) => {
   const { rideOfferId, userId } = req.params;
   const targetRideOfferId = parseInt(rideOfferId, 10);
   const targetUserId = parseInt(userId, 10);
@@ -2764,7 +2788,6 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
   }
 
   try {
-    // 1. Query Ride Offer, Driver, Vehicle, and Hub details (without non-existent driver location columns)
     const rideQuery = `
       SELECT 
         r.id,
@@ -2807,18 +2830,17 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
 
     const trip = rideRes.rows[0];
 
-    // 2. Resolve Coordinates from available columns
+    // Coordinates resolution
     const pickupLat = parseFloat(trip.pickup_lat || trip.pickup_hub_lat || 9.0115);
     const pickupLng = parseFloat(trip.pickup_lng || trip.pickup_hub_lng || 38.7945);
     const dropoffLat = parseFloat(trip.dropoff_hub_lat || 8.9985);
     const dropoffLng = parseFloat(trip.dropoff_hub_lng || 38.7855);
 
-    // Dynamic vehicle location (uses pickup_lat/lng as the current position)
     const carLat = pickupLat;
     const carLng = pickupLng;
 
-    // 3. Distance & ETA Calculation
-    const currentStatus = (trip.driver_status || "in_trip").toLowerCase().trim();
+    // ETA & Distance
+    const currentStatus = (trip.driver_status || "accepted").toLowerCase().trim();
     const isHeadingToPickup = ["accepted", "arrived", "heading_to_pickup", "matched"].includes(currentStatus);
 
     const destinationLat = isHeadingToPickup ? pickupLat : dropoffLat;
@@ -2829,7 +2851,7 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
     const rawMinutes = (distanceKm / AVERAGE_URBAN_SPEED_KMH) * 60;
     const estimatedMins = Math.max(1, Math.round(rawMinutes));
 
-    // 4. Fetch Active Passengers
+    // Passengers query
     const passengersQuery = `
       SELECT 
         rp.user_id, 
@@ -2844,7 +2866,6 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
     const passengersRes = await pool.query(passengersQuery, [targetRideOfferId]);
     let passengers = passengersRes.rows;
 
-    // Fallback using accepted_passengers array (e.g. {17,12}) if route_pool has no records
     if (passengers.length === 0 && Array.isArray(trip.accepted_passengers) && trip.accepted_passengers.length > 0) {
       const usersRes = await pool.query(
         `SELECT id AS user_id, 'accepted' AS status, full_name FROM users WHERE id = ANY($1::int[])`,
@@ -2853,7 +2874,6 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
       passengers = usersRes.rows;
     }
 
-    // 5. Label Formatting
     const plate = trip.plate_number || trip.license_plate || "";
     const vehicleModel = `${trip.vehicle_make || ""} ${trip.vehicle_model || ""}`.trim() || "Corridor Shuttle";
     const vehicleDisplay = plate ? `${vehicleModel} • ${plate}` : vehicleModel;
@@ -2861,7 +2881,6 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
     const pickupHubName = trip.pickup_hub_name || `Hub #${trip.start_location || "Origin"}`;
     const dropoffHubName = trip.dropoff_hub_name || `Hub #${trip.end_location || "Destination"}`;
 
-    // 6. Output JSON Response
     return res.status(200).json({
       success: true,
       rideOfferId: trip.id,
@@ -2871,21 +2890,25 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
       driverRating: parseFloat(trip.driver_rating).toFixed(1),
       finalPrice: parseFloat(trip.final_price),
 
-      // Summary Header & Panel Metrics
+      // Hub Names
+      pickup_hub: pickupHubName,
+      dropoff_hub: dropoffHubName,
       corridor: `${pickupHubName} ➔ ${dropoffHubName}`,
+
+      // Metrics
       etaMinutes: estimatedMins,
       distanceRemainingKm: parseFloat(distanceKm.toFixed(1)),
       passengersCount: passengers.length || trip.accepted_passengers?.length || 1,
 
-      // Map Coordinates
-      carLatitude: carLat,
-      carLongitude: carLng,
-      pickupLatitude: pickupLat,
-      pickupLongitude: pickupLng,
-      dropoffLatitude: dropoffLat,
-      dropoffLongitude: dropoffLng,
+      // Coordinates (provided in both snake_case & camelCase for safety)
+      pickup_lat: pickupLat,
+      pickup_lng: pickupLng,
+      dropoff_lat: dropoffLat,
+      dropoff_lng: dropoffLng,
+      car_lat: carLat,
+      car_lng: carLng,
 
-      // Passengers Manifest
+      // Passenger Manifest
       passengers: passengers.map((p) => ({
         user_id: p.user_id,
         full_name: p.full_name || `Rider ${p.user_id}`,
@@ -2893,13 +2916,10 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
       })),
     });
   } catch (err) {
-    console.error("📍 Error fetching passenger tracking details:", err.stack || err);
+    console.error(" Error fetching passenger tracking details:", err.stack || err);
     return res.status(500).json({ error: "Failed to stream trip tracking details." });
   }
 });
-
-
-
 
 
 
