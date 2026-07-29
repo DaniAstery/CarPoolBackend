@@ -1465,33 +1465,38 @@ app.get("/api/rides/proposal-status/:rideOfferId", async (req, res) => {
 
 /* ---------------- PASSENGER ACCEPTS PROPOSED PICKUP POINT ---------------- */
 app.post("/api/rides/accept-proposal", async (req, res) => {
-  const { ride_offer_id, user_id } = req.body;
-  if (!ride_offer_id || !user_id) {
-    return res.status(400).json({ error: "Missing ride_offer_id or user_id parameters." });
+  const { user_id, userId } = req.body;
+  // Support both snake_case and camelCase just to be safe
+  const targetUserId = parseInt(user_id || userId, 10);
+
+  if (!targetUserId || isNaN(targetUserId)) {
+    return res.status(400).json({ error: "Missing or invalid user_id parameter." });
   }
 
   try {
-    // 1. 🛡️ Data Integrity Check: Validate pool matching alignment records
+    // 1. 🛡️ Find the active matched route_pool record for this user
+    // Using ILIKE '%matched%' to handle any database trailing spaces
     const poolCheck = await pool.query(
-      `SELECT id, status 
+      `SELECT id, matched_ride_offer_id, status 
        FROM route_pool 
-       WHERE user_id = $1 AND matched_ride_offer_id = $2`,
-      [user_id, ride_offer_id]
+       WHERE user_id = $1 
+         AND status ILIKE '%matched%'
+       ORDER BY joined_at DESC
+       LIMIT 1`,
+      [targetUserId]
     );
 
-    // If no row is returned, this user is attempting an unauthorized/invalid injection
+    // If no row is returned, they have no active matched ride to accept
     if (poolCheck.rows.length === 0) {
-      return res.status(403).json({ 
-        error: "Unauthorized acceptance. User is not matched to this specific ride offer route pool cluster." 
+      return res.status(404).json({ 
+        error: "No active matched proposal found for this user." 
       });
     }
 
-    // Optional optimization: Prevent executing a state change if they are already flagged as canceled/dropped out
-    if (poolCheck.rows[0].status === 'dropped') {
-      return res.status(400).json({ error: "Cannot accept. Passenger has already left or been dropped from this pool cluster." });
-    }
+    const activeRideOfferId = poolCheck.rows[0].matched_ride_offer_id;
+    const poolRecordId = poolCheck.rows[0].id;
 
-    // 2. 📝 Execute Database Updates sequentially across the state transaction
+    // 2. 📝 Execute Database Updates
     // Thread the user_id securely into the tracking array without duplicates
     await pool.query(
       `UPDATE ride_offers 
@@ -1499,11 +1504,21 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
          array_remove(accepted_passengers, $2), $2
        ) 
        WHERE id = $1`,
-      [ride_offer_id, user_id]
+      [activeRideOfferId, targetUserId]
+    );
+
+    // 3. 🧹 Clean State: Update the user's route_pool status to 'accepted'
+    // This keeps the database perfectly synchronized with the ride_offers table
+    await pool.query(
+      `UPDATE route_pool 
+       SET status = 'accepted' 
+       WHERE id = $1`,
+      [poolRecordId]
     );
 
     res.json({ 
       success: true, 
+      ride_offer_id: activeRideOfferId,
       message: "Pickup proposal accepted successfully and validated against route pool ledger." 
     });
   } catch (err) {
@@ -1643,28 +1658,6 @@ app.post('/api/rides/accept', async (req, res) => {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /* =========================================================================
    2. 📍 ARRIVAL CHECKPOINT SIGNAL: Commit Passenger Presence Node Validation
    ========================================================================= */
@@ -1676,18 +1669,18 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
     return res.status(400).json({ error: "Missing or invalid user_id." });
   }
 
-  const client = await db.connect();
+  const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // 1. Find active route_pool record for the user and check its matched ride offer
+    // 1. Find active route_pool record for the user (accepts 'pending' AND 'accepted' ride offer statuses)
     const poolCheckQuery = `
       SELECT rp.id, rp.matched_ride_offer_id, rp.status, ro.status AS ride_status, ro.accepted_passengers
       FROM route_pool rp
       JOIN ride_offers ro ON rp.matched_ride_offer_id = ro.id
       WHERE rp.user_id = $1 
         AND LOWER(TRIM(rp.status)) NOT IN ('completed', 'cancelled', 'idle', 'expired')
-        AND LOWER(TRIM(ro.status)) = 'pending'
+        AND LOWER(TRIM(ro.status)) IN ('pending', 'accepted', 'active', 'matched', 'in_progress')
         AND $1 = ANY(ro.accepted_passengers)
       ORDER BY rp.joined_at DESC
       LIMIT 1;
@@ -1698,7 +1691,7 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
     if (poolResult.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ 
-        error: `No active ride pool match found for user ${targetUserId} with a pending ride offer and valid accepted status.` 
+        error: `No active ride pool match found for user ${targetUserId}.` 
       });
     }
 
@@ -2684,82 +2677,258 @@ app.post("/api/rides/complete", async (req, res) => {
   }
 });
 
-// GET /api/rides/passenger-track/:rideOfferId/user/:userId
 
-// GET /api/rides/passenger-track/:rideOfferId/user/:userId
-app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res) => {
+
+// ==================================================================
+// HELPER: Haversine Great-Circle Distance (in kilometers)
+// ==================================================================
+function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
+  if (!lat1 || !lon1 || !lat2 || !lon2) return 0;
+  const R = 6371; // Earth's radius in km
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+
+// ==================================================================
+// 1. PASSENGER STATUS POLLING ENDPOINT
+// GET /api/passenger-livetracking/status/:userId
+// ==================================================================
+app.get("/api/passenger-livetracking/status/:userId", async (req, res) => {
+  const targetUserId = parseInt(req.params.userId, 10);
+
+  if (isNaN(targetUserId)) {
+    return res.status(400).json({ error: "Invalid userId parameter." });
+  }
+
   try {
-    const { rideOfferId } = req.params;
+    const statusQuery = `
+      SELECT 
+        rp.status, 
+        rp.matched_ride_offer_id, 
+        COALESCE(ro.final_price, ro.price_per_seat, 80) AS final_price
+      FROM route_pool rp
+      LEFT JOIN ride_offers ro ON rp.matched_ride_offer_id = ro.id
+      WHERE rp.user_id = $1 
+        AND LOWER(TRIM(rp.status)) NOT IN ('cancelled', 'expired', 'idle')
+      ORDER BY rp.joined_at DESC
+      LIMIT 1;
+    `;
 
-    // 1. Fetch ride details, join driver from users, and count array items in accepted_passengers
-    const rideRes = await pool.query(
-      `SELECT 
-         r.*, 
-         u.full_name AS driver_name, 
-         u.rating AS driver_rating,
-         u.profile_photo_url,
-         v.model AS vehicle_model,
-         v.plate_number,
-         COALESCE(cardinality(r.accepted_passengers), 0) AS passenger_count
-       FROM ride_offers r 
-       JOIN users u ON r.driver_id = u.id
-       LEFT JOIN vehicles v ON r.vehicle_id = v.id
-       WHERE r.id = $1`,
-      [rideOfferId]
-    );
+    const result = await pool.query(statusQuery, [targetUserId]);
+
+    if (result.rows.length === 0) {
+      return res.status(200).json({ 
+        status: "idle", 
+        matched_ride_offer_id: null,
+        finalPrice: 80 
+      });
+    }
+
+    const row = result.rows[0];
+    return res.status(200).json({
+      status: row.status.toLowerCase().trim(),
+      matched_ride_offer_id: row.matched_ride_offer_id,
+      finalPrice: parseFloat(row.final_price),
+    });
+  } catch (err) {
+    console.error("❌ Error fetching passenger status:", err.stack || err);
+    return res.status(500).json({ error: "Failed to fetch passenger status." });
+  }
+});
+
+
+// ==================================================================
+// 2. PASSENGER LIVE TELEMETRY & TRACKING ENDPOINT
+// GET /api/rides/passenger-track/:rideOfferId/user/:userId
+// ==================================================================
+// ==================================================================
+// PASSENGER LIVE TELEMETRY & TRACKING ENDPOINT
+// GET /api/rides/passenger-track/:rideOfferId/user/:userId
+// ==================================================================
+app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res) => {
+  const { rideOfferId, userId } = req.params;
+  const targetRideOfferId = parseInt(rideOfferId, 10);
+  const targetUserId = parseInt(userId, 10);
+
+  if (isNaN(targetRideOfferId) || isNaN(targetUserId)) {
+    return res.status(400).json({ error: "Invalid parameter IDs." });
+  }
+
+  try {
+    // 1. Query Ride Offer, Driver, Vehicle, and Hub details (without non-existent driver location columns)
+    const rideQuery = `
+      SELECT 
+        r.id,
+        r.status AS driver_status,
+        r.price_per_seat,
+        CASE 
+          WHEN r.final_price IS NOT NULL AND r.final_price > 0 THEN r.final_price
+          ELSE COALESCE(r.price_per_seat, 80)
+        END AS final_price,
+        r.pickup_lat,
+        r.pickup_lng,
+        r.accepted_passengers,
+        r.start_location,
+        r.end_location,
+        u.full_name AS driver_name,
+        COALESCE(u.rating, 4.9) AS driver_rating,
+        v.make AS vehicle_make,
+        v.model AS vehicle_model,
+        v.plate_number,
+        ph.name AS pickup_hub_name,
+        ph.latitude AS pickup_hub_lat,
+        ph.longitude AS pickup_hub_lng,
+        dh.name AS dropoff_hub_name,
+        dh.latitude AS dropoff_hub_lat,
+        dh.longitude AS dropoff_hub_lng
+      FROM ride_offers r
+      LEFT JOIN users u ON r.driver_id = u.id
+      LEFT JOIN vehicles v ON r.vehicle_id = v.id
+      LEFT JOIN hubs ph ON CASE WHEN r.start_location ~ '^[0-9]+$' THEN CAST(r.start_location AS INTEGER) ELSE NULL END = ph.id
+      LEFT JOIN hubs dh ON CASE WHEN r.end_location ~ '^[0-9]+$' THEN CAST(r.end_location AS INTEGER) ELSE NULL END = dh.id
+      WHERE r.id = $1
+      LIMIT 1;
+    `;
+
+    const rideRes = await pool.query(rideQuery, [targetRideOfferId]);
 
     if (!rideRes.rows.length) {
-      return res.status(404).json({ error: "Active ride offer not found" });
+      return res.status(404).json({ error: "Active ride offer not found." });
     }
 
     const trip = rideRes.rows[0];
 
-    // 2. Coordinates (using pickup_lat/lng from ride_offers)
-    const carLat = parseFloat(trip.pickup_lat) || 9.022;
-    const carLng = parseFloat(trip.pickup_lng) || 38.845;
-    const dropoffLat = parseFloat(trip.dropoff_lat) || 8.9985;
-    const dropoffLng = parseFloat(trip.dropoff_lng) || 38.7855;
+    // 2. Resolve Coordinates from available columns
+    const pickupLat = parseFloat(trip.pickup_lat || trip.pickup_hub_lat || 9.0115);
+    const pickupLng = parseFloat(trip.pickup_lng || trip.pickup_hub_lng || 38.7945);
+    const dropoffLat = parseFloat(trip.dropoff_hub_lat || 8.9985);
+    const dropoffLng = parseFloat(trip.dropoff_hub_lng || 38.7855);
 
-    // 3. Haversine distance calculation
-    const toRad = (v) => (v * Math.PI) / 180;
-    const R = 6371; // Earth radius in km
-    const dLat = toRad(dropoffLat - carLat);
-    const dLon = toRad(dropoffLng - carLng);
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(toRad(carLat)) * Math.cos(toRad(dropoffLat)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    const distanceKm = (R * c * 1.3).toFixed(1);
+    // Dynamic vehicle location (uses pickup_lat/lng as the current position)
+    const carLat = pickupLat;
+    const carLng = pickupLng;
 
-    const estimatedMinutes = Math.max(1, Math.round((distanceKm / 25) * 60));
+    // 3. Distance & ETA Calculation
+    const currentStatus = (trip.driver_status || "in_trip").toLowerCase().trim();
+    const isHeadingToPickup = ["accepted", "arrived", "heading_to_pickup", "matched"].includes(currentStatus);
 
-    // Vehicle name fallback if vehicles table isn't populated
-    const vehicleDisplay = trip.vehicle_model && trip.plate_number
-      ? `${trip.vehicle_model} • ${trip.plate_number}`
-      : "Toyota Probox • Code 3";
+    const destinationLat = isHeadingToPickup ? pickupLat : dropoffLat;
+    const destinationLng = isHeadingToPickup ? pickupLng : dropoffLng;
 
-    return res.json({
-      corridor: `Route #${trip.route_id}`,
-      driverName: trip.driver_name || "Abebe Bikila",
+    const distanceKm = calculateHaversineDistance(carLat, carLng, destinationLat, destinationLng);
+    const AVERAGE_URBAN_SPEED_KMH = 25;
+    const rawMinutes = (distanceKm / AVERAGE_URBAN_SPEED_KMH) * 60;
+    const estimatedMins = Math.max(1, Math.round(rawMinutes));
+
+    // 4. Fetch Active Passengers
+    const passengersQuery = `
+      SELECT 
+        rp.user_id, 
+        rp.status,
+        u.full_name
+      FROM route_pool rp
+      LEFT JOIN users u ON rp.user_id = u.id
+      WHERE rp.matched_ride_offer_id = $1 
+        AND LOWER(TRIM(rp.status)) IN ('accepted', 'arrived', 'in_trip', 'completed')
+    `;
+
+    const passengersRes = await pool.query(passengersQuery, [targetRideOfferId]);
+    let passengers = passengersRes.rows;
+
+    // Fallback using accepted_passengers array (e.g. {17,12}) if route_pool has no records
+    if (passengers.length === 0 && Array.isArray(trip.accepted_passengers) && trip.accepted_passengers.length > 0) {
+      const usersRes = await pool.query(
+        `SELECT id AS user_id, 'accepted' AS status, full_name FROM users WHERE id = ANY($1::int[])`,
+        [trip.accepted_passengers]
+      );
+      passengers = usersRes.rows;
+    }
+
+    // 5. Label Formatting
+    const plate = trip.plate_number || trip.license_plate || "";
+    const vehicleModel = `${trip.vehicle_make || ""} ${trip.vehicle_model || ""}`.trim() || "Corridor Shuttle";
+    const vehicleDisplay = plate ? `${vehicleModel} • ${plate}` : vehicleModel;
+
+    const pickupHubName = trip.pickup_hub_name || `Hub #${trip.start_location || "Origin"}`;
+    const dropoffHubName = trip.dropoff_hub_name || `Hub #${trip.end_location || "Destination"}`;
+
+    // 6. Output JSON Response
+    return res.status(200).json({
+      success: true,
+      rideOfferId: trip.id,
+      driver_status: trip.driver_status || "accepted",
+      driverName: trip.driver_name || "Assigned Driver",
       vehicleInfo: vehicleDisplay,
-      driverRating: String(trip.driver_rating || "5.00"),
-      driverPhoto: trip.profile_photo_url,
-      finalPrice: parseFloat(trip.price_per_seat) || 120.0,
-      passengersCount: parseInt(trip.passenger_count, 10) || 1,
+      driverRating: parseFloat(trip.driver_rating).toFixed(1),
+      finalPrice: parseFloat(trip.final_price),
+
+      // Summary Header & Panel Metrics
+      corridor: `${pickupHubName} ➔ ${dropoffHubName}`,
+      etaMinutes: estimatedMins,
+      distanceRemainingKm: parseFloat(distanceKm.toFixed(1)),
+      passengersCount: passengers.length || trip.accepted_passengers?.length || 1,
+
+      // Map Coordinates
       carLatitude: carLat,
       carLongitude: carLng,
-      pickupLatitude: carLat,
-      pickupLongitude: carLng,
+      pickupLatitude: pickupLat,
+      pickupLongitude: pickupLng,
       dropoffLatitude: dropoffLat,
       dropoffLongitude: dropoffLng,
-      distanceRemainingKm: distanceKm,
-      etaMinutes: estimatedMinutes,
+
+      // Passengers Manifest
+      passengers: passengers.map((p) => ({
+        user_id: p.user_id,
+        full_name: p.full_name || `Rider ${p.user_id}`,
+        status: p.status || "accepted",
+      })),
     });
   } catch (err) {
-    console.error("Telemetry Error:", err);
-    res.status(500).json({ error: "Failed to stream trip telemetry" });
+    console.error("📍 Error fetching passenger tracking details:", err.stack || err);
+    return res.status(500).json({ error: "Failed to stream trip tracking details." });
   }
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
