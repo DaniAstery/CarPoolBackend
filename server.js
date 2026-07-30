@@ -2924,7 +2924,127 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
   }
 });
 
+// ==================================================================
+// PASSENGER HUB PRESENCE & STATUS ENDPOINT FOR LIVE TRACKING SCREEN
+// GET /api/rides/presence-status/:rideOfferId/:userId
+// ==================================================================
+app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
+  const { rideOfferId, userId } = req.params;
+  const targetRideOfferId = parseInt(rideOfferId, 10);
+  const targetUserId = parseInt(userId, 10);
 
+  if (isNaN(targetRideOfferId) || isNaN(targetUserId)) {
+    return res.status(400).json({ 
+      success: false, 
+      error: "Invalid parameter IDs provided." 
+    });
+  }
+
+  try {
+    const rideQuery = `
+      SELECT 
+        r.id,
+        r.status AS driver_status,
+        r.pickup_lat,
+        r.pickup_lng,
+        r.accepted_passengers,
+        r.start_location,
+        r.end_location,
+        u.full_name AS driver_name,
+        v.make AS vehicle_make,
+        v.model AS vehicle_model,
+        v.plate_number,
+        ph.name AS pickup_hub_name,
+        ph.latitude AS pickup_hub_lat,
+        ph.longitude AS pickup_hub_lng,
+        dh.name AS dropoff_hub_name,
+        dh.latitude AS dropoff_hub_lat,
+        dh.longitude AS dropoff_hub_lng
+      FROM ride_offers r
+      LEFT JOIN users u ON r.driver_id = u.id
+      LEFT JOIN vehicles v ON r.vehicle_id = v.id
+      LEFT JOIN hubs ph ON CASE WHEN r.start_location ~ '^[0-9]+$' THEN CAST(r.start_location AS INTEGER) ELSE NULL END = ph.id
+      LEFT JOIN hubs dh ON CASE WHEN r.end_location ~ '^[0-9]+$' THEN CAST(r.end_location AS INTEGER) ELSE NULL END = dh.id
+      WHERE r.id = $1
+      LIMIT 1;
+    `;
+
+    const rideRes = await pool.query(rideQuery, [targetRideOfferId]);
+
+    if (!rideRes.rows.length) {
+      return res.status(404).json({ 
+        success: false, 
+        error: "Active ride offer not found." 
+      });
+    }
+
+    const trip = rideRes.rows[0];
+
+    // 1. Resolve Coordinates for Hub Meetup Marker
+    const pickupLat = parseFloat(trip.pickup_lat || trip.pickup_hub_lat || 9.0115);
+    const pickupLng = parseFloat(trip.pickup_lng || trip.pickup_hub_lng || 38.7945);
+
+    // 2. Fetch Active Co-Riders Manifest & Presence Statuses
+    const passengersQuery = `
+      SELECT 
+        rp.user_id, 
+        rp.status,
+        u.full_name
+      FROM route_pool rp
+      LEFT JOIN users u ON rp.user_id = u.id
+      WHERE rp.matched_ride_offer_id = $1 
+        AND LOWER(TRIM(rp.status)) IN ('accepted', 'arrived', 'matched', 'in_trip', 'completed')
+    `;
+
+    const passengersRes = await pool.query(passengersQuery, [targetRideOfferId]);
+    let passengers = passengersRes.rows;
+
+    if (passengers.length === 0 && Array.isArray(trip.accepted_passengers) && trip.accepted_passengers.length > 0) {
+      const usersRes = await pool.query(
+        `SELECT id AS user_id, 'accepted' AS status, full_name FROM users WHERE id = ANY($1::int[])`,
+        [trip.accepted_passengers]
+      );
+      passengers = usersRes.rows;
+    }
+
+    // 3. Label Formatting
+    const plate = trip.plate_number || trip.license_plate || "";
+    const vehicleModel = `${trip.vehicle_make || ""} ${trip.vehicle_model || ""}`.trim() || "Corridor Shuttle";
+    const vehicleDisplay = plate ? `${vehicleModel} • ${plate}` : vehicleModel;
+
+    const pickupHubName = trip.pickup_hub_name || `Hub #${trip.start_location || "Origin"}`;
+    const dropoffHubName = trip.dropoff_hub_name || `Hub #${trip.end_location || "Destination"}`;
+
+    // 4. Return Lightweight JSON Response
+    return res.status(200).json({
+      success: true,
+      rideOfferId: trip.id,
+      driver_status: trip.driver_status || "accepted",
+      driverName: trip.driver_name || "Assigned Driver",
+      vehicleInfo: vehicleDisplay,
+
+      pickup_hub: pickupHubName,
+      dropoff_hub: dropoffHubName,
+      corridor: `${pickupHubName} ➔ ${dropoffHubName}`,
+
+      pickup_lat: pickupLat,
+      pickup_lng: pickupLng,
+
+      passengers: passengers.map((p) => ({
+        user_id: p.user_id,
+        userId: p.user_id,
+        full_name: p.full_name || `Rider ${p.user_id}`,
+        status: p.status || "accepted",
+      })),
+    });
+  } catch (err) {
+    console.error("❌ Error fetching hub presence status:", err.stack || err);
+    return res.status(500).json({ 
+      success: false, 
+      error: "Failed to fetch hub presence tracking status." 
+    });
+  }
+});
 
 
 
