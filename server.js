@@ -2625,32 +2625,54 @@ app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
 // POST: /api/rides/complete
 
 app.post("/api/rides/complete", async (req, res) => {
-  const { ride_offer_id } = req.body;
+  const { driver_id, ride_offer_id } = req.body;
 
-  if (!ride_offer_id) {
-    return res.status(400).json({ error: "Missing ride_offer_id parameters." });
+  if (!driver_id && !ride_offer_id) {
+    return res.status(400).json({ error: "Missing driver_id or ride_offer_id parameters." });
   }
 
   try {
-    // 1. Fetch base pricing configuration directly from the database row
-    const offerCheck = await pool.query(
-      "SELECT price_per_seat FROM ride_offers WHERE id = $1",
-      [ride_offer_id]
-    );
+    let targetRideOfferId = ride_offer_id;
+    let pricePerSeat = 0;
 
-    if (offerCheck.rows.length === 0) {
-      return res.status(404).json({ error: "Ride offer target profile instance not found." });
+    // 1. If driver_id is provided, find the active ride offer (prioritizing 'in_trip')
+    if (driver_id && !targetRideOfferId) {
+      const offerCheck = await pool.query(
+        `SELECT id, price_per_seat, status 
+         FROM ride_offers 
+         WHERE driver_id = $1 AND LOWER(TRIM(status)) IN ('in_trip', 'accepted', 'arrived', 'heading_to_pickup')
+         ORDER BY CASE WHEN LOWER(TRIM(status)) = 'in_trip' THEN 1 ELSE 2 END, id DESC 
+         LIMIT 1`,
+        [driver_id]
+      );
+
+      if (offerCheck.rows.length === 0) {
+        return res.status(404).json({ error: "No active ride offer found for this driver." });
+      }
+
+      targetRideOfferId = offerCheck.rows[0].id;
+      pricePerSeat = parseFloat(offerCheck.rows[0].price_per_seat) || 0;
+    } else {
+      // Fallback lookup using direct ride_offer_id
+      const offerCheck = await pool.query(
+        "SELECT price_per_seat FROM ride_offers WHERE id = $1",
+        [targetRideOfferId]
+      );
+
+      if (offerCheck.rows.length === 0) {
+        return res.status(404).json({ error: "Ride offer target profile instance not found." });
+      }
+
+      pricePerSeat = parseFloat(offerCheck.rows[0].price_per_seat) || 0;
     }
 
-    const pricePerSeat = parseFloat(offerCheck.rows[0].price_per_seat) || 0;
-
-    // 2. Synchronize associated users to 'completed'
+    // 2. Synchronize associated users in route_pool to 'completed'
     const passengerUpdate = await pool.query(
       `UPDATE route_pool 
        SET status = 'completed'
        WHERE matched_ride_offer_id = $1
        RETURNING id, user_id, status`,
-      [ride_offer_id]
+      [targetRideOfferId]
     );
 
     const completedRidersCount = passengerUpdate.rowCount || 0;
@@ -2663,14 +2685,15 @@ app.post("/api/rides/complete", async (req, res) => {
            final_price = $1
        WHERE id = $2 
        RETURNING id, status, final_price`,
-      [calculatedFinalPrice, ride_offer_id]
+      [calculatedFinalPrice, targetRideOfferId]
     );
 
-    console.log(`🏁 Transactional Lifecycle Sealed for Corridor Run ID #${ride_offer_id}:`);
+    console.log(`🏁 Transactional Lifecycle Sealed for Corridor Run ID #${targetRideOfferId} (Driver ID #${driver_id || 'N/A'}):`);
     console.log(`   🔹 ride_offers status -> completed (final_price: ETB ${calculatedFinalPrice})`);
     console.log(`   🔹 route_pool passengers -> ${completedRidersCount} records synchronized`);
 
     return res.status(200).json({
+      success: true,
       message: "Corridor parameters successfully updated to completed state profiles.",
       rideOffer: offerUpdate.rows[0],
       updatedRidersCount: completedRidersCount,
@@ -2682,8 +2705,6 @@ app.post("/api/rides/complete", async (req, res) => {
     return res.status(500).json({ error: "Internal database tracking matrix generation runtime fault." });
   }
 });
-
-
 
 
 
