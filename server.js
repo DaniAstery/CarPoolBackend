@@ -2554,61 +2554,97 @@ app.get("/api/rides/status/:rideOfferId", async (req, res) => {
    🚀 ENDPOINT 2: UPDATE STATUS TO ARRIVED (THE ARRIVAL BUTTON MATRIX) DRIVER
    ========================================================================= */
 app.post("/api/rides/arrive", async (req, res) => {
-  // 🛡️ GUARD: Prevent crash if req.body or req itself isn't parsed/populated
+  // 🛡️ GUARD: Prevent crash if req.body isn't parsed/populated
   if (!req || !req.body) {
     return res.status(400).json({ 
-      error: "Malformed request payload. Make sure express.json() middleware is active and Headers include Content-Type: application/json" 
+      error: "Malformed request payload. Ensure express.json() middleware is active." 
     });
   }
 
-  const { ride_offer_id } = req.body;
+  const { driver_id, driverId } = req.body;
+  const targetDriverId = parseInt(driver_id || driverId, 10);
 
-  if (!ride_offer_id) {
-    return res.status(400).json({ error: "Missing required parameter: ride_offer_id" });
-  }
-
-  const parsedOfferId = parseInt(ride_offer_id, 10);
-  if (isNaN(parsedOfferId)) {
-    return res.status(400).json({ error: "Invalid format: ride_offer_id must be an integer." });
+  if (!targetDriverId || isNaN(targetDriverId)) {
+    return res.status(400).json({ error: "Missing or invalid required parameter: driver_id" });
   }
 
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
-    // 🎯 STRICT MODE: Only allows transition if the driver already accepted the ride ('accepted')
+    // 1. Find the active 'accepted' ride offer for this driver and update status to 'arrived'
     const updateRideOfferQuery = await client.query(
       `UPDATE ride_offers 
        SET status = 'arrived' 
-       WHERE id = $1 
+       WHERE driver_id = $1 
          AND TRIM(LOWER(status)) IN ('accepted', 'arrived')
-       RETURNING id, status;`,
-      [parsedOfferId]
+       RETURNING id, driver_id, status, COALESCE(accepted_passengers, '{}') AS accepted_passengers;`,
+      [targetDriverId]
     );
 
     if (updateRideOfferQuery.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ 
-        error: `Ride offer ID ${parsedOfferId} not found or status cannot transition to arrived (Must be 'accepted' first).` 
+        error: `No active accepted ride offer found for driver ID ${targetDriverId} to mark as arrived.` 
       });
+    }
+
+    const activeRide = updateRideOfferQuery.rows[0];
+    const activeRideOfferId = activeRide.id;
+    const acceptedPassengers = activeRide.accepted_passengers;
+
+    let updatedPassengersCount = 0;
+
+    // 2. Cascade status update to 'arrived' ONLY for active accepted passengers of THIS ride offer
+    if (Array.isArray(acceptedPassengers) && acceptedPassengers.length > 0) {
+      const updatePoolQuery = await client.query(
+        `UPDATE route_pool 
+         SET status = 'arrived' 
+         WHERE matched_ride_offer_id = $1 
+           AND user_id = ANY($2::int[])
+           AND TRIM(LOWER(status)) IN ('accepted', 'arrived')
+         RETURNING id, user_id, status;`,
+        [activeRideOfferId, acceptedPassengers]
+      );
+
+      updatedPassengersCount = updatePoolQuery.rows.length;
     }
 
     await client.query("COMMIT");
 
     return res.status(200).json({
       success: true,
-      message: "Driver arrival state updated and committed successfully.",
-      ride_offer: updateRideOfferQuery.rows[0]
+      message: "Driver arrival state and associated active passenger statuses updated to arrived.",
+      ride_offer_id: activeRideOfferId,
+      driver_id: targetDriverId,
+      status: "arrived",
+      accepted_passengers_updated: updatedPassengersCount
     });
 
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("❌ TRANSACTION ARREST: ARRIVAL SYSTEM FAULT:", err.message);
+    console.error("❌ TRANSACTION ARREST: ARRIVAL SYSTEM FAULT:", err.stack || err.message);
     return res.status(500).json({ error: `Internal execution error: ${err.message}` });
   } finally {
     client.release();
   }
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // GET /api/rides/driver-active-session/:driverId
 app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
