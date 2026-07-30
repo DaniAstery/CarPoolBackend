@@ -830,54 +830,59 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
 });
 
 
-
-
-/* ---------------- START TRIP LIFECYCLE CONTROLLER ---------------- */
-// 🎯 Import or reference your matching engine runner here
-
 app.post("/api/rides/start-trip", async (req, res) => {
+  // 🛡️ GUARD: Prevent crash if req.body isn't parsed
+  if (!req || !req.body) {
+    return res.status(400).json({ 
+      error: "Malformed request payload. Ensure express.json() middleware is active." 
+    });
+  }
+
+  const { driver_id, driverId } = req.body;
+  const targetDriverId = parseInt(driver_id || driverId, 10);
+
+  console.log(`🎬 [START TRIP] Request received for Driver ID: ${targetDriverId}`);
+
+  if (!targetDriverId || isNaN(targetDriverId)) {
+    return res.status(400).json({ error: "Missing or invalid driver_id parameter format." });
+  }
+
   const client = await pool.connect();
+
   try {
-    const { ride_offer_id } = req.body;
-    const parsedRideId = parseInt(ride_offer_id, 10);
-
-    console.log(`🎬 [START TRIP] Request received for Ride Offer ID: ${ride_offer_id} (Parsed: ${parsedRideId})`);
-
-    if (!parsedRideId || isNaN(parsedRideId)) {
-      return res.status(400).json({ error: "Missing or invalid ride_offer_id parameter format." });
-    }
-
     await client.query("BEGIN");
 
-    // 1. Update the master ride offer's state from 'arrived' to 'in_trip'
+    // 1. Locate and update the driver's active 'arrived' ride offer to 'in_trip'
     const updateOffer = await client.query(
       `UPDATE ride_offers 
        SET status = 'in_trip',
            created_at = NOW()
-       WHERE id = $1 AND TRIM(LOWER(status)) = 'arrived'
+       WHERE driver_id = $1 
+         AND TRIM(LOWER(status)) IN ('arrived', 'in_trip')
        RETURNING id, status, route_id, driver_id;`,
-      [parsedRideId]
+      [targetDriverId]
     );
 
     if (updateOffer.rows.length === 0) {
       await client.query("ROLLBACK");
-      console.log(`⚠️ [START TRIP REJECTION] Row #${parsedRideId} not found or status was not 'arrived'.`);
+      console.log(`⚠️ [START TRIP REJECTION] No active 'arrived' ride offer found for Driver ID #${targetDriverId}.`);
       return res.status(404).json({ 
-        error: "Ride offer not found or current status is not 'arrived'. Cannot transition to trip state." 
+        error: `No active ride offer in 'arrived' status found for driver ID ${targetDriverId}.` 
       });
     }
 
     const activeOffer = updateOffer.rows[0];
-    console.log(`✅ [START TRIP] ride_offers row #${activeOffer.id} successfully updated to [${activeOffer.status}]`);
+    const activeRideOfferId = activeOffer.id;
+    console.log(`✅ [START TRIP] ride_offers row #${activeRideOfferId} successfully updated to [${activeOffer.status}]`);
 
     // 2. 🟢 COMMIT COMMITTED RIDERS: Transition 'accepted' or 'arrived' riders to 'in_trip'
     const poolUpdateInTrip = await client.query(
       `UPDATE route_pool 
        SET status = 'in_trip'
        WHERE matched_ride_offer_id = $1 
-         AND TRIM(LOWER(status)) IN ('accepted', 'arrived')
+         AND TRIM(LOWER(status)) IN ('accepted', 'arrived', 'in_trip')
        RETURNING id, user_id, status;`,
-      [parsedRideId]
+      [activeRideOfferId]
     );
 
     console.log(`👥 [START TRIP] Upgraded ${poolUpdateInTrip.rows.length} committed passenger records to 'in_trip'.`);
@@ -890,29 +895,24 @@ app.post("/api/rides/start-trip", async (req, res) => {
        WHERE matched_ride_offer_id = $1 
          AND TRIM(LOWER(status)) = 'matched'
        RETURNING id, user_id, status;`,
-      [parsedRideId]
+      [activeRideOfferId]
     );
 
     const recycledCount = poolResetMatched.rows.length;
     console.log(`♻️ [START TRIP] Recycled ${recycledCount} uncommitted ('matched') passengers back to 'searching'.`);
 
     // Commit the database transaction *before* calling the matching engine
-    // to ensure the recycled users are safely back in 'searching' state in DB.
     await client.query("COMMIT");
 
     // 4. 🚀 TRIGGER MATCHING ENGINE
-    // Run this asynchronously so it doesn't block the driver's client response.
     if (recycledCount > 0) {
       console.log(`⚡ [START TRIP] Triggering Corridor Matching Engine to re-assign ${recycledCount} passenger(s)...`);
       
-      // OPTION A: Internal Function Call (Fastest & cleanest)
       if (typeof runMatchingEngine === "function") {
         runMatchingEngine().catch(err => {
           console.error("❌ [Matching Engine Process Error]:", err.message);
         });
-      } 
-      // OPTION B: Loopback API Trigger (Use if matching engine is mapped to an endpoint)
-      else {
+      } else {
         fetch(`api/rides/match`, { 
           method: "POST",
           headers: { "Content-Type": "application/json" }
@@ -950,75 +950,6 @@ app.post("/api/rides/start-trip", async (req, res) => {
 
 
 
-// POST /api/rides/start-trip
-app.post("/api/rides/start-trip", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { ride_offer_id } = req.body;
-    const parsedRideId = parseInt(ride_offer_id, 10);
-
-    console.log(`🎬 [START TRIP] Request received for Ride Offer ID: ${ride_offer_id} (Parsed: ${parsedRideId})`);
-
-    if (!parsedRideId || isNaN(parsedRideId)) {
-      return res.status(400).json({ error: "Missing or invalid ride_offer_id parameter format." });
-    }
-
-    await client.query("BEGIN");
-
-    // 🎯 UPGRADE 1: Trim and normalize state tracking strings, updating to standard 'in_trip'
-    const updateOffer = await client.query(
-      `UPDATE ride_offers 
-       SET status = 'in_trip',
-           created_at = NOW()
-       WHERE id = $1 AND TRIM(LOWER(status)) = 'arrived'
-       RETURNING id, status, route_id, driver_id;`,
-      [parsedRideId]
-    );
-
-    if (updateOffer.rows.length === 0) {
-      await client.query("ROLLBACK");
-      console.log(`⚠️ [START TRIP REJECTION] Row #${parsedRideId} not found or status was not 'arrived'.`);
-      return res.status(404).json({ 
-        error: "Ride offer not found or current status is not 'arrived'. Cannot transition to trip state." 
-      });
-    }
-
-    const activeOffer = updateOffer.rows[0];
-    console.log(`✅ [START TRIP] ride_offers row #${activeOffer.id} successfully updated to [${activeOffer.status}]`);
-
-    // 🎯 UPGRADE 2: Update route_pool records using clean, trim-safe casing matching
-    const poolUpdate = await client.query(
-      `UPDATE route_pool 
-       SET status = 'in_trip',
-           joined_at = NOW()
-       WHERE matched_ride_offer_id = $1 AND TRIM(LOWER(status)) = 'matched'
-       RETURNING id;`,
-      [parsedRideId]
-    );
-
-    console.log(`👥 [START TRIP] Synchronized ${poolUpdate.rows.length} passenger pool entries to 'in_trip' matrix.`);
-
-    await client.query("COMMIT");
-
-    return res.status(200).json({
-      success: true,
-      message: "Corridor trip successfully transitioned to transit matrix.",
-      ride_offer: {
-        id: activeOffer.id,
-        status: activeOffer.status.trim(), // Strip any legacy column layout spacing safely
-        routeId: activeOffer.route_id,
-        driverId: activeOffer.driver_id
-      }
-    });
-
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ TRANSACTION ARREST: START TRIP FAULT:", err.message);
-    return res.status(500).json({ error: "Internal database state validation exception starting trip." });
-  } finally {
-    client.release();
-  }
-});
 
 
 
