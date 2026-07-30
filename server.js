@@ -1476,20 +1476,27 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
     return res.status(400).json({ error: "Missing or invalid user_id parameter." });
   }
 
+  // Get a dedicated client connection for transaction safety
+  const client = await pool.connect();
+
   try {
-    // 1. Locate the active route_pool record in 'searching' status with an assigned offer
-    const poolCheck = await pool.query(
+    await client.query("BEGIN");
+
+    // 1. Find active route_pool record (allowing both 'matched' and 'accepted' for idempotency)
+    const poolCheck = await client.query(
       `SELECT id, matched_ride_offer_id, status 
        FROM route_pool 
        WHERE user_id = $1 
-         AND status ILIKE '%matched%'
+         AND (status ILIKE '%matched%' OR status = 'accepted')
          AND matched_ride_offer_id IS NOT NULL
        ORDER BY joined_at DESC
-       LIMIT 1`,
+       LIMIT 1
+       FOR UPDATE`, // Row-level lock to prevent concurrent race conditions
       [targetUserId]
     );
 
     if (poolCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ 
         error: "No active matched proposal with a matched ride offer found for this user." 
       });
@@ -1498,8 +1505,8 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
     const activeRideOfferId = poolCheck.rows[0].matched_ride_offer_id;
     const poolRecordId = poolCheck.rows[0].id;
 
-    // 2. Append user_id to accepted_passengers array in ride_offers without duplicates
-    await pool.query(
+    // 2. Safely append user_id to accepted_passengers array without duplicates
+    await client.query(
       `UPDATE ride_offers 
        SET accepted_passengers = array_append(
          array_remove(COALESCE(accepted_passengers, '{}'), $2), $2
@@ -1509,12 +1516,14 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
     );
 
     // 3. Update the user's route_pool status to 'accepted'
-    await pool.query(
+    await client.query(
       `UPDATE route_pool 
        SET status = 'accepted' 
        WHERE id = $1`,
       [poolRecordId]
     );
+
+    await client.query("COMMIT");
 
     return res.status(200).json({ 
       success: true, 
@@ -1522,9 +1531,13 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
       user_id: targetUserId,
       message: "Proposal accepted successfully and added to accepted_passengers." 
     });
+
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("❌ ERROR RECORDING PROPOSAL ACCEPTANCE:", err.stack);
     return res.status(500).json({ error: "Failed to record proposal acceptance state." });
+  } finally {
+    client.release(); // Always release client back to the pool
   }
 });
 
