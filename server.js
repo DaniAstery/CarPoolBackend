@@ -3048,33 +3048,6 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
   const { userId } = req.params;
   const targetUserId = parseInt(userId, 10);
@@ -3141,19 +3114,64 @@ app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
 });
 
 
+// ==================================================================
+// FETCH PAYMENT & DRIVER PHONE BY LOGGED-IN PASSENGER USER ID
+// GET /api/rides/payment-details-by-user/:userId
+// ==================================================================
 
+app.get("/api/rides/payment-details-by-user/:userId", async (req, res) => {
+  const { userId } = req.params;
+  const targetUserId = parseInt(userId, 10);
 
+  if (isNaN(targetUserId)) {
+    return res.status(400).json({ success: false, error: "Invalid user ID." });
+  }
 
+  try {
+    const query = `
+      SELECT 
+        r.id AS ride_offer_id,
+        r.final_price,
+        r.price_per_seat,
+        COALESCE(u.full_name, 'Assigned Driver') AS driver_name,
+        COALESCE(NULLIF(TRIM(u.phone_number), ''), 'Phone Not Available') AS driver_phone,
+        ph.name AS pickup_hub_name,
+        dh.name AS dropoff_hub_name
+      FROM route_pool rp
+      JOIN ride_offers r ON rp.matched_ride_offer_id = r.id
+      LEFT JOIN users u ON r.driver_id = u.id
+      LEFT JOIN hubs ph ON rp.pickup_hub_id = ph.id
+      LEFT JOIN hubs dh ON rp.dropoff_hub_id = dh.id
+      WHERE rp.user_id = $1
+      ORDER BY rp.id DESC
+      LIMIT 1;
+    `;
 
+    const result = await pool.query(query, [targetUserId]);
 
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "No active ride found for this user." });
+    }
 
+    const row = result.rows[0];
+    const fixedPrice = parseFloat(row.final_price || row.price_per_seat || 80);
+    const corridorName = `${row.pickup_hub_name || 'Origin'} ➔ ${row.dropoff_hub_name || 'Destination'}`;
+    const driverPhone = row.driver_phone;
 
-
-
-
-
-
-
+    return res.status(200).json({
+      success: true,
+      rideOfferId: row.ride_offer_id,
+      fixedPrice: fixedPrice,
+      corridor: corridorName,
+      driverName: row.driver_name,
+      driverPhone: driverPhone,
+      phone_number: driverPhone
+    });
+  } catch (err) {
+    console.error("❌ Error fetching payment details by user:", err.stack || err);
+    return res.status(500).json({ success: false, error: "Failed to fetch corridor and driver details." });
+  }
+});
 
 
 
