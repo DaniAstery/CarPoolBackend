@@ -2685,23 +2685,6 @@ app.post("/api/rides/complete", async (req, res) => {
 
 
 
-// ==================================================================
-// HELPER: Haversine Great-Circle Distance (in kilometers)
-// ==================================================================
-function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
-  if (!lat1 || !lon1 || !lat2 || !lon2) return 0;
-  const R = 6371; // Earth's radius in km
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
 
 
 // ==================================================================
@@ -2752,13 +2735,32 @@ app.get("/api/passenger-livetracking/status/:userId", async (req, res) => {
 });
 
 
+
+// ==================================================================
+// HELPER: Haversine Great-Circle Distance (in kilometers)
+// ==================================================================
+function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
+  if (!lat1 || !lon1 || !lat2 || !lon2) return 0;
+  const R = 6371; // Earth's radius in km
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+
 // ==================================================================
 // 2. PASSENGER LIVE TELEMETRY & TRACKING ENDPOINT
 // GET /api/rides/passenger-track/:rideOfferId/user/:userId
 // ==================================================================
 
-
-app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) => {
+app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res) => {
   const { rideOfferId, userId } = req.params;
   const targetRideOfferId = parseInt(rideOfferId, 10);
   const targetUserId = parseInt(userId, 10);
@@ -2768,6 +2770,7 @@ app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) =
   }
 
   try {
+    // 1. Query Ride Offer, Driver, Vehicle, and Hub details
     const rideQuery = `
       SELECT 
         r.id,
@@ -2810,17 +2813,18 @@ app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) =
 
     const trip = rideRes.rows[0];
 
-    // Coordinates resolution
+    // 2. Resolve Coordinates from available columns
     const pickupLat = parseFloat(trip.pickup_lat || trip.pickup_hub_lat || 9.0115);
     const pickupLng = parseFloat(trip.pickup_lng || trip.pickup_hub_lng || 38.7945);
     const dropoffLat = parseFloat(trip.dropoff_hub_lat || 8.9985);
     const dropoffLng = parseFloat(trip.dropoff_hub_lng || 38.7855);
 
+    // Dynamic vehicle location
     const carLat = pickupLat;
     const carLng = pickupLng;
 
-    // ETA & Distance
-    const currentStatus = (trip.driver_status || "accepted").toLowerCase().trim();
+    // 3. Distance & ETA Calculation
+    const currentStatus = (trip.driver_status || "in_trip").toLowerCase().trim();
     const isHeadingToPickup = ["accepted", "arrived", "heading_to_pickup", "matched"].includes(currentStatus);
 
     const destinationLat = isHeadingToPickup ? pickupLat : dropoffLat;
@@ -2831,7 +2835,7 @@ app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) =
     const rawMinutes = (distanceKm / AVERAGE_URBAN_SPEED_KMH) * 60;
     const estimatedMins = Math.max(1, Math.round(rawMinutes));
 
-    // Passengers query
+    // 4. Fetch Active Passengers
     const passengersQuery = `
       SELECT 
         rp.user_id, 
@@ -2854,6 +2858,7 @@ app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) =
       passengers = usersRes.rows;
     }
 
+    // 5. Label Formatting
     const plate = trip.plate_number || trip.license_plate || "";
     const vehicleModel = `${trip.vehicle_make || ""} ${trip.vehicle_model || ""}`.trim() || "Corridor Shuttle";
     const vehicleDisplay = plate ? `${vehicleModel} • ${plate}` : vehicleModel;
@@ -2861,6 +2866,7 @@ app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) =
     const pickupHubName = trip.pickup_hub_name || `Hub #${trip.start_location || "Origin"}`;
     const dropoffHubName = trip.dropoff_hub_name || `Hub #${trip.end_location || "Destination"}`;
 
+    // 6. Output JSON Response
     return res.status(200).json({
       success: true,
       rideOfferId: trip.id,
@@ -2870,17 +2876,14 @@ app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) =
       driverRating: parseFloat(trip.driver_rating).toFixed(1),
       finalPrice: parseFloat(trip.final_price),
 
-      // Hub Names
       pickup_hub: pickupHubName,
       dropoff_hub: dropoffHubName,
       corridor: `${pickupHubName} ➔ ${dropoffHubName}`,
 
-      // Metrics
       etaMinutes: estimatedMins,
       distanceRemainingKm: parseFloat(distanceKm.toFixed(1)),
       passengersCount: passengers.length || trip.accepted_passengers?.length || 1,
 
-      // Coordinates (provided in both snake_case & camelCase for safety)
       pickup_lat: pickupLat,
       pickup_lng: pickupLng,
       dropoff_lat: dropoffLat,
@@ -2888,7 +2891,6 @@ app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) =
       car_lat: carLat,
       car_lng: carLng,
 
-      // Passenger Manifest
       passengers: passengers.map((p) => ({
         user_id: p.user_id,
         full_name: p.full_name || `Rider ${p.user_id}`,
@@ -2896,10 +2898,11 @@ app.get("/api/rides/passenger-tracking/:rideOfferId/:userId", async (req, res) =
       })),
     });
   } catch (err) {
-    console.error(" Error fetching passenger tracking details:", err.stack || err);
+    console.error("Error fetching passenger tracking details:", err.stack || err);
     return res.status(500).json({ error: "Failed to stream trip tracking details." });
   }
 });
+
 
 
 
