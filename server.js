@@ -3106,7 +3106,6 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
 });
 
 
-
 app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
   const { userId } = req.params;
   const targetUserId = parseInt(userId, 10);
@@ -3116,7 +3115,6 @@ app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
   }
 
   try {
-    // 1. Use ILIKE wildcard to completely ignore trailing spaces or hidden characters
     const myPoolRes = await pool.query(`
       SELECT rp.matched_ride_offer_id, rp.status, h.name AS hub_name, h.latitude AS hub_lat, h.longitude AS hub_lng
       FROM route_pool rp
@@ -3141,7 +3139,6 @@ app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
       longitude: parseFloat(myPoolRes.rows[0].hub_lng || 0)
     };
 
-    // 2. Fetch the corresponding ride_offer state
     const offerRes = await pool.query(`
       SELECT status AS driver_status, accepted_passengers 
       FROM ride_offers 
@@ -3150,12 +3147,13 @@ app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
     
     const rideOffer = offerRes.rows[0] || { driver_status: "pending", accepted_passengers: [] };
 
-    // 3. Fetch ONLY the co-riders for this EXACT ride offer who are actively matched/accepted
+    // 🔍 JOIN users table to pull full_name alongside route_pool status
     const passengersRes = await pool.query(`
-      SELECT user_id, status 
-      FROM route_pool 
-      WHERE matched_ride_offer_id = $1 
-        AND (status ILIKE '%matched%' OR status ILIKE '%accepted%')
+      SELECT rp.user_id, rp.status, u.full_name 
+      FROM route_pool rp
+      JOIN users u ON rp.user_id = u.id
+      WHERE rp.matched_ride_offer_id = $1 
+        AND (rp.status ILIKE '%matched%' OR rp.status ILIKE '%accepted%')
     `, [activeRideOfferId]);
 
     return res.json({
@@ -3171,6 +3169,7 @@ app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
     return res.status(500).json({ error: "Failed to fetch proposal manifest" });
   }
 });
+
 
 
 // ==================================================================
