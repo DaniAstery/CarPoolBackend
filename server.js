@@ -3265,6 +3265,80 @@ app.get('/api/routes/from/:hubName', async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+
+
+
+// 📴 Driver Go Offline Endpoint (Full Cleanup, Route Pool Reset & Matching Engine Trigger)
+app.post('/api/rides/go-offline', async (req, res) => {
+  const { driver_id } = req.body;
+
+  if (!driver_id) {
+    return res.status(400).json({ error: "Driver ID is required from AuthContext." });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Find all active/pending/matched ride offers for this driver
+    const rideQuery = await client.query(
+      "SELECT id FROM ride_offers WHERE driver_id = $1 AND status IN ('pending', 'matched', 'accepted')",
+      [driver_id]
+    );
+
+    const rideOfferIds = rideQuery.rows.map(row => row.id);
+
+    if (rideOfferIds.length > 0) {
+      // 2. Nullify matched_ride_offer_id in route_pool and reset status for affected riders
+      await client.query(
+        "UPDATE route_pool SET matched_ride_offer_id = NULL, status = 'searching' WHERE matched_ride_offer_id = ANY($1::int[]) AND status IN ('matching', 'matched', 'accepted')",
+        [rideOfferIds]
+      );
+
+      // 3. Delete the ride offer(s) from ride_offer table
+      await client.query(
+        "DELETE FROM ride_offers WHERE id = ANY($1::int[])",
+        [rideOfferIds]
+      );
+    }
+
+    // 4. Remove the driver from driver_queue where status is 'queued'
+    const queueDeleteResult = await client.query(
+      "DELETE FROM driver_queue WHERE driver_id = $1 AND status = 'queued'",
+      [driver_id]
+    );
+
+    await client.query('COMMIT');
+
+    console.log(`📴 Driver [${driver_id}] went offline. Unlinked route_pool records, deleted ride offers, and cleared driver_queue.`);
+
+    // 5. Invoke Matching Engine so unassigned riders are immediately re-processed
+    try {
+      if (typeof runMatchingEngine === 'function') {
+        await runMatchingEngine();
+        console.log("🔄 Matching engine successfully re-triggered after driver went offline.");
+      }
+    } catch (matchingErr) {
+      console.error("⚠️ Warning: Matching engine invocation failed post-offline:", matchingErr);
+    }
+
+    res.json({
+      success: true,
+      message: "Successfully went offline, queue, ride offers, and pool links cleared."
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("❌ Error processing driver go offline transaction:", err);
+    res.status(500).json({ error: "Internal server error while processing go offline request." });
+  } finally {
+    client.release();
+  }
+});
+
+
+
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
