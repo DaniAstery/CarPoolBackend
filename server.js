@@ -1,7 +1,10 @@
 const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const { Client } = require('pg');
 const cors = require('cors');
 require('dotenv').config();
-const pool = require('./db');
+const pool = require('./db'); // 👈 KEEP YOUR EXISTING DB POOL INTACT!
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -14,6 +17,48 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// 🔌 Wrap Express app in HTTP server for WebSockets
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+// 🔔 DEDICATED CLIENT FOR POSTGRES LISTEN / NOTIFY 
+// (Uses process.env.DATABASE_URL or your database connection string)
+const pgListener = new Client({
+  connectionString: process.env.DATABASE_URL || `postgresql://postgres:D@ny_456@127.0.0.1:5432/corridor_pool`
+});
+
+pgListener.connect()
+  .then(async () => {
+    console.log("🔌 Dedicated Postgres client connected for LISTEN/NOTIFY");
+    await pgListener.query("LISTEN route_pool_changed");
+  })
+  .catch(err => console.error("❌ Postgres listener connection failed:", err));
+
+pgListener.on("notification", (msg) => {
+  try {
+    const payload = JSON.parse(msg.payload);
+    console.log("🔔 Postgres Notification Caught on Server:", payload);
+    
+    // Broadcast instantly to all connected React Native clients
+    io.emit("route_pool_updated", payload);
+  } catch (err) {
+    console.error("❌ Error parsing notification payload:", err);
+  }
+});
+
+io.on("connection", (socket) => {
+  console.log("⚡ Passenger/Driver connected via Socket.io:", socket.id);
+});
+
+// ==========================================
+// YOUR EXISTING ROUTES (e.g., /api/routes/from/:hubName, etc.)
+// remain completely unaffected below here...
+// ==========================================
+
+// ⚠️ IMPORTANT: Use server.listen instead of app.listen so WebSockets work!
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT} with WebSockets and Postgres Listener`);
+});
 
 
 
@@ -762,7 +807,7 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
       )
       SELECT 
         pi.route_id,
-        pi.capacity,
+        COALESCE(latest_ro.total_seats, pi.capacity) AS capacity,
         pi.base_price,
         pi.pickup_hub_id AS start_hub_id,
         rs_drop.hub_id AS end_hub_id,
@@ -775,12 +820,26 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
           WHERE rs_all.route_id = pi.route_id
             AND rs_all.stop_order >= pi.pickup_order
             AND rs_all.stop_order <= rs_drop.stop_order
-        ) AS stops
+        ) AS stops,
+        -- 🧮 Live calculated seat metrics from active ride offers
+        COALESCE(latest_ro.available_seats, COALESCE(latest_ro.total_seats, pi.capacity)) AS available_seats,
+        (COALESCE(latest_ro.total_seats, pi.capacity) - COALESCE(latest_ro.available_seats, COALESCE(latest_ro.total_seats, pi.capacity))) AS filled_seats,
+        latest_ro.id AS ride_offer_id,
+        latest_ro.status AS offer_status
       FROM pickup_info pi
       -- Find all downstream drop-off stops that occur AFTER the pickup stop
       JOIN route_stops rs_drop ON rs_drop.route_id = pi.route_id 
         AND rs_drop.stop_order > pi.pickup_order
       JOIN hubs h_drop ON h_drop.id = rs_drop.hub_id
+      -- 🔍 Attach the latest active ride offer dynamically
+      LEFT JOIN LATERAL (
+        SELECT id, total_seats, available_seats, status
+        FROM ride_offers 
+        WHERE ride_offers.route_id = pi.route_id 
+          AND status IN ('pending', 'matched', 'active')
+        ORDER BY id DESC 
+        LIMIT 1
+      ) latest_ro ON true
       ORDER BY pi.route_id, rs_drop.stop_order;`,
       [pickupHub]
     );
@@ -3174,9 +3233,39 @@ app.get("/api/rides/payment-details-by-user/:userId", async (req, res) => {
 });
 
 
+// ==================================================================
+// FETCH AVAILABLE CORRIDORS FOR A HUB (WITH REAL-TIME SEAT COUNT)
+// GET /api/routes/from/:hubName
+// ==================================================================
+app.get('/api/routes/from/:hubName', async (req, res) => {
+  try {
+    const { hubName } = req.params;
 
+    const query = `
+      SELECT 
+        r.id AS route_id, 
+        r.stops, 
+        r.base_price,
+        COALESCE(ro.total_seats, 4) AS capacity,
+        COALESCE(ro.available_seats, 4) AS available_seats,
+        -- 🧮 Compute filled seats directly in SQL so the frontend gets an exact number
+        (COALESCE(ro.total_seats, 4) - COALESCE(ro.available_seats, 4)) AS filled_seats,
+        ro.id AS ride_offer_id,
+        ro.status AS offer_status
+      FROM routes r
+      JOIN hubs h ON r.pickup_hub_id = h.id
+      LEFT JOIN ride_offers ro ON r.id = ro.route_id AND ro.status IN ('pending', 'matched', 'active')
+      WHERE LOWER(h.name) = LOWER($1);
+    `;
 
-
+    const result = await pool.query(query, [hubName]);
+    console.log(`📊 [API /routes/from/${hubName}] Returning corridors with filled_seats:`, result.rows);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching active corridors:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
