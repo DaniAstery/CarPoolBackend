@@ -41,6 +41,11 @@ pgListener.on("notification", (msg) => {
     
     // Broadcast instantly to all connected React Native clients
     io.emit("route_pool_updated", payload);
+    
+    // ✅ Use payload.hub_id coming straight from the database notification
+    if (payload.hub_id) {
+      io.emit('queue_update', { hub_id: payload.hub_id, route_id: payload.route_id });
+    }
   } catch (err) {
     console.error("❌ Error parsing notification payload:", err);
   }
@@ -3300,7 +3305,7 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
   try {
     const { hubName } = req.params;
 
-    const query = `
+   const query = `
       SELECT 
         r.id AS route_id,
         r.hub_id,
@@ -3311,17 +3316,26 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
         h_drop.name AS destination_name,
         h_pass.name AS pass_through_name,
         COALESCE(r.recommended_base_price, 100) AS recommended_base_price,
-        COALESCE(ro.total_seats, 4) AS capacity,
-        COALESCE(ro.available_seats, 4) AS available_seats,
-        ro.id AS ride_offer_id,
-        ro.status AS offer_status,
+        COALESCE(ro_latest.total_seats, 4) AS capacity,
+        COALESCE(ro_latest.available_seats, 4) AS available_seats,
+        ro_latest.id AS ride_offer_id,
+        ro_latest.status AS offer_status,
         -- 🚗 Real-time driver queue count join
         COALESCE(driver_counts.waiting_drivers, 0)::INTEGER AS driver_queue_count
       FROM routes r
       JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
       JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
       LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id
-      LEFT JOIN ride_offers ro ON r.id = ro.route_id AND LOWER(ro.status) IN ('pending', 'matched', 'active', 'inprogress')
+      -- 🛡️ Prevent row duplication by grabbing the latest/active ride offer per route using DISTINCT ON or subquery
+      LEFT JOIN LATERAL (
+        SELECT id, total_seats, available_seats, status 
+        FROM ride_offers 
+        WHERE ride_offers.route_id = r.id 
+          AND LOWER(status) IN ('pending', 'matched', 'active', 'inprogress')
+        ORDER BY created_at DESC 
+        LIMIT 1
+      ) ro_latest ON TRUE
+      -- 🚗 Real-time driver count aggregated cleanly
       LEFT JOIN (
         SELECT route_id, COUNT(driver_id) AS waiting_drivers
         FROM driver_queue
