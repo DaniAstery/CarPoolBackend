@@ -1202,7 +1202,6 @@ app.post("/api/rides/create", async (req, res) => {
     await client.query("BEGIN");
 
     // 2. CONSTRAINT CHECK: Strictly target active operational statuses only
-    // Ensures 'rejected', 'declined', 'cancelled', 'completed', and 'expired' offers NEVER block going online.
     const activeOfferCheck = await client.query(
       `SELECT id, status FROM ride_offers 
        WHERE driver_id = $1 
@@ -1219,35 +1218,49 @@ app.post("/api/rides/create", async (req, res) => {
       });
     }
 
-    // 3. Collect Route, Geometry, and Hub IDs
+    // 3. Collect Route Geometry & Hub Details from New Flat Routes Schema
     const routeGeomQuery = await client.query(
-      `SELECT r.base_price, 
-              ARRAY_AGG(h.id ORDER BY rs.stop_order) AS hub_ids,
-              ARRAY_AGG(h.name ORDER BY rs.stop_order) AS hub_names,
-              (ARRAY_AGG(h.id ORDER BY rs.stop_order))[1] AS start_hub_id,
-              (ARRAY_AGG(h.name ORDER BY rs.stop_order))[1] AS start_hub_name,
-              (ARRAY_AGG(h.latitude ORDER BY rs.stop_order))[1] AS start_lat,
-              (ARRAY_AGG(h.longitude ORDER BY rs.stop_order))[1] AS start_lng
+      `SELECT 
+        COALESCE(r.recommended_base_price, 100) AS base_price,
+        r.pickup_hub_id AS start_hub_id,
+        h_pickup.name AS start_hub_name,
+        h_pickup.latitude AS start_lat,
+        h_pickup.longitude AS start_lng,
+        r.drop_off_hub_id,
+        h_drop.name AS drop_off_hub_name,
+        r.pass_through_hub_id,
+        h_pass.name AS pass_through_hub_name
        FROM routes r
-       JOIN route_stops rs ON rs.route_id = r.id
-       JOIN hubs h ON h.id = rs.hub_id
+       JOIN hubs h_pickup ON h_pickup.id = r.pickup_hub_id
+       JOIN hubs h_drop ON h_drop.id = r.drop_off_hub_id
+       LEFT JOIN hubs h_pass ON h_pass.id = r.pass_through_hub_id
        WHERE r.id = $1 
-       GROUP BY r.id, r.base_price;`,
+       LIMIT 1;`,
       [parseInt(route_id, 10)]
     );
     
     const routeData = routeGeomQuery.rows[0];
-    if (!routeData || !routeData.hub_ids || routeData.hub_ids.length < 2) {
+    if (!routeData) {
       await client.query("ROLLBACK");
       return res.status(400).json({ 
         error: "INCOMPLETE_ROUTE", 
-        message: "The chosen corridor route blueprint has an incomplete stop list." 
+        message: "The chosen corridor route blueprint does not exist." 
       });
     }
 
-    // 🎯 4. Enforce saving Hub ID numbers (e.g., "1" and "4") instead of string names
-    const finalStartLoc = start_location !== undefined && start_location !== null ? String(start_location) : String(routeData.hub_ids[0]);
-    const finalEndLoc = end_location !== undefined && end_location !== null ? String(end_location) : String(routeData.hub_ids[routeData.hub_ids.length - 1]);
+    // Construct flat hub arrays dynamically
+    const hub_ids = [routeData.start_hub_id];
+    const hub_names = [routeData.start_hub_name];
+    if (routeData.pass_through_hub_id) {
+      hub_ids.push(routeData.pass_through_hub_id);
+      hub_names.push(routeData.pass_through_hub_name);
+    }
+    hub_ids.push(routeData.drop_off_hub_id);
+    hub_names.push(routeData.drop_off_hub_name);
+
+    // 🎯 4. Enforce saving Hub ID numbers
+    const finalStartLoc = start_location !== undefined && start_location !== null ? String(start_location) : String(routeData.start_hub_id);
+    const finalEndLoc = end_location !== undefined && end_location !== null ? String(end_location) : String(routeData.drop_off_hub_id);
     const finalPickupLat = pickup_lat || routeData.start_lat;
     const finalPickupLng = pickup_lng || routeData.start_lng;
     const pricePerSeat = routeData.base_price;
