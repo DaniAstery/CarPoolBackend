@@ -3305,7 +3305,7 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
   try {
     const { hubName } = req.params;
 
-   const query = `
+    const query = `
       SELECT 
         r.id AS route_id,
         r.hub_id,
@@ -3326,16 +3326,17 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
       JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
       JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
       LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id
-      -- 🛡️ Prevent row duplication by grabbing the latest/active ride offer per route using DISTINCT ON or subquery
-      LEFT JOIN LATERAL (
-        SELECT id, total_seats, available_seats, status 
-        FROM ride_offers 
-        WHERE ride_offers.route_id = r.id 
-          AND LOWER(status) IN ('pending', 'matched', 'active', 'inprogress')
-        ORDER BY created_at DESC 
-        LIMIT 1
-      ) ro_latest ON TRUE
-      -- 🚗 Real-time driver count aggregated cleanly
+      
+      -- 🛡️ Prevent row duplication by grabbing the latest/active ride offer per route
+      LEFT JOIN (
+        SELECT DISTINCT ON (route_id) 
+          id, total_seats, available_seats, status, route_id
+        FROM ride_offers
+        WHERE LOWER(status) IN ('pending', 'matched', 'active', 'inprogress')
+        ORDER BY route_id, created_at DESC
+      ) ro_latest ON r.id = ro_latest.route_id
+      
+      -- 🚗 Real-time driver count aggregated cleanly and independently
       LEFT JOIN (
         SELECT route_id, COUNT(driver_id) AS waiting_drivers
         FROM driver_queue
@@ -3348,6 +3349,7 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
     const result = await pool.query(query, [hubName]);
     console.log("🔥 CORRECTED SCHEMA ROWS WITH QUEUE:", result.rows);
     return res.json(result.rows);
+    
   } catch (err) {
     console.error("❌ Error fetching live corridors:", err);
     return res.status(500).json({ error: "Internal server error" });
