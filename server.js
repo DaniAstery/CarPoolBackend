@@ -3296,33 +3296,47 @@ app.get("/api/rides/payment-details-by-user/:userId", async (req, res) => {
 // FETCH AVAILABLE CORRIDORS FOR A HUB (WITH REAL-TIME SEAT COUNT)
 // GET /api/routes/from/:hubName
 // ==================================================================
-app.get('/api/routes/from/:hubName', async (req, res) => {
+app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
   try {
     const { hubName } = req.params;
 
     const query = `
       SELECT 
-        r.id AS route_id, 
-        r.stops, 
-        r.base_price,
+        r.id AS route_id,
+        r.hub_id,
+        r.pickup_hub_id,
+        r.drop_off_hub_id,
+        r.pass_through_hub_id,
+        h_pickup.name AS pickup_hub_name,
+        h_drop.name AS destination_name,
+        h_pass.name AS pass_through_name,
+        COALESCE(r.recommended_base_price, 100) AS recommended_base_price,
         COALESCE(ro.total_seats, 4) AS capacity,
         COALESCE(ro.available_seats, 4) AS available_seats,
-        -- 🧮 Compute filled seats directly in SQL so the frontend gets an exact number
-        (COALESCE(ro.total_seats, 4) - COALESCE(ro.available_seats, 4)) AS filled_seats,
         ro.id AS ride_offer_id,
-        ro.status AS offer_status
+        ro.status AS offer_status,
+        -- 🚗 Real-time driver queue count join
+        COALESCE(driver_counts.waiting_drivers, 0)::INTEGER AS driver_queue_count
       FROM routes r
-      JOIN hubs h ON r.pickup_hub_id = h.id
-      LEFT JOIN ride_offers ro ON r.id = ro.route_id AND ro.status IN ('pending', 'matched', 'active')
-      WHERE LOWER(h.name) = LOWER($1);
+      JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
+      JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
+      LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id
+      LEFT JOIN ride_offers ro ON r.id = ro.route_id AND LOWER(ro.status) IN ('pending', 'matched', 'active', 'inprogress')
+      LEFT JOIN (
+        SELECT route_id, COUNT(driver_id) AS waiting_drivers
+        FROM driver_queue
+        WHERE LOWER(status) = 'queued'
+        GROUP BY route_id
+      ) driver_counts ON r.id = driver_counts.route_id
+      WHERE LOWER(h_pickup.name) = LOWER($1);
     `;
 
     const result = await pool.query(query, [hubName]);
-    console.log(`📊 [API /routes/from/${hubName}] Returning corridors with filled_seats:`, result.rows);
-    res.json(result.rows);
+    console.log("🔥 CORRECTED SCHEMA ROWS WITH QUEUE:", result.rows);
+    return res.json(result.rows);
   } catch (err) {
-    console.error("❌ Error fetching active corridors:", err);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("❌ Error fetching live corridors:", err);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -3396,6 +3410,9 @@ app.post('/api/rides/go-offline', async (req, res) => {
     client.release();
   }
 });
+
+
+
 
 
 
