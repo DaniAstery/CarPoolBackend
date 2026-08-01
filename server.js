@@ -474,6 +474,8 @@ app.get("/api/rides/pool-status/:userId", async (req, res) => {
   }
 });
 
+
+
 app.post("/api/routes/join", async (req, res) => {
   const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
 
@@ -507,34 +509,38 @@ app.post("/api/routes/join", async (req, res) => {
       });
     }
 
-    // 2. DYNAMIC LOOKUP: Resolve pickup_hub_id if missing
+    // 2. DYNAMIC LOOKUP: Resolve pickup & dropoff hubs directly from the routes table if missing
     let targetPickupHubId = pickup_hub_id;
-    if (!targetPickupHubId) {
-      const pickupLookup = await client.query(
-        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order ASC LIMIT 1;`,
+    let finalDropoffHubId = dropoff_hub_id;
+
+    if (!targetPickupHubId || !finalDropoffHubId) {
+      const routeLookup = await client.query(
+        `SELECT pickup_hub_id, drop_off_hub_id FROM routes WHERE id = $1;`,
         [parseInt(route_id, 10)]
       );
-      targetPickupHubId = pickupLookup.rows[0]?.hub_id;
-      if (!targetPickupHubId) {
+
+      if (routeLookup.rows.length === 0) {
         await client.query("ROLLBACK");
-        return res.status(400).json({
-          error: "MISSING_PICKUP_HUB",
-          message: "pickup_hub_id is required and could not be resolved from route stops."
+        return res.status(404).json({
+          error: "ROUTE_NOT_FOUND",
+          message: `Route with ID ${route_id} does not exist.`
         });
       }
+
+      const routeData = routeLookup.rows[0];
+      if (!targetPickupHubId) targetPickupHubId = routeData.pickup_hub_id;
+      if (!finalDropoffHubId) finalDropoffHubId = routeData.drop_off_hub_id;
     }
 
-    // 3. DYNAMIC LOOKUP: Resolve dropoff_hub_id if missing
-    let finalDropoffHubId = dropoff_hub_id;
-    if (!finalDropoffHubId) {
-      const destinationLookup = await client.query(
-        `SELECT hub_id FROM route_stops WHERE route_id = $1 ORDER BY stop_order DESC LIMIT 1;`,
-        [parseInt(route_id, 10)]
-      );
-      finalDropoffHubId = destinationLookup.rows[0]?.hub_id || 1;
+    if (!targetPickupHubId) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "MISSING_PICKUP_HUB",
+        message: "pickup_hub_id is required and could not be resolved from route."
+      });
     }
 
-    // 4. Insert Entry strictly into route_pool with 'searching' status
+    // 3. Insert Entry strictly into route_pool with 'searching' status
     const insertRes = await client.query(
       `INSERT INTO route_pool (user_id, route_id, pickup_hub_id, dropoff_hub_id, status, joined_at)
        VALUES ($1, $2, $3, $4, 'searching', NOW()) RETURNING id, status;`,
@@ -544,8 +550,7 @@ app.post("/api/routes/join", async (req, res) => {
     const newPool = insertRes.rows[0];
     console.log(`✅ User ${user_id} registered into route_pool queue (searching). Triggering matching engine...`);
 
-    // ⚡ 5. INVOKE UNIFIED MATCHING ENGINE INSTANTLY
-    // (Make sure executeCorridorAutoMatch is imported at the top of your file!)
+    // ⚡ 4. INVOKE UNIFIED MATCHING ENGINE INSTANTLY
     const matchPipelineResult = await executeCorridorAutoMatch(
       client, 
       parseInt(route_id, 10)
@@ -574,9 +579,6 @@ app.post("/api/routes/join", async (req, res) => {
     client.release();
   }
 });
-
-
-
 
 
 // Checking passenger Distance from requested hub 
@@ -777,18 +779,16 @@ async function executeCorridorAutoMatch(client, route_id) {
      RETURNING rp.id, rp.user_id;`
   );
 
-  // 2. FETCH ELIGIBLE PASSENGERS
+  // 2. FETCH ELIGIBLE PASSENGERS (Direct lookup on routes.pickup_hub_id & routes.drop_off_hub_id)
   const waitingPassengersQuery = await client.query(
     `SELECT rp.id, rp.user_id, rp.status, 
-            rs_pickup.stop_order AS pickup_stop_order,
-            rs_dropoff.stop_order AS dropoff_stop_order
+            (CASE WHEN rp.pickup_hub_id::text = r.pickup_hub_id::text THEN 1 ELSE 2 END) AS pickup_stop_order,
+            (CASE WHEN rp.dropoff_hub_id::text = r.drop_off_hub_id::text THEN 2 ELSE 1 END) AS dropoff_stop_order
      FROM route_pool rp
-     JOIN route_stops rs_pickup ON rs_pickup.route_id = rp.route_id AND rs_pickup.hub_id::int = rp.pickup_hub_id::int
-     JOIN route_stops rs_dropoff ON rs_dropoff.route_id = rp.route_id AND rs_dropoff.hub_id::int = rp.dropoff_hub_id::int
+     JOIN routes r ON r.id = rp.route_id
      WHERE rp.route_id = $1 
-       AND rs_dropoff.stop_order > rs_pickup.stop_order
        AND TRIM(LOWER(rp.status)) = 'searching'
-     ORDER BY rs_pickup.stop_order ASC, rp.joined_at ASC 
+     ORDER BY rp.joined_at ASC 
      FOR UPDATE OF rp;`,
     [route_id]
   );
@@ -798,19 +798,18 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   if (availableRiders.length === 0) return { status: "idle", matchedCount: 0 };
 
-  // 3. FETCH PENDING RIDE OFFERS (Explicitly locking ONLY 'ro' to bypass outer join lock error)
+  // 3. FETCH PENDING RIDE OFFERS (Direct lookup on routes.pickup_hub_id & routes.drop_off_hub_id)
   const openOffersQuery = await client.query(
     `SELECT ro.id, ro.driver_id, ro.total_seats, ro.available_seats,
-            LEAST(rs_start.stop_order, rs_end.stop_order) AS start_stop_order,
-            GREATEST(rs_start.stop_order, rs_end.stop_order) AS end_stop_order
+            (CASE WHEN TRIM(ro.start_location::text) = TRIM(r.pickup_hub_id::text) THEN 1 ELSE 2 END) AS start_stop_order,
+            (CASE WHEN TRIM(ro.end_location::text) = TRIM(r.drop_off_hub_id::text) THEN 2 ELSE 1 END) AS end_stop_order
      FROM ride_offers ro
-     LEFT JOIN route_stops rs_start ON rs_start.route_id = ro.route_id AND TRIM(rs_start.hub_id::text) = TRIM(ro.start_location::text)
-     LEFT JOIN route_stops rs_end ON rs_end.route_id = ro.route_id AND TRIM(rs_end.hub_id::text) = TRIM(ro.end_location::text)
+     JOIN routes r ON r.id = ro.route_id
      WHERE ro.route_id = $1 
        AND TRIM(LOWER(ro.status)) = 'pending' 
        AND ro.available_seats > 0
      ORDER BY ro.created_at ASC 
-     FOR UPDATE OF ro;`, // 👈 Fixed: Explicitly targets 'ro' instead of locking nullable outer joins
+     FOR UPDATE OF ro;`,
     [route_id]
   );
 
@@ -868,12 +867,6 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   return { status: "success", matchedCount: totalMatchedCount };
 }
-
-
-
-
-
-
 
 
 
@@ -2385,9 +2378,15 @@ app.post("/api/rides/driver-accept", async (req, res) => {
       await client.query(updatePassengerPoolQuery, [ride_offer_id, ...confirmedPassengerIds]);
     }
 
-    // 6. Remove driver from queue since run is locked
-    const deleteQueueQuery = `DELETE FROM driver_queue WHERE driver_id = $1`;
-    await client.query(deleteQueueQuery, [driver_id]);
+    // 🟢 6. UPDATE DRIVER QUEUE LOGS (Record exit time for hybrid wait analytics)
+    const updateQueueQuery = `
+      UPDATE driver_queue 
+      SET status = 'dispatched', 
+          exited_at = NOW() 
+      WHERE driver_id = $1 
+        AND LOWER(status) = 'queued'
+    `;
+    await client.query(updateQueueQuery, [driver_id]);
 
     // 7. Resolve pickup hub ID for auto-matching background engine
     let targetHubId = 1; 
@@ -2440,7 +2439,6 @@ app.post("/api/rides/driver-accept", async (req, res) => {
     client.release();
   }
 });
-
 
 
 
