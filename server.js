@@ -631,6 +631,108 @@ app.post("/api/passenger/validate-location", async (req, res) => {
 });
 
 
+// 🚗 Dedicated Driver Location Validation Endpoint
+app.post('/api/driver/validate-location', async (req, res) => {
+  const { user_lat, user_lng, user_id } = req.body;
+
+  if (!user_lat || !user_lng) {
+    return res.status(400).json({ error: "Latitude and longitude are required." });
+  }
+
+  try {
+    // Haversine formula to find the nearest hub and its distance in kilometers
+    const hubQuery = `
+      SELECT id, name, latitude, longitude,
+      (6371 * acos(
+        cos(radians($1)) * cos(radians(latitude)) * 
+        cos(radians(longitude) - radians($2)) + 
+        sin(radians($1)) * sin(radians(latitude))
+      )) AS distance_km
+      FROM hubs
+      ORDER BY distance_km ASC
+      LIMIT 1;
+    `;
+
+    const result = await pool.query(hubQuery, [user_lat, user_lng]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "No hubs configured in the system." });
+    }
+
+    const nearestHub = result.rows[0];
+    const distanceKm = parseFloat(nearestHub.distance_km);
+    
+    // Driver allowance radius: 2.0 kilometers (2000 meters)
+    const DRIVER_MAX_RADIUS_KM = 2.0;
+
+    if (distanceKm <= DRIVER_MAX_RADIUS_KM) {
+      return res.json({
+        success: true,
+        inRange: true,
+        nearestHub: {
+          id: nearestHub.id,
+          name: nearestHub.name,
+          latitude: nearestHub.latitude,
+          longitude: nearestHub.longitude,
+          distanceKm: distanceKm.toFixed(1)
+        }
+      });
+    } else {
+      // Out of range, but provide helpful data so frontend can guide the driver
+      return res.json({
+        success: false,
+        inRange: false,
+        closestHubName: nearestHub.name,
+        distanceKm: distanceKm.toFixed(1),
+        error: `You are out of range. Closest hub is ${nearestHub.name} (${distanceKm.toFixed(1)} km away).`
+      });
+    }
+
+  } catch (err) {
+    console.error("❌ Error validating driver location:", err);
+    res.status(500).json({ error: "Internal server error during location validation." });
+  }
+});
+
+// GET /api/hubs - Fetch all system hubs for the waypoint map display for driver
+app.get('/api/hubs', async (req, res) => {
+  try {
+    const query = `
+      SELECT id, name, latitude, longitude 
+      FROM hubs 
+      ORDER BY id ASC;
+    `;
+    
+    const result = await pool.query(query);
+    
+    // Return standard array expected by React Native frontend
+    res.status(200).json(result.rows);
+  } catch (err) {
+    console.log("❌ Error fetching hubs:", err.message);
+    res.status(500).json({ error: "Failed to retrieve system hubs" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 app.post("/api/test/distance", (req, res) => {
@@ -786,61 +888,44 @@ app.get("/api/hubs/search/:term", async (req, res) => {
   }
 });
 
-/* ---------------- SELECT HUB → GET VALID CORRIDORS ---------------- */
-/* ---------------- SELECT HUB → GET SLICED SEPARATE CORRIDORS ---------------- */
+/* ---------------- GET CORRIDORS FROM PICKUP HUB (NEW FLAT SCHEMA) ---------------- */
+/* ---------------- GET CORRIDORS FROM PICKUP HUB (MATCHING EXISTING RIDE_OFFERS) ---------------- */
 app.get("/api/routes/from/:pickupHub", async (req, res) => {
   try {
     const { pickupHub } = req.params;
     
     const result = await pool.query(
-      `WITH pickup_info AS (
-        SELECT 
-          r.id AS route_id,
-          r.capacity,
-          r.base_price,
-          rs.hub_id AS pickup_hub_id,
-          rs.stop_order AS pickup_order
-        FROM routes r
-        JOIN route_stops rs ON rs.route_id = r.id
-        JOIN hubs h ON h.id = rs.hub_id
-        WHERE LOWER(h.name) = LOWER($1)
-      )
-      SELECT 
-        pi.route_id,
-        COALESCE(latest_ro.total_seats, pi.capacity) AS capacity,
-        pi.base_price,
-        pi.pickup_hub_id AS start_hub_id,
-        rs_drop.hub_id AS end_hub_id,
+      `SELECT 
+        r.id AS route_id,
+        r.hub_id AS parent_hub_id,
+        r.recommended_base_price,
+        r.pickup_hub_id,
+        h_pickup.name AS pickup_hub_name,
+        r.drop_off_hub_id,
         h_drop.name AS destination_name,
-        -- Dynamically slice the stops array from pickup up to this specific drop-off
-        (
-          SELECT ARRAY_AGG(h_all.name ORDER BY rs_all.stop_order)
-          FROM route_stops rs_all
-          JOIN hubs h_all ON h_all.id = rs_all.hub_id
-          WHERE rs_all.route_id = pi.route_id
-            AND rs_all.stop_order >= pi.pickup_order
-            AND rs_all.stop_order <= rs_drop.stop_order
-        ) AS stops,
-        -- 🧮 Live calculated seat metrics from active ride offers
-        COALESCE(latest_ro.available_seats, COALESCE(latest_ro.total_seats, pi.capacity)) AS available_seats,
-        (COALESCE(latest_ro.total_seats, pi.capacity) - COALESCE(latest_ro.available_seats, COALESCE(latest_ro.total_seats, pi.capacity))) AS filled_seats,
+        r.pass_through_hub_id,
+        h_pass.name AS pass_through_name,
+        -- Hybrid Pricing: Use driver's custom price_per_seat if active, otherwise fallback to recommended base price
+        COALESCE(latest_ro.price_per_seat, r.recommended_base_price) AS current_price,
+        latest_ro.available_seats,
+        latest_ro.total_seats,
         latest_ro.id AS ride_offer_id,
         latest_ro.status AS offer_status
-      FROM pickup_info pi
-      -- Find all downstream drop-off stops that occur AFTER the pickup stop
-      JOIN route_stops rs_drop ON rs_drop.route_id = pi.route_id 
-        AND rs_drop.stop_order > pi.pickup_order
-      JOIN hubs h_drop ON h_drop.id = rs_drop.hub_id
-      -- 🔍 Attach the latest active ride offer dynamically
+      FROM routes r
+      JOIN hubs h_pickup ON h_pickup.id = r.pickup_hub_id
+      JOIN hubs h_drop ON h_drop.id = r.drop_off_hub_id
+      LEFT JOIN hubs h_pass ON h_pass.id = r.pass_through_hub_id
+      -- Attach the latest active driver ride offer matching this route
       LEFT JOIN LATERAL (
-        SELECT id, total_seats, available_seats, status
+        SELECT id, price_per_seat, available_seats, total_seats, status
         FROM ride_offers 
-        WHERE ride_offers.route_id = pi.route_id 
+        WHERE ride_offers.route_id = r.id 
           AND status IN ('pending', 'matched', 'active')
         ORDER BY id DESC 
         LIMIT 1
       ) latest_ro ON true
-      ORDER BY pi.route_id, rs_drop.stop_order;`,
+      WHERE LOWER(h_pickup.name) = LOWER($1)
+      ORDER BY r.id;`,
       [pickupHub]
     );
 
@@ -850,44 +935,6 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
-
-/* ---------------- PASSENGER SIDE: JOIN CORRIDOR WAITING POOL ---------------- */
-/* ---------------- SELECT HUB → GET ALL ROUTES PASSING THROUGH ---------------- */
-app.get("/api/routes/from/:pickupHub", async (req, res) => {
-  try {
-    const { pickupHub } = req.params;
-    
-    const result = await pool.query(
-      `SELECT
-        r.id AS route_id,
-        r.capacity,
-        r.base_price,
-        (SELECT rs_first.hub_id FROM route_stops rs_first WHERE rs_first.route_id = r.id ORDER BY rs_first.stop_order ASC LIMIT 1) AS start_hub_id,
-        (SELECT rs_last.hub_id FROM route_stops rs_last WHERE rs_last.route_id = r.id ORDER BY rs_last.stop_order DESC LIMIT 1) AS end_hub_id,
-        (
-          SELECT ARRAY_AGG(h.name ORDER BY rs.stop_order)
-          FROM route_stops rs
-          JOIN hubs h ON h.id = rs.hub_id
-          WHERE rs.route_id = r.id
-        ) AS stops
-      FROM routes r
-      WHERE r.id IN (
-        SELECT rs_check.route_id 
-        FROM route_stops rs_check
-        JOIN hubs h_check ON h_check.id = rs_check.hub_id
-        WHERE LOWER(h_check.name) = LOWER($1)
-      );`,
-      [pickupHub]
-    );
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error("❌ Error fetching routes from hub:", err.message);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
 
 app.post("/api/rides/start-trip", async (req, res) => {
   // 🛡️ GUARD: Prevent crash if req.body isn't parsed
