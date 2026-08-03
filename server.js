@@ -1493,7 +1493,7 @@ app.post("/api/rides/create", async (req, res) => {
 app.get("/api/routes/engine/:route_id", async (req, res) => {
   const { route_id } = req.params;
   try {
-    const route = await pool.query(`SELECT capacity, base_price FROM routes WHERE id = $1`, [route_id]);
+    const route = await pool.query(`SELECT capacity, recommended_base_price FROM routes WHERE id = $1`, [route_id]);
     if (route.rows.length === 0) return res.status(404).json({ error: "Route configuration map missing" });
 
     const count = await pool.query(`SELECT COUNT(*) FROM route_pool WHERE route_id = $1 AND status = 'searching'`, [route_id]);
@@ -1543,6 +1543,79 @@ app.get("/api/rides", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// Driver Waiting For riders active pool status
+// GET active waiting pool status for a driver by driver_id
+app.get('/api/rides/waiting-pool-status/:driverId', async (req, res) => {
+  try {
+    const { driverId } = req.params;
+
+    const rideQuery = `
+      SELECT ro.id AS ride_offer_id, 
+             ro.route_id, 
+             ro.start_location AS hub_id, 
+             ro.end_location AS destination_id, 
+             ro.price_per_seat,
+             ro.total_seats,
+             ro.available_seats,
+             ro.status,
+             h_start.name AS start_hub_name,
+             h_end.name AS end_hub_name
+      FROM ride_offers ro
+      LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
+      LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
+      WHERE ro.driver_id = $1::integer AND ro.status = 'pending'
+      ORDER BY ro.created_at DESC
+      LIMIT 1
+    `;
+    
+    const rideResult = await pool.query(rideQuery, [driverId]);
+
+    if (rideResult.rows.length === 0) {
+      return res.status(404).json({ 
+        error: "No active pending ride offer found for this driver." 
+      });
+    }
+
+    const activeRide = rideResult.rows[0];
+    const seatsFilled = (activeRide.total_seats || 3) - (activeRide.available_seats || 0);
+
+    return res.status(200).json({
+      success: true,
+      rideOfferId: activeRide.ride_offer_id,
+      routeId: activeRide.route_id,
+      hubId: activeRide.hub_id,
+      hubName: activeRide.start_hub_name || "Unknown Hub",
+      destinationName: activeRide.end_hub_name || "Unknown Destination",
+      pricePerSeat: activeRide.price_per_seat,
+      totalSearching: 0,
+      totalMatched: seatsFilled,
+      matchedRiders: []
+    });
+
+  } catch (err) {
+    console.error("❌ Error fetching driver waiting pool status:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* ------------- FETCH ACTIVE PASSENGER REQUESTS (DEMAND MATRIX) ------------- */
 app.get("/api/corridors/passenger-requests", async (req, res) => {
