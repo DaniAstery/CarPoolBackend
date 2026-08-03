@@ -2161,45 +2161,68 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
   }
 
   try {
-    const offerQuery = await pool.query(
-      `SELECT id, status, price_per_seat, pickup_lat, pickup_lng, route_id 
-       FROM ride_offers 
-       WHERE id = $1`,
-      [rideOfferId]
-    );
-
+    // 1. Fetch offer details including total_seats and resolved hub coordinates
+          const offerQuery = await pool.query(
+        `SELECT ro.id, ro.status, ro.price_per_seat, ro.pickup_lat, ro.pickup_lng, ro.route_id,
+                ro.start_location, ro.end_location, ro.total_seats,
+                h_start.name AS start_hub_name, h_start.latitude AS start_hub_lat, h_start.longitude AS start_hub_lng,
+                h_end.name AS end_hub_name, h_end.latitude AS end_hub_lat, h_end.longitude AS end_hub_lng
+        FROM ride_offers ro
+        LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
+        LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
+        WHERE ro.id = $1`,
+        [rideOfferId]
+      );
     if (offerQuery.rows.length === 0) {
       return res.status(404).json({ error: "Target Corridor Offer profile index not found." });
     }
 
     const offer = offerQuery.rows[0];
 
-    // 🎯 UPGRADE: Join 'users' table to fetch real passenger names and contact info
+    // 2. Fetch passengers with complete profile information from users table
     const passengersQuery = await pool.query(
-      `SELECT rp.user_id, rp.status, u.full_name, u.phone_number 
+      `SELECT rp.user_id, rp.status, 
+              u.full_name, u.phone_number, u.email, u.role, u.rating, u.profile_photo_url
        FROM route_pool rp
        JOIN users u ON rp.user_id = u.id
        WHERE rp.matched_ride_offer_id = $1
-         AND TRIM(LOWER(rp.status)) IN ('matched', 'accepted', 'arrived', 'in_trip', 'intransit')`,
+         AND TRIM(LOWER(rp.status)) IN ('matched', 'accepted', 'arrived', 'in_trip', 'intransit', 'picked_up')`,
       [rideOfferId]
     );
 
+    // 3. Construct rich payload
     const trackingPayload = {
       rideOfferId: offer.id,
       rideStatus: offer.status, 
-      status: offer.status, // Support both casing variations for frontend resilience
+      status: offer.status,
       route_id: offer.route_id,
       price_per_seat: offer.price_per_seat,
+      total_seats: parseInt(offer.total_seats, 10) || 4,
+      
+      start_location: offer.start_location,
+      end_location: offer.end_location,
+      hubName: offer.start_hub_name || offer.start_location || "Departure Hub",
+      destinationName: offer.end_hub_name || offer.end_location || "Destination Hub",
+      
       driverLocation: {
         latitude: parseFloat(offer.pickup_lat) || 9.0106,
         longitude: parseFloat(offer.pickup_lng) || 38.7894
       },
+      destinationLocation: {
+        latitude: parseFloat(offer.end_hub_lat) || 9.0125,
+        longitude: parseFloat(offer.end_hub_lng) || 38.7535
+      },
+      
       passengers: passengersQuery.rows.map(row => ({
         userId: parseInt(row.user_id, 10), 
         user_id: parseInt(row.user_id, 10), 
         full_name: row.full_name || `Rider ${row.user_id}`,
         phone_number: row.phone_number || "",
-        status: row.status ? row.status.toString().trim().toLowerCase() : "matched" 
+        email: row.email || "",
+        role: row.role || "rider",
+        rating: row.rating ? parseFloat(row.rating).toFixed(2) : "5.00",
+        profile_photo_url: row.profile_photo_url || "",
+        status: row.status ? row.status.toString().trim().toLowerCase() : "in_trip" 
       }))
     };
 
@@ -2210,7 +2233,6 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
     return res.status(500).json({ error: "Internal server telemetry data retrieval error." });
   }
 });
-
 /**
  * 🔄 GET ACTIVE ASSIGNMENT PROPOSAL FOR DRIVER
  * Route: GET /api/rides/driver-proposal/:driverId
