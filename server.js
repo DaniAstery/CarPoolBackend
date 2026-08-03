@@ -2598,6 +2598,96 @@ app.post('/api/rides/driver-decline', async (req, res) => {
     client.release();
   }
 });
+//session timeout handler for drivers who have not accepted the offer within the time limit
+app.post('/api/rides/driver-expired', async (req, res) => {
+  const { ride_offer_id, driver_id } = req.body;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Fetch authoritative route details
+    const currentOfferRes = await client.query(
+      `SELECT route_id, start_location, end_location 
+       FROM ride_offers 
+       WHERE id = $1`,
+      [ride_offer_id]
+    );
+
+    if (currentOfferRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: "Ride offer not found" });
+    }
+
+    const { route_id: rId, start_location, end_location } = currentOfferRes.rows[0];
+
+    // 2. Check for other pending drivers
+    const otherOffersCheck = await client.query(
+      `SELECT id 
+       FROM ride_offers 
+       WHERE id != $1
+         AND driver_id != $2
+         AND LOWER(status) = 'pending'
+         AND route_id = $3
+         AND start_location = $4
+         AND end_location = $5
+       LIMIT 1`,
+      [ride_offer_id, driver_id, rId, start_location, end_location]
+    );
+
+    // 3. Release route_pool records back to searching first (unlinks them from Offer 1)
+    await client.query(
+      `UPDATE route_pool 
+       SET matched_ride_offer_id = NULL, status = 'searching' 
+       WHERE matched_ride_offer_id = $1`,
+      [ride_offer_id]
+    );
+
+    // 4. Temporarily set Offer 1 to a non-pending state (e.g. 'processing' or 'expiring') 
+    // so the matching engine ignores it and assigns passengers to Offer 2 (Driver 16)
+    await client.query(
+      `UPDATE ride_offers SET status = 'processing' WHERE id = $1`,
+      [ride_offer_id]
+    );
+
+    // 5. 🔥 RUN MATCHING ENGINE (Passengers are now assigned to Offer 2 in route_pool)
+    await executeCorridorAutoMatch(client, rId);
+
+    // 6. FINALLY, mark Offer 1 as 'expired' 
+    // 🔔 THIS FIRES THE DATABASE TRIGGER! Because matching has already run, 
+    // the trigger finds users 1 & 2 pointing to Offer 2, updates their route_pool to 'accepted', 
+    // and correctly injects them into Offer 2's accepted_passengers array!
+    await client.query(
+      `UPDATE ride_offers SET status = 'expired' WHERE id = $1`,
+      [ride_offer_id]
+    );
+
+    // 7. Return driver back to queued status
+    await client.query(
+      `UPDATE driver_queue 
+       SET status = 'queued' 
+       WHERE driver_id = $1 AND route_id = $2`,
+      [driver_id, rId]
+    );
+
+    await client.query('COMMIT');
+    console.log(`❌ Driver ${driver_id} offer expired. Pool reset, matching executed, trigger successfully migrated passengers to new offer, driver re-queued.`);
+
+    return res.json({ 
+      success: true, 
+      message: "Offer expired and accepted passengers successfully migrated via trigger." 
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("❌ Error in driver-expired handler:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  } finally {
+    client.release();
+  }
+});
+
+
 
 
 // GET /api/rides/driver-active-session/:driverId
