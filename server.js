@@ -22,38 +22,140 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 // 🔔 DEDICATED CLIENT FOR POSTGRES LISTEN / NOTIFY 
-// (Uses process.env.DATABASE_URL or your database connection string)
 const pgListener = new Client({
   connectionString: process.env.DATABASE_URL || `postgresql://postgres:D@ny_456@127.0.0.1:5432/corridor_pool`
 });
 
+// ✅ Connect ONCE and listen to all required channels
 pgListener.connect()
   .then(async () => {
     console.log("🔌 Dedicated Postgres client connected for LISTEN/NOTIFY");
     await pgListener.query("LISTEN route_pool_changed");
+    await pgListener.query("LISTEN queue_changes");
   })
   .catch(err => console.error("❌ Postgres listener connection failed:", err));
 
-pgListener.on("notification", (msg) => {
+pgListener.on("notification", async (msg) => {
   try {
     const payload = JSON.parse(msg.payload);
-    console.log("🔔 Postgres Notification Caught on Server:", payload);
+    console.log(`🔔 Postgres Notification Caught on [${msg.channel}]:`, payload);
     
-    // Broadcast instantly to all connected React Native clients
+    // Optional global notification emission
     io.emit("route_pool_updated", payload);
     
-    // ✅ Use payload.hub_id coming straight from the database notification
+    // ✅ Use payload.hub_id to resolve the hub name and trigger your existing helper
     if (payload.hub_id) {
-      io.emit('queue_update', { hub_id: payload.hub_id, route_id: payload.route_id });
+      const hubResult = await pool.query(`SELECT name FROM hubs WHERE id = $1`, [payload.hub_id]);
+      if (hubResult.rows.length > 0) {
+        const hubName = hubResult.rows[0].name;
+        // Call your existing helper function below!
+        await broadcastHubQueueUpdate(io, pool, hubName);
+      }
     }
   } catch (err) {
-    console.error("❌ Error parsing notification payload:", err);
+    console.error("❌ Error processing notification payload:", err);
   }
 });
 
 io.on("connection", (socket) => {
   console.log("⚡ Passenger/Driver connected via Socket.io:", socket.id);
+  socket.on("join_hub", ({ hub_name }) => {
+    if (!hub_name) return;
+    const roomName = `hub_${hub_name.toLowerCase().trim()}`;
+    socket.join(roomName);
+    console.log(`🔌 Socket ${socket.id} joined room: ${roomName}`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("🔴 Client disconnected:", socket.id);
+  });
 });
+// ==========================================
+// 1. Helper to fetch fresh metrics and broadcast
+// ==========================================
+const broadcastHubQueueUpdate = async (io, pool, hubName) => {
+  if (!hubName) return;
+  try {
+    const query = `
+      SELECT 
+        r.id AS route_id,
+        r.hub_id,
+        r.pickup_hub_id,
+        r.drop_off_hub_id,
+        r.pass_through_hub_id,
+        h_pickup.name AS pickup_hub_name,
+        h_drop.name AS destination_name,
+        h_pass.name AS pass_through_name,
+        COALESCE(r.recommended_base_price, 100) AS recommended_base_price,
+        COALESCE(ro_latest.total_seats, 4) AS capacity,
+        COALESCE(ro_latest.available_seats, 4) AS available_seats,
+        ro_latest.id AS ride_offer_id,
+        ro_latest.status AS offer_status,
+        COALESCE(driver_counts.waiting_drivers, 0)::INTEGER AS driver_queue_count,
+        COALESCE(avg_wait_stats.avg_wait_mins, 0)::INTEGER AS average_wait_mins
+      FROM routes r
+      JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
+      JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
+      LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id
+      LEFT JOIN (
+        SELECT DISTINCT ON (route_id) 
+          id, total_seats, available_seats, status, route_id
+        FROM ride_offers
+        WHERE LOWER(status) IN ('pending', 'matched', 'active', 'inprogress')
+        ORDER BY route_id, created_at DESC
+      ) ro_latest ON r.id = ro_latest.route_id
+      LEFT JOIN (
+        SELECT route_id, COUNT(driver_id) AS waiting_drivers
+        FROM driver_queue
+        WHERE LOWER(status) = 'queued'
+        GROUP BY route_id
+      ) driver_counts ON r.id = driver_counts.route_id
+      LEFT JOIN (
+        SELECT 
+          route_id, 
+          ROUND(AVG(EXTRACT(EPOCH FROM (exited_at - entered_at)) / 60)) AS avg_wait_mins
+        FROM driver_queue
+        WHERE LOWER(status) = 'dispatched' 
+          AND exited_at IS NOT NULL
+          AND entered_at IS NOT NULL
+          AND exited_at >= NOW() - INTERVAL '12 hours'
+        GROUP BY route_id
+      ) avg_wait_stats ON r.id = avg_wait_stats.route_id
+      WHERE LOWER(h_pickup.name) = LOWER($1);
+    `;
+
+    const result = await pool.query(query, [hubName]);
+    const roomName = `hub_${hubName.toLowerCase().trim()}`;
+    
+    io.to(roomName).emit("queue_update", result.rows);
+  } catch (err) {
+    console.error("❌ Error broadcasting hub queue update:", err);
+  }
+};
+
+// ==========================================
+// 2. Postgres Notification Listener (Calls #1)
+// ==========================================
+const setupPostgresListener = (pgClient, io, pool) => {
+  pgClient.on('notification', async (msg) => {
+    try {
+      const payload = JSON.parse(msg.payload);
+      console.log("🔔 Postgres Notification Caught on Server:", payload);
+
+      if (payload.hub_id) {
+        // Resolve hub ID to hub name
+        const hubResult = await pool.query(`SELECT name FROM hubs WHERE id = $1`, [payload.hub_id]);
+        if (hubResult.rows.length > 0) {
+          const hubName = hubResult.rows[0].name;
+          await broadcastHubQueueUpdate(io, pool, hubName);
+        }
+      }
+    } catch (err) {
+      console.error("❌ Error processing Postgres notification:", err);
+    }
+  });
+};
+
 
 // ==========================================
 // YOUR EXISTING ROUTES (e.g., /api/routes/from/:hubName, etc.)
@@ -3296,7 +3398,7 @@ app.get("/api/rides/payment-details-by-user/:userId", async (req, res) => {
 
 
 // ==================================================================
-// FETCH AVAILABLE CORRIDORS FOR A HUB (WITH REAL-TIME SEAT COUNT)
+// FETCH AVAILABLE CORRIDORS FOR A HUB (WITH REAL-TIME SEAT COUNT) WITH TIME WAIT TIME & DRIVER QUEUE METRICS
 // GET /api/routes/from/:hubName
 // ==================================================================
 app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
@@ -3319,7 +3421,9 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
         ro_latest.id AS ride_offer_id,
         ro_latest.status AS offer_status,
         -- 🚗 Real-time driver queue count join
-        COALESCE(driver_counts.waiting_drivers, 0)::INTEGER AS driver_queue_count
+        COALESCE(driver_counts.waiting_drivers, 0)::INTEGER AS driver_queue_count,
+        -- ⏱️ Average wait time calculated using entered_at & exited_at
+        COALESCE(avg_wait_stats.avg_wait_mins, 0)::INTEGER AS average_wait_mins
       FROM routes r
       JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
       JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
@@ -3341,11 +3445,25 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
         WHERE LOWER(status) = 'queued'
         GROUP BY route_id
       ) driver_counts ON r.id = driver_counts.route_id
+
+      -- ⏱️ Average wait time stats join using entered_at instead of created_at
+      LEFT JOIN (
+        SELECT 
+          route_id, 
+          ROUND(AVG(EXTRACT(EPOCH FROM (exited_at - entered_at)) / 60)) AS avg_wait_mins
+        FROM driver_queue
+        WHERE LOWER(status) = 'dispatched' 
+          AND exited_at IS NOT NULL
+          AND entered_at IS NOT NULL
+          AND exited_at >= NOW() - INTERVAL '12 hours'
+        GROUP BY route_id
+      ) avg_wait_stats ON r.id = avg_wait_stats.route_id
+
       WHERE LOWER(h_pickup.name) = LOWER($1);
     `;
 
     const result = await pool.query(query, [hubName]);
-    console.log("🔥 CORRECTED SCHEMA ROWS WITH QUEUE:", result.rows);
+    console.log("🔥 CORRECTED SCHEMA ROWS WITH QUEUE & WAIT METRICS:", result.rows);
     return res.json(result.rows);
     
   } catch (err) {
@@ -3353,8 +3471,6 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
     return res.status(500).json({ error: "Internal server error" });
   }
 });
-
-
 
 
 // 📴 Driver Go Offline Endpoint (Full Cleanup, Route Pool Reset & Matching Engine Trigger)
