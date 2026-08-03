@@ -2223,15 +2223,19 @@ app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
   }
 
   try {
-    // 1. Fetch active ride offer for this driver
+    // 1. Fetch active ride offer for this driver with hub name resolution
     const proposalQuery = await pool.query(
-      `SELECT id, route_id, status, start_location, end_location, departure_time, 
-              total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng,
-              accepted_passengers
-       FROM ride_offers 
-       WHERE driver_id = $1 
-         AND status IN ('pending', 'accepted', 'arrived', 'matched', 'in_trip', 'inprogress')
-       ORDER BY created_at DESC 
+      `SELECT ro.id, ro.route_id, ro.status, ro.start_location, ro.end_location, ro.departure_time, 
+              ro.total_seats, ro.available_seats, ro.price_per_seat, ro.pickup_lat, ro.pickup_lng,
+              ro.accepted_passengers,
+              h_start.name AS start_hub_name,
+              h_end.name AS end_hub_name
+       FROM ride_offers ro
+       LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
+       LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
+       WHERE ro.driver_id = $1 
+         AND ro.status IN ('pending', 'accepted', 'arrived', 'matched', 'in_trip', 'inprogress')
+       ORDER BY ro.created_at DESC 
        LIMIT 1`,
       [driverId]
     );
@@ -2284,6 +2288,8 @@ app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
       status: offer.status,
       start_location: offer.start_location,
       end_location: offer.end_location,
+      hubName: offer.start_hub_name || offer.start_location,
+      destinationName: offer.end_hub_name || offer.end_location,
       departure_time: offer.departure_time,
       total_seats: offer.total_seats,
       available_seats: offer.available_seats,
@@ -2307,15 +2313,19 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
   if (isNaN(driverId)) driverId = 10;
 
   try {
-    // 1. Fetch active ride offer for the given driver
+    // 1. Fetch active ride offer for the given driver with hub name resolution
     const offerQuery = await pool.query(
-      `SELECT id, route_id, status, start_location, end_location, departure_time, 
-              total_seats, available_seats, price_per_seat, pickup_lat, pickup_lng,
-              accepted_passengers, driver_id
-       FROM ride_offers 
-       WHERE driver_id = $1 
-         AND status IN ('pending', 'proposed', 'accepted', 'arrived', 'inprogress')
-       ORDER BY created_at DESC 
+      `SELECT ro.id, ro.route_id, ro.status, ro.start_location, ro.end_location, ro.departure_time, 
+              ro.total_seats, ro.available_seats, ro.price_per_seat, ro.pickup_lat, ro.pickup_lng,
+              ro.accepted_passengers, ro.driver_id,
+              h_start.name AS start_hub_name,
+              h_end.name AS end_hub_name
+       FROM ride_offers ro
+       LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
+       LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
+       WHERE ro.driver_id = $1 
+         AND ro.status IN ('pending', 'proposed', 'accepted', 'arrived', 'inprogress')
+       ORDER BY ro.created_at DESC 
        LIMIT 1`,
       [driverId]
     );
@@ -2358,42 +2368,43 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
     );
 
     // 5. Map passengers and prioritize 'accepted' state if present in accepted_passengers array
+    const formattedPassengers = passengersQuery.rows.map(passenger => {
+      const pId = parseInt(passenger.user_id, 10);
+      const dbStatus = passenger.status ? passenger.status.trim().toLowerCase() : "";
+      const isAccepted = acceptedIdsArray.includes(pId);
 
-        const formattedPassengers = passengersQuery.rows.map(passenger => {
-        const pId = parseInt(passenger.user_id, 10);
-        const dbStatus = passenger.status ? passenger.status.trim().toLowerCase() : "";
-        const isAccepted = acceptedIdsArray.includes(pId);
-
-        // Preserve advanced statuses (like 'arrived', 'picked_up', 'completed') from route_pool
-        let finalStatus = dbStatus;
-        if (!dbStatus || dbStatus === "pending" || dbStatus === "matched") {
-          if (isAccepted) {
-            finalStatus = "accepted";
-          } else {
-            finalStatus = "matched";
-          }
+      // Preserve advanced statuses (like 'arrived', 'picked_up', 'completed') from route_pool
+      let finalStatus = dbStatus;
+      if (!dbStatus || dbStatus === "pending" || dbStatus === "matched") {
+        if (isAccepted) {
+          finalStatus = "accepted";
+        } else {
+          finalStatus = "matched";
         }
+      }
 
-        return {
-          user_id: pId,
-          status: finalStatus,
-          name: passenger.passenger_name,
-          phone_number: passenger.phone_number
-        };
-      });
+      return {
+        user_id: pId,
+        status: finalStatus,
+        name: passenger.passenger_name,
+        phone_number: passenger.phone_number
+      };
+    });
 
     const totalSeats = parseInt(offer.total_seats, 10) || 4;
     const computedAvailableSeats = Math.max(0, totalSeats - acceptedIdsArray.length);
 
-    // 6. Return response payload
+    // 6. Return response payload with resolved hub names
     return res.status(200).json({
       hasActiveProposal: true,
       id: offer.id,
       ride_offer_id: offer.id,
       route_id: offer.route_id,
       status: offer.status,
-      start_location: offer.start_location || "Megenagna Departure Hub",
-      end_location: offer.end_location || "Piassa",
+      start_location: offer.start_location,
+      end_location: offer.end_location,
+      hubName: offer.start_hub_name || offer.start_location || "Megenagna Departure Hub",
+      destinationName: offer.end_hub_name || offer.end_location || "Piassa",
       departure_time: offer.departure_time,
       total_seats: totalSeats,
       available_seats: computedAvailableSeats,
@@ -2409,7 +2420,6 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
     return res.status(500).json({ error: "Internal server error retrieving driver cluster offer." });
   }
 });
-
 
 
 
