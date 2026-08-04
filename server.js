@@ -1049,34 +1049,39 @@ app.get("/api/hubs/search/:term", async (req, res) => {
   }
 });
 
-/* ---------------- GET CORRIDORS FROM PICKUP HUB (NEW FLAT SCHEMA) ---------------- */
 /* ---------------- GET CORRIDORS FROM PICKUP HUB (MATCHING EXISTING RIDE_OFFERS) ---------------- */
 app.get("/api/routes/from/:pickupHub", async (req, res) => {
   try {
     const { pickupHub } = req.params;
+    console.log(`🔍 [API] Fetching corridors for pickupHub parameter: "${pickupHub}"`);
     
     const result = await pool.query(
       `SELECT 
         r.id AS route_id,
+        r.id AS id,
         r.hub_id AS parent_hub_id,
-        r.recommended_base_price,
         r.pickup_hub_id,
-        h_pickup.name AS pickup_hub_name,
+        COALESCE(h_pickup.name, 'Unknown Hub') AS pickup_hub_name,
         r.drop_off_hub_id,
-        h_drop.name AS destination_name,
+        COALESCE(h_drop.name, 'Destination') AS name,
+        COALESCE(h_drop.name, 'Destination') AS destination_name,
         r.pass_through_hub_id,
         h_pass.name AS pass_through_name,
-        -- Hybrid Pricing: Use driver's custom price_per_seat if active, otherwise fallback to recommended base price
-        COALESCE(latest_ro.price_per_seat, r.recommended_base_price) AS current_price,
+        r.recommended_base_price,
+        
+        -- Hybrid Pricing: Driver custom price or fallback recommended base price
+        COALESCE(latest_ro.price_per_seat, r.recommended_base_price) AS price,
+        
         latest_ro.available_seats,
         latest_ro.total_seats,
         latest_ro.id AS ride_offer_id,
         latest_ro.status AS offer_status
       FROM routes r
-      JOIN hubs h_pickup ON h_pickup.id = r.pickup_hub_id
-      JOIN hubs h_drop ON h_drop.id = r.drop_off_hub_id
+      LEFT JOIN hubs h_pickup ON h_pickup.id = r.pickup_hub_id
+      LEFT JOIN hubs h_drop ON h_drop.id = r.drop_off_hub_id
       LEFT JOIN hubs h_pass ON h_pass.id = r.pass_through_hub_id
-      -- Attach the latest active driver ride offer matching this route
+      
+      -- Attach latest active driver ride offer matching this route
       LEFT JOIN LATERAL (
         SELECT id, price_per_seat, available_seats, total_seats, status
         FROM ride_offers 
@@ -1085,15 +1090,21 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
         ORDER BY id DESC 
         LIMIT 1
       ) latest_ro ON true
-      WHERE LOWER(h_pickup.name) = LOWER($1)
+      
+      WHERE LOWER(h_pickup.name) = LOWER($1) OR r.pickup_hub_id::text = $1
       ORDER BY r.id;`,
       [pickupHub]
     );
 
+    console.log(`📦 [API] Successfully compiled ${result.rows.length} corridors for hub: "${pickupHub}"`);
+    if (result.rows.length > 0) {
+      console.log("📝 Sample Row Data:", JSON.stringify(result.rows[0], null, 2));
+    }
+
     res.json(result.rows);
   } catch (err) {
     console.error("❌ Error fetching corridors from hub:", err.message);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
