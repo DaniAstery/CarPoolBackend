@@ -376,6 +376,67 @@ app.get("/api/routes/status/:userId", async (req, res) => {
   }
 });
 
+// A DEDICATED ENDPOINT TO FETCH MAP COORDINATES FOR DRIVER OR RIDE OFFER
+app.get('/api/rides/map_coordinates', async (req, res) => {
+  try {
+    const { driver_id, ride_offer_id } = req.query;
+
+    let query = `
+      SELECT 
+        ro.id AS ride_offer_id,
+        ro.driver_id,
+        ro.status,
+        ro.price_per_seat,
+        ro.total_seats,
+        ro.available_seats,
+        sh.id AS start_hub_id,
+        sh.name AS start_hub_name,
+        sh.latitude AS start_latitude,
+        sh.longitude AS start_longitude,
+        eh.id AS end_hub_id,
+        eh.name AS end_hub_name,
+        eh.latitude AS end_latitude,
+        eh.longitude AS end_longitude
+      FROM ride_offers ro
+      JOIN hubs sh ON ro.start_location::integer = sh.id
+      JOIN hubs eh ON ro.end_location::integer = eh.id
+    `;
+
+    let queryParams = [];
+    if (ride_offer_id) {
+      query += ` WHERE ro.id = $1`;
+      queryParams.push(parseInt(ride_offer_id, 10));
+    } else if (driver_id) {
+      query += ` WHERE ro.driver_id = $1 AND ro.status IN ('pending', 'accepted', 'arrived', 'in_trip') ORDER BY ro.created_at DESC LIMIT 1`;
+      queryParams.push(parseInt(driver_id, 10));
+    } else {
+      return res.status(400).json({ success: false, error: "Missing driver_id or ride_offer_id" });
+    }
+
+    const result = await pool.query(query, queryParams);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "No active map coordinates found for this driver" });
+    }
+
+    res.json({ success: true, coordinates: result.rows[0] });
+  } catch (err) {
+    console.error("Error fetching map coordinates:", err);
+    res.status(500).json({ success: false, error: "Server error fetching map coordinates" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // passenger screen status gatewaykeeper 
