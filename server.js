@@ -3737,10 +3737,122 @@ app.post('/api/rides/go-offline', async (req, res) => {
 });
 
 
+app.get("/api/rides/TripSummary", async (req, res) => {
+  const { driver_id, ride_offer_id } = req.query;
 
+  if (!driver_id && !ride_offer_id) {
+    return res.status(400).json({ error: "Driver ID or Ride Offer ID is required." });
+  }
 
+  try {
+    let queryText = `
+      SELECT ro.*, 
+             COALESCE(h_start.name, 'Hub #' || ro.start_location) AS start_hub_name, 
+             COALESCE(h_end.name, 'Hub #' || ro.end_location) AS end_hub_name,
+             COALESCE(v.model, 'Standard Fleet') AS vehicle_model,
+             COALESCE(v.make, '') AS vehicle_make,
+             COALESCE(v.plate_number, 'N/A') AS vehicle_plate
+      FROM ride_offers ro
+      LEFT JOIN hubs h_start ON h_start.id = NULLIF(ro.start_location::text, '')::integer
+      LEFT JOIN hubs h_end ON h_end.id = NULLIF(ro.end_location::text, '')::integer
+      LEFT JOIN vehicles v ON ro.vehicle_id = v.id
+    `;
 
+    let queryParams = [];
 
+    if (ride_offer_id) {
+      // Direct lookup if specific ID is supplied
+      queryText += ` WHERE ro.id = $1`;
+      queryParams.push(ride_offer_id);
+    } else {
+      // Auto-resolve latest/maximum ride offer for the logged-in driver
+      queryText += ` WHERE ro.driver_id = $1 ORDER BY ro.id DESC, ro.created_at DESC LIMIT 1`;
+      queryParams.push(driver_id);
+    }
+
+    const rideQuery = await pool.query(queryText, queryParams);
+
+    if (rideQuery.rows.length === 0) {
+      return res.status(404).json({ error: "No ride offer found for this driver session." });
+    }
+
+    const rideOffer = rideQuery.rows[0];
+    const pricePerSeat = parseFloat(rideOffer.price_per_seat) || 0.00;
+
+    // 2. Parse accepted_passengers PostgreSQL array (handles '{12,14}' or JS arrays)
+    let passengerIds = [];
+    const rawPassengers = rideOffer.accepted_passengers;
+
+    if (Array.isArray(rawPassengers)) {
+      passengerIds = rawPassengers.map(id => parseInt(id, 10)).filter(id => !isNaN(id));
+    } else if (typeof rawPassengers === 'string') {
+      passengerIds = rawPassengers
+        .replace(/[{}]/g, '')
+        .split(',')
+        .map(id => parseInt(id.trim(), 10))
+        .filter(id => !isNaN(id));
+    }
+
+    // 3. Fetch passenger details from users table
+    let activePassengers = [];
+    if (passengerIds.length > 0) {
+      const passengersQuery = await pool.query(
+        `SELECT id AS user_id, 
+                COALESCE(full_name, 'Rider #' || id) AS full_name,
+                COALESCE(phone_number, '') AS phone_number,
+                COALESCE(profile_photo_url, '') AS profile_photo_url
+         FROM users
+         WHERE id = ANY($1::int[])`,
+        [passengerIds]
+      );
+      activePassengers = passengersQuery.rows;
+    }
+
+    const totalPassengers = activePassengers.length;
+
+    // 4. Financial Calculations
+    const grossEarnings = totalPassengers * pricePerSeat;
+    const platformFee = grossEarnings * 0.10; // 10% platform commission
+    const netPayout = rideOffer.final_price !== null && rideOffer.final_price !== undefined
+      ? parseFloat(rideOffer.final_price) 
+      : (grossEarnings - platformFee);
+
+    // 5. Respond with payload matching frontend contract
+    return res.status(200).json({
+      success: true,
+      tripDetails: {
+        rideOfferId: rideOffer.id,
+        routeId: rideOffer.route_id,
+        startHub: rideOffer.start_hub_name,
+        endHub: rideOffer.end_hub_name,
+        departureTime: rideOffer.departure_time,
+        completedAt: rideOffer.created_at || new Date().toISOString(),
+        vehicleInfo: {
+          model: `${rideOffer.vehicle_make} ${rideOffer.vehicle_model}`.trim(),
+          plate: rideOffer.vehicle_plate
+        }
+      },
+      financials: {
+        totalPassengers,
+        pricePerSeat,
+        grossEarnings: parseFloat(grossEarnings.toFixed(2)),
+        platformFee: parseFloat(platformFee.toFixed(2)),
+        netPayout: parseFloat(netPayout.toFixed(2))
+      },
+      passengers: activePassengers.map((p, index) => ({
+        userId: p.user_id,
+        fullName: p.full_name,
+        phoneNumber: p.phone_number,
+        profilePhotoUrl: p.profile_photo_url,
+        seatLabel: index === 0 ? "Front Seat" : `Rear Seat ${index}`
+      }))
+    });
+
+  } catch (err) {
+    console.error("Trip summary fetch error:", err);
+    return res.status(500).json({ error: "Internal server error while fetching trip summary." });
+  }
+});
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
