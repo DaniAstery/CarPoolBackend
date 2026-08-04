@@ -3761,11 +3761,9 @@ app.get("/api/rides/TripSummary", async (req, res) => {
     let queryParams = [];
 
     if (ride_offer_id) {
-      // Direct lookup if specific ID is supplied
       queryText += ` WHERE ro.id = $1`;
       queryParams.push(ride_offer_id);
     } else {
-      // Auto-resolve latest/maximum ride offer for the logged-in driver
       queryText += ` WHERE ro.driver_id = $1 ORDER BY ro.id DESC, ro.created_at DESC LIMIT 1`;
       queryParams.push(driver_id);
     }
@@ -3779,7 +3777,6 @@ app.get("/api/rides/TripSummary", async (req, res) => {
     const rideOffer = rideQuery.rows[0];
     const pricePerSeat = parseFloat(rideOffer.price_per_seat) || 0.00;
 
-    // 2. Parse accepted_passengers PostgreSQL array (handles '{12,14}' or JS arrays)
     let passengerIds = [];
     const rawPassengers = rideOffer.accepted_passengers;
 
@@ -3793,13 +3790,14 @@ app.get("/api/rides/TripSummary", async (req, res) => {
         .filter(id => !isNaN(id));
     }
 
-    // 3. Fetch passenger details from users table
     let activePassengers = [];
     if (passengerIds.length > 0) {
+      // Fetch rating and phone_number from users table
       const passengersQuery = await pool.query(
         `SELECT id AS user_id, 
                 COALESCE(full_name, 'Rider #' || id) AS full_name,
-                COALESCE(phone_number, '') AS phone_number,
+                COALESCE(phone_number, 'N/A') AS phone_number,
+                COALESCE(rating, 5.00) AS rating,
                 COALESCE(profile_photo_url, '') AS profile_photo_url
          FROM users
          WHERE id = ANY($1::int[])`,
@@ -3809,15 +3807,12 @@ app.get("/api/rides/TripSummary", async (req, res) => {
     }
 
     const totalPassengers = activePassengers.length;
-
-    // 4. Financial Calculations
     const grossEarnings = totalPassengers * pricePerSeat;
-    const platformFee = grossEarnings * 0.10; // 10% platform commission
+    const platformFee = grossEarnings * 0.10;
     const netPayout = rideOffer.final_price !== null && rideOffer.final_price !== undefined
       ? parseFloat(rideOffer.final_price) 
       : (grossEarnings - platformFee);
 
-    // 5. Respond with payload matching frontend contract
     return res.status(200).json({
       success: true,
       tripDetails: {
@@ -3839,12 +3834,12 @@ app.get("/api/rides/TripSummary", async (req, res) => {
         platformFee: parseFloat(platformFee.toFixed(2)),
         netPayout: parseFloat(netPayout.toFixed(2))
       },
-      passengers: activePassengers.map((p, index) => ({
+      passengers: activePassengers.map((p) => ({
         userId: p.user_id,
         fullName: p.full_name,
         phoneNumber: p.phone_number,
-        profilePhotoUrl: p.profile_photo_url,
-        seatLabel: index === 0 ? "Front Seat" : `Rear Seat ${index}`
+        rating: p.rating ? parseFloat(p.rating).toFixed(2) : "5.00",
+        profilePhotoUrl: p.profile_photo_url
       }))
     });
 
