@@ -1891,12 +1891,10 @@ app.post('/api/rides/accept', async (req, res) => {
 });
 
 
-
-
-
 /* =========================================================================
    2. 📍 ARRIVAL CHECKPOINT SIGNAL: Commit Passenger Presence Node Validation
    ========================================================================= */
+
 app.post("/api/rides/signal-arrival", async (req, res) => {
   const { user_id, userId } = req.body;
   const targetUserId = parseInt(user_id || userId, 10);
@@ -1909,14 +1907,16 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // 1. Find active route_pool record for the user (accepts 'pending' AND 'accepted' ride offer statuses)
+    // 1. Find active route_pool record for the user ensuring:
+    //    - route_pool status is 'accepted'
+    //    - ride_offers status is either 'accepted' or 'arrived'
     const poolCheckQuery = `
       SELECT rp.id, rp.matched_ride_offer_id, rp.status, ro.status AS ride_status, ro.accepted_passengers
       FROM route_pool rp
       JOIN ride_offers ro ON rp.matched_ride_offer_id = ro.id
       WHERE rp.user_id = $1 
-        AND LOWER(TRIM(rp.status)) NOT IN ('completed', 'cancelled', 'idle', 'expired')
-        AND LOWER(TRIM(ro.status)) IN ('pending', 'accepted', 'active', 'matched', 'in_progress')
+        AND LOWER(TRIM(rp.status)) = 'accepted'
+        AND LOWER(TRIM(ro.status)) IN ('accepted', 'arrived')
         AND $1 = ANY(ro.accepted_passengers)
       ORDER BY rp.joined_at DESC
       LIMIT 1;
@@ -1927,7 +1927,7 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
     if (poolResult.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ 
-        error: `No active ride pool match found for user ${targetUserId}.` 
+        error: `No eligible active ride pool match found for user ${targetUserId}. Check that rider status is 'accepted' and driver ride offer is 'accepted' or 'arrived'.` 
       });
     }
 
@@ -1943,7 +1943,7 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
       [poolRowId]
     );
 
-    // 3. Fetch co-riders manifest
+    // 3. Fetch updated co-riders manifest for this ride offer
     const passengersQuery = await client.query(
       `SELECT user_id, TRIM(LOWER(status)) as status FROM route_pool WHERE matched_ride_offer_id = $1`,
       [targetRideId]
@@ -1972,7 +1972,7 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
   }
 });
 
-// 📊 DRIVER Get Corridor Pool Status OF PASSENGERS metrics for a specific pickup hub
+
 
 
 app.get("/api/rides/corridor-pool-status", async (req, res) => {
@@ -2918,66 +2918,36 @@ app.post("/api/rides/arrive", async (req, res) => {
     return res.status(400).json({ error: "Missing or invalid required parameter: driver_id" });
   }
 
-  const client = await pool.connect();
-
   try {
-    await client.query("BEGIN");
-
-    // 1. Find the active 'accepted' ride offer for this driver and update status to 'arrived'
-    const updateRideOfferQuery = await client.query(
+    // Update ONLY the ride_offers table status to 'arrived'
+    const updateRideOfferQuery = await pool.query(
       `UPDATE ride_offers 
        SET status = 'arrived' 
        WHERE driver_id = $1 
-         AND TRIM(LOWER(status)) IN ('accepted', 'arrived')
-       RETURNING id, driver_id, status, COALESCE(accepted_passengers, '{}') AS accepted_passengers;`,
+         AND TRIM(LOWER(status)) IN ('accepted', 'arrived', 'matched')
+       RETURNING id, driver_id, status;`,
       [targetDriverId]
     );
 
     if (updateRideOfferQuery.rows.length === 0) {
-      await client.query("ROLLBACK");
       return res.status(404).json({ 
-        error: `No active accepted ride offer found for driver ID ${targetDriverId} to mark as arrived.` 
+        error: `No active ride offer found for driver ID ${targetDriverId} to mark as arrived.` 
       });
     }
 
     const activeRide = updateRideOfferQuery.rows[0];
-    const activeRideOfferId = activeRide.id;
-    const acceptedPassengers = activeRide.accepted_passengers;
-
-    let updatedPassengersCount = 0;
-
-    // 2. Cascade status update to 'arrived' ONLY for active accepted passengers of THIS ride offer
-    if (Array.isArray(acceptedPassengers) && acceptedPassengers.length > 0) {
-      const updatePoolQuery = await client.query(
-        `UPDATE route_pool 
-         SET status = 'arrived' 
-         WHERE matched_ride_offer_id = $1 
-           AND user_id = ANY($2::int[])
-           AND TRIM(LOWER(status)) IN ('accepted', 'arrived')
-         RETURNING id, user_id, status;`,
-        [activeRideOfferId, acceptedPassengers]
-      );
-
-      updatedPassengersCount = updatePoolQuery.rows.length;
-    }
-
-    await client.query("COMMIT");
 
     return res.status(200).json({
       success: true,
-      message: "Driver arrival state and associated active passenger statuses updated to arrived.",
-      ride_offer_id: activeRideOfferId,
+      message: "Driver arrival state updated to arrived in ride_offers table.",
+      ride_offer_id: activeRide.id,
       driver_id: targetDriverId,
-      status: "arrived",
-      accepted_passengers_updated: updatedPassengersCount
+      status: "arrived"
     });
 
   } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("❌ TRANSACTION ARREST: ARRIVAL SYSTEM FAULT:", err.stack || err.message);
+    console.error("❌ ARRIVAL SYSTEM FAULT:", err.stack || err.message);
     return res.status(500).json({ error: `Internal execution error: ${err.message}` });
-  } finally {
-    client.release();
   }
 });
 
