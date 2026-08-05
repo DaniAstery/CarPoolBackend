@@ -49,7 +49,7 @@ pgListener.on("notification", async (msg) => {
       if (hubResult.rows.length > 0) {
         const hubName = hubResult.rows[0].name;
         // Call your existing helper function below!
-        await broadcastHubQueueUpdate(io, pool, hubName);
+        // await broadcastHubQueueUpdate(io, pool, hubName);
       }
     }
   } catch (err) {
@@ -70,6 +70,193 @@ io.on("connection", (socket) => {
     console.log("🔴 Client disconnected:", socket.id);
   });
 });
+
+const TelegramModule = require('node-telegram-bot-api');
+// Safely resolve the constructor across different library versions (v0.x vs v1.x)
+const TelegramBot = TelegramModule.default || TelegramModule.TelegramBot || TelegramModule.Bot || TelegramModule;
+
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+// Create the bot instance safely
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+// In-memory store for tracking session payloads while waiting for contact share
+const activeLoginSessions = {}; 
+
+// Listen for incoming messages or start commands from users
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text || '';
+
+  console.log(`📥 [Telegram Bot] Received message from chatId ${chatId}: "${text}"`);
+
+  if (text.startsWith('/start')) {
+    const payload = text.split(' ')[1]; 
+    console.log(`🔗 [Telegram Bot] Deep link payload extracted: "${payload}"`);
+
+    if (!payload) {
+      bot.sendMessage(chatId, "Welcome to Corridor! Please open the app and tap 'Verify with Telegram' or 'Sign In with Telegram'.");
+      return;
+    }
+
+    activeLoginSessions[chatId] = payload;
+    console.log(`💾 [Telegram Bot] Saved session mapping for chatId ${chatId} -> ${payload}`);
+
+    bot.sendMessage(chatId, "Welcome to Corridor! Please tap the button below to securely share your phone number and complete authentication.", {
+      reply_markup: {
+        keyboard: [
+          [{ text: "📱 Share Phone Number", request_contact: true }]
+        ],
+        one_time_keyboard: true,
+        resize_keyboard: true
+      }
+    });
+  }
+
+  if (msg.contact) {
+    const phoneNumber = msg.contact.phone_number; 
+    const sessionPayload = activeLoginSessions[chatId];
+    console.log(`📱 [Telegram Bot] Contact shared: ${phoneNumber} for chat ${chatId} with payload: ${sessionPayload}`);
+
+    if (!sessionPayload) {
+      console.warn(`⚠️ [Telegram Bot] Session expired or missing for chatId ${chatId}`);
+      bot.sendMessage(chatId, "Session expired. Please restart authentication from the Corridor app.");
+      return;
+    }
+
+    try {
+      if (sessionPayload.startsWith('verify_')) {
+        const userId = sessionPayload.replace('verify_', '');
+        console.log(`✍️ [Telegram Bot] Processing registration verification for user ID: ${userId}`);
+
+        await pool.query(
+          `UPDATE users SET phone_number = $1, phone_verified = TRUE WHERE id = $2`,
+          [phoneNumber, userId]
+        );
+
+        bot.sendMessage(chatId, "✅ Phone verification successful! You can now return to the Corridor app.");
+        delete activeLoginSessions[chatId];
+
+      } else if (sessionPayload.startsWith('login_')) {
+        const sessionId = sessionPayload.replace('login_', '');
+        console.log(`🔑 [Telegram Bot] Processing sign-in for session ID: ${sessionId}`);
+
+        const userRes = await pool.query(
+          `SELECT id, full_name, role, phone_verified FROM users WHERE phone_number = $1`,
+          [phoneNumber]
+        );
+
+        if (userRes.rows.length === 0) {
+          console.warn(`❌ [Telegram Bot] No account found with phone number: ${phoneNumber}`);
+          bot.sendMessage(chatId, "❌ No account found with this phone number. Please register on the Corridor app first.");
+          return;
+        }
+
+        const user = userRes.rows[0];
+        console.log(`✅ [Telegram Bot] User found:`, user);
+
+        activeLoginSessions[sessionId] = {
+          success: true,
+          userId: user.id,
+          role: user.role,
+          phone_verified: true
+        };
+
+        bot.sendMessage(chatId, `✅ Welcome back, ${user.full_name}! You have successfully signed in.`);
+        delete activeLoginSessions[chatId];
+      }
+    } catch (err) {
+      console.error("❌ Telegram contact processing error:", err);
+      bot.sendMessage(chatId, "⚠️ An error occurred processing your request. Please try again.");
+    }
+  }
+});
+
+// ==========================================
+// AUTHENTICATION & VERIFICATION ENDPOINTS
+// ==========================================
+
+// 1. Initialize Registration Record
+app.post('/api/auth/register-init', async (req, res) => {
+  try {
+    const { full_name, role } = req.body;
+    
+    const query = `
+      INSERT INTO users (full_name, role, phone_verified) 
+      VALUES ($1, $2, FALSE) 
+      RETURNING id, full_name, role;
+    `;
+    const result = await pool.query(query, [full_name, role]);
+    res.json({ userId: result.rows[0].id });
+  } catch (err) {
+    console.error("Init registration error:", err);
+    res.status(500).json({ error: "Database exception" });
+  }
+});
+
+// 2. Check registration phone verification status
+
+// 1. SIGN-IN STATUS CHECK ENDPOINT
+app.get('/api/auth/check-signin/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const sessionData = activeLoginSessions[sessionId];
+
+  if (sessionData && sessionData.success) {
+    // Session found and verified! Return user details
+    res.json(sessionData);
+    // Optional: clear session after successful fetch so it can't be reused
+    delete activeLoginSessions[sessionId];
+  } else {
+    res.status(404).json({ success: false, message: "Sign-in pending or session expired" });
+  }
+});
+
+// Add this to your server.js
+app.post('/api/auth/signin-init', (req, res) => {
+  const sessionId = "signin_" + Date.now();
+  // Optional: pre-initialize in memory if needed
+  activeLoginSessions[sessionId] = { success: false };
+  res.json({ sessionId });
+});
+
+// 2. REGISTRATION STATUS CHECK ENDPOINT (Checks Database directly)
+// In your server.js
+app.get('/api/auth/check-status/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT id, role, phone_verified FROM users WHERE id = $1`, // 👈 Must include 'role'
+      [userId]
+    );
+
+    if (result.rows.length > 0 && result.rows[0].phone_verified) {
+      res.json({ 
+        success: true, 
+        userId: result.rows[0].id,
+        role: result.rows[0].role,        // 👈 Sent to frontend
+        phone_verified: true 
+      });
+    } else {
+      res.json({ success: false, phone_verified: false });
+    }
+  } catch (err) {
+    console.error("Status check error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ==========================================
 // 1. Helper to fetch fresh metrics and broadcast
 // ==========================================
