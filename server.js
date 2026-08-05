@@ -113,47 +113,62 @@ bot.on('message', async (msg) => {
     });
   }
 
-  if (msg.contact) {
-    const phoneNumber = msg.contact.phone_number; 
+ if (msg.contact) {
+    const phoneNumber = msg.contact.phone_number;
     const sessionPayload = activeLoginSessions[chatId];
-    console.log(`📱 [Telegram Bot] Contact shared: ${phoneNumber} for chat ${chatId} with payload: ${sessionPayload}`);
 
     if (!sessionPayload) {
-      console.warn(`⚠️ [Telegram Bot] Session expired or missing for chatId ${chatId}`);
-      bot.sendMessage(chatId, "Session expired. Please restart authentication from the Corridor app.");
+      bot.sendMessage(chatId, "Session expired. Please restart the sign-in or registration process from the app.");
       return;
     }
 
     try {
       if (sessionPayload.startsWith('verify_')) {
+        // --- REGISTRATION FLOW ---
         const userId = sessionPayload.replace('verify_', '');
-        console.log(`✍️ [Telegram Bot] Processing registration verification for user ID: ${userId}`);
 
+        // Fetch the role for this specific temporary user row
+        const userRoleQuery = await pool.query(`SELECT role FROM users WHERE id = $1`, [userId]);
+        const userRole = userRoleQuery.rows[0]?.role;
+
+        // 🛡️ Check if this phone number is already registered FOR THIS SAME ROLE
+        const existingUserCheck = await pool.query(
+          `SELECT id FROM users WHERE phone_number = $1 AND role = $2 AND id != $3`,
+          [phoneNumber, userRole, userId]
+        );
+
+        if (existingUserCheck.rows.length > 0) {
+          bot.sendMessage(chatId, `❌ This phone number is already registered as a ${userRole}! Please use 'Sign In' instead.`);
+          // Clean up the temporary empty user row
+          await pool.query(`DELETE FROM users WHERE id = $1`, [userId]);
+          delete activeLoginSessions[chatId];
+          return;
+        }
+
+        // Finalize registration
         await pool.query(
           `UPDATE users SET phone_number = $1, phone_verified = TRUE WHERE id = $2`,
           [phoneNumber, userId]
         );
-
-        bot.sendMessage(chatId, "✅ Phone verification successful! You can now return to the Corridor app.");
+        bot.sendMessage(chatId, `✅ Registration & Phone verification successful as a ${userRole}! Return to the Corridor app.`);
         delete activeLoginSessions[chatId];
 
       } else if (sessionPayload.startsWith('login_')) {
+        // --- SIGN-IN FLOW ---
         const sessionId = sessionPayload.replace('login_', '');
-        console.log(`🔑 [Telegram Bot] Processing sign-in for session ID: ${sessionId}`);
-
+        
         const userRes = await pool.query(
           `SELECT id, full_name, role, phone_verified FROM users WHERE phone_number = $1`,
           [phoneNumber]
         );
 
         if (userRes.rows.length === 0) {
-          console.warn(`❌ [Telegram Bot] No account found with phone number: ${phoneNumber}`);
-          bot.sendMessage(chatId, "❌ No account found with this phone number. Please register on the Corridor app first.");
+          bot.sendMessage(chatId, "❌ No account found with this phone number. Please register on the app first.");
           return;
         }
 
+        // If a phone number has both a rider and driver profile, handle selection or pick the primary/latest one
         const user = userRes.rows[0];
-        console.log(`✅ [Telegram Bot] User found:`, user);
 
         activeLoginSessions[sessionId] = {
           success: true,
@@ -162,12 +177,12 @@ bot.on('message', async (msg) => {
           phone_verified: true
         };
 
-        bot.sendMessage(chatId, `✅ Welcome back, ${user.full_name}! You have successfully signed in.`);
+        bot.sendMessage(chatId, `✅ Welcome back, ${user.full_name}! Signed in successfully. Return to the app.`);
         delete activeLoginSessions[chatId];
       }
     } catch (err) {
-      console.error("❌ Telegram contact processing error:", err);
-      bot.sendMessage(chatId, "⚠️ An error occurred processing your request. Please try again.");
+      console.error("Telegram contact error:", err);
+      bot.sendMessage(chatId, "⚠️ An error occurred. Please try again.");
     }
   }
 });
