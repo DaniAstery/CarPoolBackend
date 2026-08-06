@@ -3174,6 +3174,50 @@ app.get("/api/rides/status/:rideOfferId", async (req, res) => {
 });
 
 
+// Soft-cancel passenger pool request by updating status to 'cancelled'
+app.patch('/api/routes/pool/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `UPDATE route_pool 
+       SET status = 'cancelled' 
+       WHERE user_id = $1 
+         AND status = 'searching'
+       RETURNING id, user_id, status`,
+      [userId]
+    );
+
+    console.log(`[Pool Cancellation] User ${userId} status updated to 'cancelled'. Rows affected: ${result.rowCount}`);
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: "No active searching pool request found to cancel." });
+    }
+
+    res.json({ success: true, message: "Successfully cancelled searching request." });
+  } catch (err) {
+    console.error("[Pool Cancellation Error]:", err);
+    res.status(500).json({ error: "Failed to cancel pool request." });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /* ========================================================================= 
    🚀 ENDPOINT 2: UPDATE STATUS TO ARRIVED (THE ARRIVAL BUTTON MATRIX) DRIVER
    ========================================================================= */
