@@ -154,11 +154,10 @@ bot.on('message', async (msg) => {
         delete activeLoginSessions[chatId];
 
       } else if (sessionPayload.startsWith('login_')) {
-        // --- SIGN-IN FLOW ---
         const sessionId = sessionPayload.replace('login_', '');
         
         const userRes = await pool.query(
-          `SELECT id, full_name, role, phone_verified FROM users WHERE phone_number = $1`,
+          `SELECT id, full_name, role, phone_verified, profile_photo_url FROM users WHERE phone_number = $1`,
           [phoneNumber]
         );
 
@@ -167,17 +166,18 @@ bot.on('message', async (msg) => {
           return;
         }
 
-        // If a phone number has both a rider and driver profile, handle selection or pick the primary/latest one
-        const user = userRes.rows[0];
-
+        // Pass all matching accounts back to the app session watcher
         activeLoginSessions[sessionId] = {
           success: true,
-          userId: user.id,
-          role: user.role,
+          requiresRoleSelection: userRes.rows.length > 1,
+          accounts: userRes.rows,
+          // Fallback primary user if single account
+          userId: userRes.rows[0].id,
+          role: userRes.rows[0].role,
           phone_verified: true
         };
 
-        bot.sendMessage(chatId, `✅ Welcome back, ${user.full_name}! Signed in successfully. Return to the app.`);
+        bot.sendMessage(chatId, `✅ Phone verified successfully! Return to the Corridor app to continue.`);
         delete activeLoginSessions[chatId];
       }
     } catch (err) {
@@ -4136,6 +4136,65 @@ app.get("/api/rides/TripSummary", async (req, res) => {
     return res.status(500).json({ error: "Internal server error while fetching trip summary." });
   }
 });
+
+
+// DRAWER MENU ENDPOINTS FOR USER PROFILE SUMMARY AND TRIP HISTORY
+// 1. Get user profile summary for drawer header
+app.get('/api/users/profile/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT id, full_name, role, phone_number, rating, created_at, profile_picture FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch user profile" });
+  }
+});
+
+// 2. Get last 5 completed trips for trip history
+app.get('/api/trips/history/:userId/:role', async (req, res) => {
+  const { userId, role } = req.params;
+  try {
+    const query = role === 'driver'
+      ? `SELECT id, corridor, final_price AS price, created_at FROM rides WHERE driver_id = $1 AND status = 'completed' ORDER BY created_at DESC LIMIT 5`
+      : `SELECT rp.id, rp.route_id, rp.status, rp.created_at, r.corridor, r.final_price AS price 
+         FROM route_pool rp 
+         LEFT JOIN rides r ON rp.matched_ride_offer_id = r.id 
+         WHERE rp.user_id = $1 AND rp.status = 'completed' ORDER BY rp.created_at DESC LIMIT 5`;
+
+    const result = await pool.query(query, [userId]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch trip history" });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
