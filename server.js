@@ -629,18 +629,6 @@ app.get('/api/rides/map_coordinates', async (req, res) => {
 });
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 // passenger screen status gatewaykeeper 
 
 // 🎯 DEDICATED PASSENGER STATUS LIFECYCLE ENDPOINT
@@ -1144,13 +1132,12 @@ async function executeCorridorAutoMatch(client, route_id) {
      RETURNING rp.id, rp.user_id;`
   );
 
-  // 2. FETCH ELIGIBLE PASSENGERS (Direct lookup on routes.pickup_hub_id & routes.drop_off_hub_id)
+  // 2. FETCH ELIGIBLE PASSENGERS (Clean Hub IDs as text)
   const waitingPassengersQuery = await client.query(
     `SELECT rp.id, rp.user_id, rp.status, 
-            (CASE WHEN rp.pickup_hub_id::text = r.pickup_hub_id::text THEN 1 ELSE 2 END) AS pickup_stop_order,
-            (CASE WHEN rp.dropoff_hub_id::text = r.drop_off_hub_id::text THEN 2 ELSE 1 END) AS dropoff_stop_order
+            TRIM(rp.pickup_hub_id::text) AS pickup_hub_id,
+            TRIM(rp.dropoff_hub_id::text) AS dropoff_hub_id
      FROM route_pool rp
-     JOIN routes r ON r.id = rp.route_id
      WHERE rp.route_id = $1 
        AND TRIM(LOWER(rp.status)) = 'searching'
      ORDER BY rp.joined_at ASC 
@@ -1163,13 +1150,12 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   if (availableRiders.length === 0) return { status: "idle", matchedCount: 0 };
 
-  // 3. FETCH PENDING RIDE OFFERS (Direct lookup on routes.pickup_hub_id & routes.drop_off_hub_id)
+  // 3. FETCH PENDING RIDE OFFERS (Clean Hub IDs as text)
   const openOffersQuery = await client.query(
     `SELECT ro.id, ro.driver_id, ro.total_seats, ro.available_seats,
-            (CASE WHEN TRIM(ro.start_location::text) = TRIM(r.pickup_hub_id::text) THEN 1 ELSE 2 END) AS start_stop_order,
-            (CASE WHEN TRIM(ro.end_location::text) = TRIM(r.drop_off_hub_id::text) THEN 2 ELSE 1 END) AS end_stop_order
+            TRIM(ro.start_location::text) AS start_location,
+            TRIM(ro.end_location::text) AS end_location
      FROM ride_offers ro
-     JOIN routes r ON r.id = ro.route_id
      WHERE ro.route_id = $1 
        AND TRIM(LOWER(ro.status)) = 'pending' 
        AND ro.available_seats > 0
@@ -1183,25 +1169,22 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   let totalMatchedCount = 0;
 
-  // 4. BULLETPROOF MATCHING PIPELINE
+  // 4. MATCHING PIPELINE (Strict Origin & Destination Verification)
   for (const offer of openOffers) {
     let unassigned = [];
     let seatsAvailable = Number(offer.available_seats);
     let matchesMadeThisOffer = 0;
 
-    const offerStartStop = offer.start_stop_order !== null ? Number(offer.start_stop_order) : 1;
-    const offerEndStop = offer.end_stop_order !== null ? Number(offer.end_stop_order) : 999;
-
     for (const pax of availableRiders) {
-      const paxPickup = Number(pax.pickup_stop_order);
-      const paxDropoff = Number(pax.dropoff_stop_order);
+      // Validate EXACT origin and destination alignment
+      const isSamePickup = pax.pickup_hub_id === offer.start_location;
+      const isSameDropoff = pax.dropoff_hub_id === offer.end_location;
 
-      const isValidSegment = 
-        paxPickup >= offerStartStop && 
-        paxDropoff <= offerEndStop &&
-        seatsAvailable > 0;
+      const isValidSegment = isSamePickup && isSameDropoff && seatsAvailable > 0;
 
-      console.log(`   [DEBUG] Rider ${pax.user_id}: Needs ${paxPickup}->${paxDropoff} | Driver #${offer.id} covers ${offerStartStop}->${offerEndStop} | Valid: ${isValidSegment}`);
+      console.log(
+        `   [DEBUG] Rider ${pax.user_id}: ${pax.pickup_hub_id}->${pax.dropoff_hub_id} | Driver #${offer.id}: ${offer.start_location}->${offer.end_location} | Match: ${isValidSegment}`
+      );
 
       if (isValidSegment) {
         await client.query(
@@ -1232,8 +1215,6 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   return { status: "success", matchedCount: totalMatchedCount };
 }
-
-
 
 /* ---------------- HUB SEARCH ---------------- */
 app.get("/api/hubs/search/:term", async (req, res) => {
