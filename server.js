@@ -1120,21 +1120,78 @@ app.post("/api/test/distance", (req, res) => {
 async function executeCorridorAutoMatch(client, route_id) {
   console.log(`\n🎬 [ENGINE START] Corridor Matching Pipeline | Route [${route_id}]`);
 
-  // 1. OVERFLOW SWEEP
-  const recoverySweep = await client.query(
+  // ==========================================
+  // 1. DRIVER DECLINE & OVERFLOW RECOVERY SWEEP
+  // ==========================================
+  // If an offer is declined/cancelled, reset all passengers back to 'searching'
+  await client.query(
     `UPDATE route_pool rp
-     SET status = 'searching', matched_ride_offer_id = NULL
+     SET status = 'searching',
+         matched_ride_offer_id = NULL
      FROM ride_offers ro
      WHERE rp.matched_ride_offer_id = ro.id
-       AND TRIM(LOWER(ro.status)) IN ('accepted', 'arrived', 'completed')
-       AND TRIM(LOWER(rp.status)) != 'declined'
-       AND NOT (rp.user_id = ANY(ro.accepted_passengers))
-     RETURNING rp.id, rp.user_id;`
+       AND TRIM(LOWER(ro.status)) IN ('declined', 'cancelled', 'expired')
+       AND rp.status NOT IN ('completed', 'cancelled');`
   );
 
-  // 2. FETCH ELIGIBLE PASSENGERS (Clean Hub IDs as text)
+  // ==========================================
+  // 2. MANUAL BOOKING AUTOMATED LIFECYCLE MIMICKING (is_manual = true ONLY)
+  // ==========================================
+  
+  // Rule A: Manual bookings automatically move from 'matched' to 'accepted' when the driver accepts the offer
+  await client.query(`
+    UPDATE route_pool rp
+    SET status = 'accepted'
+    FROM ride_offers ro
+    WHERE rp.matched_ride_offer_id = ro.id
+      AND rp.is_manual = true
+      AND rp.status = 'matched'
+      AND ro.status IN ('accepted', 'arrived', 'in_trip');
+  `);
+
+  // Rule B: Synchronize route_pool statuses to mimic driver lifecycle status (arrived, in_trip, completed) FOR MANUAL BOOKINGS ONLY
+  await client.query(`
+    UPDATE route_pool rp
+    SET status = ro.status
+    FROM ride_offers ro
+    WHERE rp.matched_ride_offer_id = ro.id
+      AND rp.is_manual = true
+      AND ro.status IN ('arrived', 'in_trip', 'completed')
+      AND rp.status IN ('matched', 'accepted', 'arrived', 'in_trip')
+      AND rp.status != ro.status;
+  `);
+
+  // ==========================================
+  // 3. PEER MIMICKING FOR MANUAL BOOKINGS SHARING AN OFFER
+  // ==========================================
+  // If a manual booking is matched alongside others, mimic active peer status FOR MANUAL BOOKINGS ONLY
+  await client.query(`
+    UPDATE route_pool rp_manual
+    SET status = peer_status.status
+    FROM (
+      SELECT DISTINCT ON (matched_ride_offer_id) matched_ride_offer_id, status
+      FROM route_pool
+      WHERE status IN ('accepted', 'arrived', 'in_trip', 'completed')
+      ORDER BY matched_ride_offer_id, 
+        CASE status 
+          WHEN 'completed' THEN 4 
+          WHEN 'in_trip' THEN 3 
+          WHEN 'arrived' THEN 2 
+          WHEN 'accepted' THEN 1 
+          ELSE 0 
+        END DESC
+    ) peer_status
+    WHERE rp_manual.matched_ride_offer_id = peer_status.matched_ride_offer_id
+      AND rp_manual.is_manual = true
+      AND rp_manual.status = 'matched'
+      AND rp_manual.status != peer_status.status;
+  `);
+
+  // ==========================================
+  // 4. FETCH ELIGIBLE SEARCHING PASSENGERS
+  // ==========================================
   const waitingPassengersQuery = await client.query(
-    `SELECT rp.id, rp.user_id, rp.status, 
+    `SELECT rp.id, rp.user_id, rp.status, rp.is_manual,
             TRIM(rp.pickup_hub_id::text) AS pickup_hub_id,
             TRIM(rp.dropoff_hub_id::text) AS dropoff_hub_id
      FROM route_pool rp
@@ -1150,7 +1207,9 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   if (availableRiders.length === 0) return { status: "idle", matchedCount: 0 };
 
-  // 3. FETCH PENDING RIDE OFFERS (Clean Hub IDs as text)
+  // ==========================================
+  // 5. FETCH PENDING RIDE OFFERS
+  // ==========================================
   const openOffersQuery = await client.query(
     `SELECT ro.id, ro.driver_id, ro.total_seats, ro.available_seats,
             TRIM(ro.start_location::text) AS start_location,
@@ -1169,22 +1228,18 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   let totalMatchedCount = 0;
 
-  // 4. MATCHING PIPELINE (Strict Origin & Destination Verification)
+  // ==========================================
+  // 6. MATCHING PIPELINE
+  // ==========================================
   for (const offer of openOffers) {
     let unassigned = [];
     let seatsAvailable = Number(offer.available_seats);
     let matchesMadeThisOffer = 0;
 
     for (const pax of availableRiders) {
-      // Validate EXACT origin and destination alignment
       const isSamePickup = pax.pickup_hub_id === offer.start_location;
       const isSameDropoff = pax.dropoff_hub_id === offer.end_location;
-
       const isValidSegment = isSamePickup && isSameDropoff && seatsAvailable > 0;
-
-      console.log(
-        `   [DEBUG] Rider ${pax.user_id}: ${pax.pickup_hub_id}->${pax.dropoff_hub_id} | Driver #${offer.id}: ${offer.start_location}->${offer.end_location} | Match: ${isValidSegment}`
-      );
 
       if (isValidSegment) {
         await client.query(
@@ -1196,7 +1251,7 @@ async function executeCorridorAutoMatch(client, route_id) {
         seatsAvailable--;
         matchesMadeThisOffer++;
         totalMatchedCount++;
-        console.log(`   ⚡ MATCHED: Rider ${pax.user_id} assigned to Driver #${offer.driver_id}`);
+        console.log(`   ⚡ MATCHED: Rider ${pax.user_id} (Manual: ${pax.is_manual}) assigned to Driver #${offer.driver_id}`);
       } else {
         unassigned.push(pax);
       }
@@ -1215,6 +1270,8 @@ async function executeCorridorAutoMatch(client, route_id) {
 
   return { status: "success", matchedCount: totalMatchedCount };
 }
+
+
 
 /* ---------------- HUB SEARCH ---------------- */
 app.get("/api/hubs/search/:term", async (req, res) => {
@@ -2001,7 +2058,7 @@ app.post("/api/rides/accept-proposal", async (req, res) => {
       [poolRecordId]
     );
 
-    await client.query("COMMIT");
+    await client.query("COMMIT");q
 
     return res.status(200).json({ 
       success: true, 
@@ -3155,28 +3212,55 @@ app.get("/api/rides/status/:rideOfferId", async (req, res) => {
 
 
 // Soft-cancel passenger pool request by updating status to 'cancelled'
+// PATCH Passenger cancels while in searching or matched state
 app.patch('/api/routes/pool/:userId', async (req, res) => {
-  const { userId } = req.params;
+  const userId = req.params.userId;
+  const client = await pool.connect();
+
   try {
-    const result = await pool.query(
-      `UPDATE route_pool 
-       SET status = 'cancelled' 
-       WHERE user_id = $1 
-         AND status = 'searching'
-       RETURNING id, user_id, status`,
+    await client.query('BEGIN');
+
+    // 1. Find active route_pool entry for the user (only searching or matched states)
+    const poolRes = await client.query(
+      `SELECT id, status, matched_ride_offer_id FROM route_pool 
+       WHERE user_id = $1 AND status IN ('searching', 'matched')`,
       [userId]
     );
 
-    console.log(`[Pool Cancellation] User ${userId} status updated to 'cancelled'. Rows affected: ${result.rowCount}`);
-    
-    if (result.rowCount === 0) {
-      return res.status(404).json({ success: false, error: "No active searching pool request found to cancel." });
+    if (poolRes.rows.length === 0) {
+      await client.query('COMMIT');
+      return res.status(404).json({ success: false, error: 'No active searching or matched pool entry found.' });
     }
 
-    res.json({ success: true, message: "Successfully cancelled searching request." });
+    const booking = poolRes.rows[0];
+
+    // 2. If they were matched to a ride offer, restore the seat back to the driver (+1)
+    if (booking.matched_ride_offer_id) {
+      await client.query(
+        `UPDATE ride_offers 
+         SET available_seats = available_seats + 1 
+         WHERE id = $1;`,
+        [booking.matched_ride_offer_id]
+      );
+    }
+
+    // 3. Update route_pool: set status to 'cancelled' and clear matched_ride_offer_id to NULL
+    await client.query(
+      `UPDATE route_pool 
+       SET status = 'cancelled', 
+           matched_ride_offer_id = NULL 
+       WHERE id = $1;`,
+      [booking.id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Pool request successfully cancelled and seat released.' });
   } catch (err) {
-    console.error("[Pool Cancellation Error]:", err);
-    res.status(500).json({ error: "Failed to cancel pool request." });
+    await client.query('ROLLBACK');
+    console.error('Error handling passenger cancellation:', err);
+    res.status(500).json({ success: false, error: 'Server error processing cancellation.' });
+  } finally {
+    client.release();
   }
 });
 
