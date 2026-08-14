@@ -22,6 +22,11 @@ app.use(express.urlencoded({ extended: true }));
 // 🔌 Wrap Express app in HTTP server for WebSockets
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+//
+app.use((req, res, next) => {
+  req.io = io;
+  next();
+});
 
 // 🔔 DEDICATED CLIENT FOR POSTGRES LISTEN / NOTIFY 
 const pgListener = new Client({
@@ -4238,6 +4243,9 @@ app.get('/api/trips/history/:userId/:role', async (req, res) => {
   }
 });
 
+// SECTION FOR STANDARD SOLO TRIPS
+
+
 app.get('/api/rides/autocomplete', async (req, res) => {
   try {
     const { input, location } = req.query; // location optional format: "lat,lng" for biasing results
@@ -4341,22 +4349,247 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
   }
 });
 
+// ==================================================================
+  // Helper Haversine distance calculator in kilometers
+// ==================================================================
+function calculateHaversine(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Earth radius in km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c; 
+}
+
+app.post('/api/rides/estimate-fare', async (req, res) => {
+  try {
+    const { origin_lat, origin_lng, destination_lat, destination_lng } = req.body;
+
+    if (!origin_lat || !origin_lng || !destination_lat || !destination_lng) {
+      return res.status(400).json({ success: false, message: 'Missing coordinate parameters.' });
+    }
+
+    // 1. Fetch active pricing rules dynamically from your dashboard configuration table
+    let pricingConfig = {
+      base_flag_down: 105.00,
+      rate_per_km: 15.50,
+      rate_per_minute: 1.50,
+      minimum_fare: 120.00,
+      fuel_multiplier: 1.00,
+      surge_multiplier: 1.00
+    };
+
+    try {
+      const dbResult = await pool.query(
+        "SELECT * FROM pricing_configs WHERE city_code = 'ADDIS_ABABA' AND is_active = TRUE LIMIT 1"
+      );
+      if (dbResult.rows.length > 0) {
+        pricingConfig = dbResult.rows[0];
+      }
+    } catch (dbErr) {
+      console.warn("⚠️ Failed to load pricing config from DB, using fallback defaults:", dbErr.message);
+    }
+
+    // 2. Calculate distance in KM (Applying a 1.25 road-network detour factor for Addis streets)
+    const rawDistanceKm = calculateHaversine(
+      parseFloat(origin_lat), parseFloat(origin_lng),
+      parseFloat(destination_lat), parseFloat(destination_lng)
+    );
+    const distanceKm = Math.max(1, Math.round((rawDistanceKm * 1.25) * 10) / 10);
+
+    // 3. Estimate duration based on city traffic speed (~3.5 mins per km)
+    const estimatedMinutes = Math.round(distanceKm * 3.5);
+
+    // 4. Compute formula with Fuel and Surge multipliers applied dynamically
+    const baseFee = parseFloat(pricingConfig.base_flag_down);
+    const kmRate = parseFloat(pricingConfig.rate_per_km);
+    const minRate = parseFloat(pricingConfig.rate_per_minute);
+    const fuelMult = parseFloat(pricingConfig.fuel_multiplier);
+    const surgeMult = parseFloat(pricingConfig.surge_multiplier);
+    const minFare = parseFloat(pricingConfig.minimum_fare);
+
+    let calculatedPrice = (baseFee + (distanceKm * kmRate) + (estimatedMinutes * minRate)) * fuelMult * surgeMult;
+
+    // 5. Enforce floor minimum fare constraint
+    if (calculatedPrice < minFare) {
+      calculatedPrice = minFare;
+    }
+
+    return res.json({
+      success: true,
+      distanceKm: distanceKm,
+      durationText: `${estimatedMinutes} mins`,
+      estimatedPrice: Math.round(calculatedPrice),
+      breakdown: {
+        baseFee,
+        distanceKm,
+        fuelMultiplier: fuelMult,
+        surgeMultiplier: surgeMult
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ Fare estimation calculation crash:", err);
+    return res.status(500).json({ success: false, message: 'Server error calculating fare.' });
+  }
+});
 
 
 
 
+// POST /api/routes/standard/request
+app.post('/api/rides/standard/request', async (req, res) => {
+  const {
+    user_id,
+    pickup_lat,
+    pickup_lng,
+    destination_lat,
+    destination_lng,
+    destination_name,
+    destination_address,
+    estimated_price,
+    distance_km
+  } = req.body;
+
+  if (!user_id) {
+    return res.status(400).json({ success: false, message: "user_id is required." });
+  }
+
+  try {
+    // 1. Cleanly cancel any existing active searches for this user
+    await pool.query(
+      `UPDATE route_pool_standard 
+       SET status = 'cancelled', updated_at = NOW() 
+       WHERE user_id = $1 AND status = 'searching'`,
+      [user_id]
+    );
+
+    // 2. Insert the fresh ride request
+    const insertQuery = `
+      INSERT INTO route_pool_standard 
+        (user_id, pickup_lat, pickup_lng, destination_lat, destination_lng, destination_name, destination_address, estimated_price, distance_km, status)
+      VALUES 
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'searching')
+      RETURNING id, status, created_at;
+    `;
+
+    const result = await pool.query(insertQuery, [
+      user_id,
+      pickup_lat,
+      pickup_lng,
+      destination_lat,
+      destination_lng,
+      destination_name,
+      destination_address || '',
+      estimated_price,
+      distance_km
+    ]);
+
+    const newRequest = result.rows[0];
+
+    // 3. Broadcast to nearby drivers via Socket.io
+    req.io?.emit('new_standard_ride_request', {
+      requestId: newRequest.id,
+      userId: user_id,
+      pickupLat: pickup_lat,
+      pickupLng: pickup_lng,
+      destinationName: destination_name,
+      estimatedPrice: estimated_price,
+      distanceKm: distance_km
+    });
+
+    return res.status(201).json({
+      success: true,
+      requestId: newRequest.id,
+      status: newRequest.status,
+      message: "Standard ride request queued successfully."
+    });
+
+  } catch (error) {
+    // Postgres Unique Violation Error Code (23505)
+    if (error.code === '23505') {
+      return res.status(409).json({
+        success: false,
+        message: "You already have an active ride search in progress."
+      });
+    }
+
+    console.error("❌ Standard Ride Request DB Error:", error);
+    return res.status(500).json({ success: false, message: "Internal server error." });
+  }
+});
 
 
+// POST /api/rides/standard/cancel
+app.post('/api/rides/standard/cancel', async (req, res) => {
+  const { requestId, user_id } = req.body;
 
+  if (!user_id && !requestId) {
+    return res.status(400).json({
+      success: false,
+      message: "Either requestId or user_id is required."
+    });
+  }
 
+  try {
+    let query = "";
+    let params = [];
 
+    // 1. If exact requestId is provided, target it specifically
+    if (requestId) {
+      query = `
+        UPDATE route_pool_standard 
+        SET status = 'cancelled', updated_at = NOW() 
+        WHERE id = $1 AND (user_id = $2 OR $2 IS NULL) AND status = 'searching'
+        RETURNING id, user_id, driver_id;
+      `;
+      params = [requestId, user_id || null];
+    } else {
+      // 2. Fallback: Cancel any active searching request for this user
+      query = `
+        UPDATE route_pool_standard 
+        SET status = 'cancelled', updated_at = NOW() 
+        WHERE user_id = $1 AND status = 'searching'
+        RETURNING id, user_id, driver_id;
+      `;
+      params = [user_id];
+    }
 
+    const result = await pool.query(query, params);
 
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No active searching request found to cancel."
+      });
+    }
 
+    const cancelledRequest = result.rows[0];
 
+    // 3. Broadcast cancellation event to drivers via Socket.io
+    req.io?.emit('standard_ride_cancelled', {
+      requestId: cancelledRequest.id,
+      userId: cancelledRequest.user_id,
+      driverId: cancelledRequest.driver_id
+    });
 
+    return res.status(200).json({
+      success: true,
+      message: "Standard ride request cancelled successfully.",
+      requestId: cancelledRequest.id
+    });
 
-
+  } catch (error) {
+    console.error("❌ Standard Ride Cancellation Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error."
+    });
+  }
+});
 
 
 /* ===========================================================================
