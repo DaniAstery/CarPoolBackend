@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { Client } = require('pg');
+const axios = require('axios');
 const cors = require('cors');
 require('dotenv').config();
 const pool = require('./db'); // 👈 KEEP YOUR EXISTING DB POOL INTACT!
@@ -11,6 +12,7 @@ const PORT = process.env.PORT || 5000;
 
 const multer = require("multer");
 const path = require("path");
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 // ⚡ Global Parsers & Middlewares
 app.use(cors());
@@ -2342,17 +2344,12 @@ app.get("/api/rides/corridor-pool-status", async (req, res) => {
 
 
 
-
-
-
-
-
 /* ---------------- PASSENGER SIDE: DECLINE PROPOSAL & SWAP ---------------- */
 app.post("/api/routes/decline-proposal", async (req, res) => {
-  const { user_id, ride_offer_id } = req.body;
+  const { user_id } = req.body;
 
-  if (!user_id || !ride_offer_id) {
-    return res.status(400).json({ error: "Missing required user_id or ride_offer_id." });
+  if (!user_id) {
+    return res.status(400).json({ error: "Missing required user_id." });
   }
 
   const client = await pool.connect();
@@ -2360,13 +2357,13 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // 1. Fetch details of the record being declined
+    // 1. Fetch details of the record being declined where status is 'matched'
     const currentMatchQuery = await client.query(
-      `SELECT id, route_id, pickup_hub_id 
+      `SELECT id, route_id, pickup_hub_id, matched_ride_offer_id 
        FROM route_pool 
-       WHERE user_id = $1 AND matched_ride_offer_id = $2 AND status = 'matched'
+       WHERE user_id = $1 AND status = 'matched'
        FOR UPDATE;`,
-      [parseInt(user_id, 10), parseInt(ride_offer_id, 10)]
+      [parseInt(user_id, 10)]
     );
 
     const matchRecord = currentMatchQuery.rows[0];
@@ -2376,9 +2373,14 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
       return res.status(404).json({ error: "Active matching proposal record not found." });
     }
 
-    const { route_id, pickup_hub_id } = matchRecord;
+    const { route_id, pickup_hub_id, matched_ride_offer_id: ride_offer_id } = matchRecord;
 
-    // 2. Mark the declining passenger as 'cancelled'
+    if (!ride_offer_id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "No associated ride offer found for this match." });
+    }
+
+    // 2. Mark the declining passenger as 'cancelled' and clear their matched ride offer id
     await client.query(
       `UPDATE route_pool SET status = 'cancelled', matched_ride_offer_id = NULL WHERE id = $1;`,
       [matchRecord.id]
@@ -2442,9 +2444,10 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
       );
     }
 
-    // 5. 🌟 DECOUPLED CALL: Invoke upgraded Matching Engine to resolve searching/stranded entries
-    // Passing the transactional client down allows the recovery engine to execute within the same safe atomic space.
-    await executeCorridorAutoMatch(client, route_id, pickup_hub_id);
+    // 5. 🌟 DECOUPLED CALL: Invoke upgraded Matching Engine if defined to resolve searching/stranded entries
+    if (typeof executeCorridorAutoMatch === 'function') {
+      await executeCorridorAutoMatch(client, route_id, pickup_hub_id);
+    }
 
     await client.query("COMMIT");
 
@@ -2462,7 +2465,6 @@ app.post("/api/routes/decline-proposal", async (req, res) => {
     client.release();
   }
 });
-
 
 // 🔄 1. TRACK LIVE OFFER TELEMETRY ENDPOINT
 app.get("/api/rides/track-live/offer/:id", async (req, res) => {
@@ -4236,10 +4238,108 @@ app.get('/api/trips/history/:userId/:role', async (req, res) => {
   }
 });
 
+app.get('/api/rides/autocomplete', async (req, res) => {
+  try {
+    const { input, location } = req.query; // location optional format: "lat,lng" for biasing results
+
+    if (!input) {
+      return res.status(400).json({ error: 'Input query is required' });
+    }
+
+    let url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(
+      input
+    )}&key=${GOOGLE_MAPS_API_KEY}&components=country:et`; // Biased to Ethiopia (change country code if needed)
+
+    if (location) {
+      url += `&location=${location}&radius=50000`; // 50km bias around user current location
+    }
+
+    const response = await axios.get(url);
+
+    const predictions = response.data.predictions.map((item) => ({
+      placeId: item.place_id,
+      mainText: item.structured_formatting.main_text,
+      secondaryText: item.structured_formatting.secondary_text,
+      description: item.description,
+    }));
+
+    return res.status(200).json({ success: true, predictions });
+  } catch (error) {
+    console.error('Google Places Autocomplete Error:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch places suggestions' });
+  }
+});
+
+app.get('/api/rides/details', async (req, res) => {
+  try {
+    const { placeId } = req.query;
+
+    if (!placeId) {
+      return res.status(400).json({ error: 'Place ID is required' });
+    }
+
+    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=geometry,formatted_address,name&key=${GOOGLE_MAPS_API_KEY}`;
+    
+    const response = await axios.get(url);
+    const result = response.data.result;
+
+    if (!result) {
+      return res.status(404).json({ error: 'Place details not found' });
+    }
+
+    return res.status(200).json({
+      success: true,
+      place: {
+        name: result.name,
+        address: result.formatted_address,
+        lat: result.geometry.location.lat,
+        lng: result.geometry.location.lng,
+      },
+    });
+  } catch (error) {
+    console.error('Google Place Details Error:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch place details' });
+  }
+});
 
 
+app.post('/api/rides/estimate-fare', async (req, res) => {
+  try {
+    const { origin_lat, origin_lng, destination_lat, destination_lng } = req.body;
 
+    if (!origin_lat || !origin_lng || !destination_lat || !destination_lng) {
+      return res.status(400).json({ error: 'Origin and destination coordinates are required' });
+    }
 
+    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${origin_lat},${origin_lng}&destinations=${destination_lat},${destination_lng}&key=${GOOGLE_MAPS_API_KEY}`;
+    
+    const response = await axios.get(url);
+    const element = response.data.rows[0]?.elements[0];
+
+    if (!element || element.status !== 'OK') {
+      return res.status(400).json({ error: 'Could not calculate distance between locations' });
+    }
+
+    const distanceMeters = element.distance.value; 
+    const distanceKm = (distanceMeters / 1000).toFixed(1);
+    const durationText = element.duration.text;
+
+    // Standard KM Pricing Formula (Base Fare + Rate per KM)
+    const baseFare = 50; // ETB Base
+    const ratePerKm = 35; // ETB per KM
+    const estimatedPrice = Math.round(baseFare + (parseFloat(distanceKm) * ratePerKm));
+
+    return res.status(200).json({
+      success: true,
+      distanceKm: parseFloat(distanceKm),
+      durationText,
+      estimatedPrice,
+    });
+  } catch (error) {
+    console.error('Fare estimation error:', error.message);
+    return res.status(500).json({ error: 'Failed to calculate fare' });
+  }
+});
 
 
 
