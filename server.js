@@ -267,6 +267,97 @@ app.get('/api/auth/check-status/:userId', async (req, res) => {
   }
 });
 
+// CHECKING APP NAVIGATOR FOR SCREEN STATES FOR SHARED AND STANDARD RIDES 
+
+app.get('/api/gateway/state/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const role = (req.query.role || 'passenger').toLowerCase().trim();
+
+  if (!userId) {
+    return res.status(400).json({ success: false, message: "userId is required" });
+  }
+
+  try {
+    if (role === 'passenger') {
+      // 1. Check route_pool_standard for active direct ride requests
+      const standardQuery = `
+        SELECT 
+          id,
+          id AS "rideOfferId",
+          'route_pool_standard' AS source_table,
+          'standard' AS booking_type,
+          status,
+          user_id,
+          driver_id,
+          pickup_lat,
+          pickup_lng,
+          destination_lat,
+          destination_lng,
+          destination_name AS "destinationName",
+          destination_address,
+          estimated_price,
+          distance_km,
+          created_at,
+          updated_at
+        FROM route_pool_standard
+        WHERE user_id = $1 
+          AND status IN ('searching', 'accepted', 'arrived', 'in_trip')
+        ORDER BY created_at DESC
+        LIMIT 1;
+      `;
+
+      const standardResult = await pool.query(standardQuery, [userId]);
+
+      // If active standard ride exists (e.g. ID 4 with status = 'searching')
+      if (standardResult.rows.length > 0) {
+        return res.status(200).json(standardResult.rows[0]);
+      }
+
+      // 2. Fallback: Check route_pool for active shared corridor rides
+      const sharedQuery = `
+        SELECT 
+          id,
+          id AS "rideOfferId",
+          'route_pool' AS source_table,
+          'shared' AS booking_type,
+          status,
+          user_id,
+          driver_id,
+          pickup_lat,
+          pickup_lng,
+          created_at,
+          updated_at
+        FROM route_pool
+        WHERE user_id = $1 
+          AND status IN ('searching', 'matched', 'pending', 'arrived', 'in_trip')
+        ORDER BY created_at DESC
+        LIMIT 1;
+      `;
+
+      const sharedResult = await pool.query(sharedQuery, [userId]);
+
+      if (sharedResult.rows.length > 0) {
+        return res.status(200).json(sharedResult.rows[0]);
+      }
+
+      // 3. No active ride searching or in progress
+      return res.status(200).json({
+        status: 'none',
+        source_table: 'none',
+        booking_type: 'none'
+      });
+    } else {
+      // Driver gateway logic handling...
+      return res.status(200).json({ status: 'none' });
+    }
+
+  } catch (error) {
+    console.error("❌ Gateway State Check Error:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+
 
 
 
@@ -4459,11 +4550,10 @@ app.post('/api/rides/standard/request', async (req, res) => {
   }
 
   try {
-    // 1. Cleanly cancel any existing active searches for this user
+    // 1. Delete all existing active searches and cancelled history for this user
     await pool.query(
-      `UPDATE route_pool_standard 
-       SET status = 'cancelled', updated_at = NOW() 
-       WHERE user_id = $1 AND status = 'searching'`,
+      `DELETE FROM route_pool_standard 
+       WHERE user_id = $1 AND status IN ('searching', 'cancelled')`,
       [user_id]
     );
 
