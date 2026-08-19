@@ -30,7 +30,7 @@ app.use((req, res, next) => {
 
 // 🔔 DEDICATED CLIENT FOR POSTGRES LISTEN / NOTIFY 
 const pgListener = new Client({
-  connectionString: process.env.DATABASE_URL || `postgresql://postgres:D@ny_456@127.0.0.1:5432/corridor_pool`
+  connectionString: process.env.DATABASE_URL 
 });
 
 // ✅ Connect ONCE and listen to all required channels
@@ -41,6 +41,8 @@ pgListener.connect()
     await pgListener.query("LISTEN queue_changes");
   })
   .catch(err => console.error("❌ Postgres listener connection failed:", err));
+
+
 
 pgListener.on("notification", async (msg) => {
   try {
@@ -64,6 +66,17 @@ pgListener.on("notification", async (msg) => {
   }
 });
 
+
+
+
+
+
+
+
+
+
+
+
 io.on("connection", (socket) => {
   console.log("⚡ Passenger/Driver connected via Socket.io:", socket.id);
   socket.on("join_hub", ({ hub_name }) => {
@@ -73,9 +86,58 @@ io.on("connection", (socket) => {
     console.log(`🔌 Socket ${socket.id} joined room: ${roomName}`);
   });
 
-  socket.on("disconnect", () => {
-    console.log("🔴 Client disconnected:", socket.id);
+  // 2. Driver Targeted Room Joining (Matches / Direct Alerts)
+  socket.on("join_driver_room", ({ driverId, driver_id }) => {
+    const id = driverId || driver_id;
+    if (!id) return;
+    
+    const roomName = `driver_${id}`;
+    socket.join(roomName);
+    console.log(`🎯 Socket ${socket.id} registered as Driver Room: ${roomName}`);
   });
+
+  socket.on('join_ride_room', ({ rideId, userId }) => {
+    socket.join(`ride_${rideId}`);
+    socket.userId = userId;
+    socket.rideId = rideId;
+    console.log(`👤 User ${userId} joined room for pending ride #${rideId}`);
+  });
+
+  io.on('connection', (socket) => {
+  console.log(`🔌 User connected: ${socket.id}`);
+
+  // When passenger joins the searching room on StandardScreen
+  socket.on('join_ride_room', ({ rideId, userId }) => {
+    socket.join(`ride_${rideId}`);
+    socket.userId = userId;
+    socket.rideId = rideId;
+    console.log(`👤 User ${userId} joined room for pending ride #${rideId}`);
+  });
+
+  // 🛑 AUTOMATIC CANCELLATION ON APP CLOSE OR DISCONNECT
+  socket.on('disconnect', async () => {
+    console.log(`🔌 User disconnected: ${socket.id}`);
+    
+    if (socket.rideId && socket.userId) {
+      try {
+        const cancelQuery = `
+          UPDATE ride_request_solo 
+          SET status = 'cancelled', updated_at = NOW() 
+          WHERE id = $1 AND user_id = $2 AND status = 'pending'
+          RETURNING id;
+        `;
+        
+        const result = await pool.query(cancelQuery, [socket.rideId, socket.userId]);
+        
+        if (result.rows.length > 0) {
+          console.log(`🧹 Auto-cancelled abandoned pending ride #${socket.rideId} for user ${socket.userId}`);
+        }
+      } catch (err) {
+        console.error("❌ Error auto-cancelling ride on socket disconnect:", err.message);
+      }
+    }
+  });
+});
 });
 
 const TelegramModule = require('node-telegram-bot-api');
@@ -266,106 +328,6 @@ app.get('/api/auth/check-status/:userId', async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
-// CHECKING APP NAVIGATOR FOR SCREEN STATES FOR SHARED AND STANDARD RIDES 
-
-app.get('/api/gateway/state/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const role = (req.query.role || 'passenger').toLowerCase().trim();
-
-  if (!userId) {
-    return res.status(400).json({ success: false, message: "userId is required" });
-  }
-
-  try {
-    if (role === 'passenger') {
-      // 1. Check route_pool_standard for active direct ride requests
-      const standardQuery = `
-        SELECT 
-          id,
-          id AS "rideOfferId",
-          'route_pool_standard' AS source_table,
-          'standard' AS booking_type,
-          status,
-          user_id,
-          driver_id,
-          pickup_lat,
-          pickup_lng,
-          destination_lat,
-          destination_lng,
-          destination_name AS "destinationName",
-          destination_address,
-          estimated_price,
-          distance_km,
-          created_at,
-          updated_at
-        FROM route_pool_standard
-        WHERE user_id = $1 
-          AND status IN ('searching', 'accepted', 'arrived', 'in_trip')
-        ORDER BY created_at DESC
-        LIMIT 1;
-      `;
-
-      const standardResult = await pool.query(standardQuery, [userId]);
-
-      // If active standard ride exists (e.g. ID 4 with status = 'searching')
-      if (standardResult.rows.length > 0) {
-        return res.status(200).json(standardResult.rows[0]);
-      }
-
-      // 2. Fallback: Check route_pool for active shared corridor rides
-      const sharedQuery = `
-        SELECT 
-          id,
-          id AS "rideOfferId",
-          'route_pool' AS source_table,
-          'shared' AS booking_type,
-          status,
-          user_id,
-          driver_id,
-          pickup_lat,
-          pickup_lng,
-          created_at,
-          updated_at
-        FROM route_pool
-        WHERE user_id = $1 
-          AND status IN ('searching', 'matched', 'pending', 'arrived', 'in_trip')
-        ORDER BY created_at DESC
-        LIMIT 1;
-      `;
-
-      const sharedResult = await pool.query(sharedQuery, [userId]);
-
-      if (sharedResult.rows.length > 0) {
-        return res.status(200).json(sharedResult.rows[0]);
-      }
-
-      // 3. No active ride searching or in progress
-      return res.status(200).json({
-        status: 'none',
-        source_table: 'none',
-        booking_type: 'none'
-      });
-    } else {
-      // Driver gateway logic handling...
-      return res.status(200).json({ status: 'none' });
-    }
-
-  } catch (error) {
-    console.error("❌ Gateway State Check Error:", error);
-    return res.status(500).json({ success: false, message: "Internal server error" });
-  }
-});
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -725,6 +687,7 @@ app.get('/api/rides/map_coordinates', async (req, res) => {
     res.status(500).json({ success: false, error: "Server error fetching map coordinates" });
   }
 });
+
 
 
 // passenger screen status gatewaykeeper 
@@ -4528,11 +4491,7 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
   }
 });
 
-
-
-
-// POST /api/routes/standard/request
-app.post('/api/rides/standard/request', async (req, res) => {
+app.post('/api/rides/solo/create', async (req, res) => {
   const {
     user_id,
     pickup_lat,
@@ -4545,141 +4504,209 @@ app.post('/api/rides/standard/request', async (req, res) => {
     distance_km
   } = req.body;
 
-  if (!user_id) {
-    return res.status(400).json({ success: false, message: "user_id is required." });
+  if (!user_id || !pickup_lat || !pickup_lng || !destination_lat || !destination_lng) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required location or user parameters.' 
+    });
   }
 
   try {
-    // 1. Delete all existing active searches and cancelled history for this user
-    await pool.query(
-      `DELETE FROM route_pool_standard 
-       WHERE user_id = $1 AND status IN ('searching', 'cancelled')`,
-      [user_id]
-    );
+    // 🛑 1. Check if a pending ride already exists to prevent duplicate rows
+    const existingQuery = `
+      SELECT * FROM ride_request_solo 
+      WHERE user_id = $1 AND status = 'pending'
+      ORDER BY created_at DESC 
+      LIMIT 1;
+    `;
+    const existingResult = await pool.query(existingQuery, [user_id]);
 
-    // 2. Insert the fresh ride request
+    if (existingResult.rows.length > 0) {
+      const activeRide = existingResult.rows[0];
+      console.log(`⚠️ Active pending ride already exists for user ${user_id} (ID: ${activeRide.id}). Returning existing record.`);
+      
+      return res.status(200).json({
+        success: true,
+        message: 'Active ride request already exists.',
+        ride: activeRide,
+        resolvedHubId: activeRide.hub_id,
+        isExisting: true
+      });
+    }
+
+    // 2. Find nearest hub ID for the hub_id column
+    const hubQuery = `
+      SELECT id,
+      ( 6371 * acos( cos( radians($1) ) * cos( radians(latitude) ) * cos( radians(longitude) - radians($2) ) + sin( radians($1) ) * sin( radians(latitude) ) ) ) AS distance
+      FROM hubs
+      ORDER BY distance ASC
+      LIMIT 1;
+    `;
+    const hubResult = await pool.query(hubQuery, [pickup_lat, pickup_lng]);
+    const resolvedHubId = hubResult.rows.length > 0 ? hubResult.rows[0].id : null;
+
+    // 3. Insert new request only if no pending ride exists
     const insertQuery = `
-      INSERT INTO route_pool_standard 
-        (user_id, pickup_lat, pickup_lng, destination_lat, destination_lng, destination_name, destination_address, estimated_price, distance_km, status)
-      VALUES 
-        ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'searching')
-      RETURNING id, status, created_at;
+      INSERT INTO ride_request_solo (
+        user_id,
+        pickup_lat,
+        pickup_lng,
+        destination_lat,
+        destination_lng,
+        destination_name,
+        destination_address,
+        price,
+        distance_km,
+        hub_id,
+        status,
+        created_at,
+        updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', NOW(), NOW())
+      RETURNING *;
     `;
 
-    const result = await pool.query(insertQuery, [
+    const values = [
       user_id,
       pickup_lat,
       pickup_lng,
       destination_lat,
       destination_lng,
-      destination_name,
+      destination_name || 'Destination',
       destination_address || '',
-      estimated_price,
-      distance_km
-    ]);
+      estimated_price || 0,
+      distance_km || 0,
+      resolvedHubId
+    ];
 
-    const newRequest = result.rows[0];
-
-    // 3. Broadcast to nearby drivers via Socket.io
-    req.io?.emit('new_standard_ride_request', {
-      requestId: newRequest.id,
-      userId: user_id,
-      pickupLat: pickup_lat,
-      pickupLng: pickup_lng,
-      destinationName: destination_name,
-      estimatedPrice: estimated_price,
-      distanceKm: distance_km
-    });
+    const result = await pool.query(insertQuery, values);
+    const newRide = result.rows[0];
 
     return res.status(201).json({
       success: true,
-      requestId: newRequest.id,
-      status: newRequest.status,
-      message: "Standard ride request queued successfully."
+      message: 'Solo ride request created successfully.',
+      ride: newRide,
+      resolvedHubId: resolvedHubId,
+      isExisting: false
     });
 
-  } catch (error) {
-    // Postgres Unique Violation Error Code (23505)
-    if (error.code === '23505') {
-      return res.status(409).json({
-        success: false,
-        message: "You already have an active ride search in progress."
-      });
-    }
-
-    console.error("❌ Standard Ride Request DB Error:", error);
-    return res.status(500).json({ success: false, message: "Internal server error." });
+  } catch (err) {
+    console.error("❌ Error creating solo ride request:", err.message);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Server error while dispatching solo ride request.' 
+    });
   }
 });
 
 
-// POST /api/rides/standard/cancel
-app.post('/api/rides/standard/cancel', async (req, res) => {
+// Cancel active solo/standard ride request with strict user verification
+app.post('/api/rides/solo/cancel', async (req, res) => {
   const { requestId, user_id } = req.body;
 
-  if (!user_id && !requestId) {
-    return res.status(400).json({
-      success: false,
-      message: "Either requestId or user_id is required."
+  if (!requestId || !user_id) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required request ID or user ID.' 
     });
   }
 
   try {
-    let query = "";
-    let params = [];
+    const updateQuery = `
+      UPDATE ride_request_solo 
+      SET status = 'cancelled', updated_at = NOW() 
+      WHERE id = $1 AND user_id = $2 AND status = 'pending'
+      RETURNING id, user_id, status;
+    `;
 
-    // 1. If exact requestId is provided, target it specifically
-    if (requestId) {
-      query = `
-        UPDATE route_pool_standard 
-        SET status = 'cancelled', updated_at = NOW() 
-        WHERE id = $1 AND (user_id = $2 OR $2 IS NULL) AND status = 'searching'
-        RETURNING id, user_id, driver_id;
-      `;
-      params = [requestId, user_id || null];
-    } else {
-      // 2. Fallback: Cancel any active searching request for this user
-      query = `
-        UPDATE route_pool_standard 
-        SET status = 'cancelled', updated_at = NOW() 
-        WHERE user_id = $1 AND status = 'searching'
-        RETURNING id, user_id, driver_id;
-      `;
-      params = [user_id];
-    }
+    const result = await pool.query(updateQuery, [requestId, user_id]);
 
-    const result = await pool.query(query, params);
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "No active searching request found to cancel."
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Active ride request not found, already cancelled, or unauthorized.' 
       });
     }
 
-    const cancelledRequest = result.rows[0];
-
-    // 3. Broadcast cancellation event to drivers via Socket.io
-    req.io?.emit('standard_ride_cancelled', {
-      requestId: cancelledRequest.id,
-      userId: cancelledRequest.user_id,
-      driverId: cancelledRequest.driver_id
-    });
+    const cancelledRide = result.rows[0];
 
     return res.status(200).json({
       success: true,
-      message: "Standard ride request cancelled successfully.",
-      requestId: cancelledRequest.id
+      message: 'Ride request cancelled successfully.',
+      ride: cancelledRide
     });
 
-  } catch (error) {
-    console.error("❌ Standard Ride Cancellation Error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Internal server error."
+  } catch (err) {
+    console.error("❌ Error cancelling solo ride request:", err.message);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Server error while cancelling ride request.' 
     });
   }
 });
+
+
+// Get nearby active drivers from active_user_sessions table
+// GET /api/drivers/nearby?lat=9.0420778&lng=38.8741641&radius_km=15
+// GET /api/drivers/nearby?lat=9.0420778&lng=38.8741641&radius_km=15
+app.get('/api/drivers/nearby', async (req, res) => {
+  try {
+    const lat = parseFloat(req.query.lat);
+    const lng = parseFloat(req.query.lng);
+    const radiusKm = parseFloat(req.query.radius_km) || 15;
+
+    if (isNaN(lat) || isNaN(lng)) {
+      return res.status(400).json({ success: false, message: "Invalid latitude or longitude" });
+    }
+
+    // Pure SQL Haversine distance formula (works directly on lat/lng columns)
+    const query = `
+      SELECT 
+        user_id,
+        active_role,
+        lat,
+        lng,
+        heading,
+        status,
+        last_ping_at,
+        device_id,
+        (
+          6371 * acos(
+            LEAST(1.0, GREATEST(-1.0,
+              sin(radians($1)) * sin(radians(lat)) +
+              cos(radians($1)) * cos(radians(lat)) *
+              cos(radians(lng) - radians($2))
+            ))
+          )
+        ) AS distance_km
+      FROM active_user_sessions
+      WHERE active_role = 'driver'
+        AND status = 'online'
+        AND last_ping_at >= NOW() - INTERVAL '2 hours'
+      ORDER BY distance_km ASC;
+    `;
+
+    const { rows } = await pool.query(query, [lat, lng]);
+
+    // Filter drivers within requested radius
+    const nearby = rows.filter(driver => driver.distance_km <= radiusKm);
+
+    console.log(`📍 Nearby drivers query for (${lat}, ${lng}): Found ${nearby.length} drivers`);
+
+    return res.json({
+      success: true,
+      count: nearby.length,
+      drivers: nearby
+    });
+
+  } catch (error) {
+    console.error("❌ Error fetching nearby drivers:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+
+
+
 
 
 /* ===========================================================================
