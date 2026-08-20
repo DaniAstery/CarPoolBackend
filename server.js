@@ -14,6 +14,9 @@ const multer = require("multer");
 const path = require("path");
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
+// 🟢 DECLARE IN-MEMORY DRIVER STATE MAP AT TOP LEVEL
+const activeDrivers = new Map();
+
 // ⚡ Global Parsers & Middlewares
 app.use(cors());
 app.use(express.json());
@@ -33,7 +36,6 @@ const pgListener = new Client({
   connectionString: process.env.DATABASE_URL 
 });
 
-// ✅ Connect ONCE and listen to all required channels
 pgListener.connect()
   .then(async () => {
     console.log("🔌 Dedicated Postgres client connected for LISTEN/NOTIFY");
@@ -42,22 +44,17 @@ pgListener.connect()
   })
   .catch(err => console.error("❌ Postgres listener connection failed:", err));
 
-
-
 pgListener.on("notification", async (msg) => {
   try {
     const payload = JSON.parse(msg.payload);
     console.log(`🔔 Postgres Notification Caught on [${msg.channel}]:`, payload);
     
-    // Optional global notification emission
     io.emit("route_pool_updated", payload);
     
-    // ✅ Use payload.hub_id to resolve the hub name and trigger your existing helper
     if (payload.hub_id) {
       const hubResult = await pool.query(`SELECT name FROM hubs WHERE id = $1`, [payload.hub_id]);
       if (hubResult.rows.length > 0) {
         const hubName = hubResult.rows[0].name;
-        // Call your existing helper function below!
         // await broadcastHubQueueUpdate(io, pool, hubName);
       }
     }
@@ -66,19 +63,14 @@ pgListener.on("notification", async (msg) => {
   }
 });
 
-
-
-
-
-
-
-
-
-
-
+// ------------------------------------------------------------------
+// UNIFIED SOCKET.IO ENGINE
+// ------------------------------------------------------------------
 
 io.on("connection", (socket) => {
-  console.log("⚡ Passenger/Driver connected via Socket.io:", socket.id);
+  console.log("⚡ Client connected via Socket.io:", socket.id);
+
+  // 1. Hub Room Joining
   socket.on("join_hub", ({ hub_name }) => {
     if (!hub_name) return;
     const roomName = `hub_${hub_name.toLowerCase().trim()}`;
@@ -86,38 +78,74 @@ io.on("connection", (socket) => {
     console.log(`🔌 Socket ${socket.id} joined room: ${roomName}`);
   });
 
-  // 2. Driver Targeted Room Joining (Matches / Direct Alerts)
-  socket.on("join_driver_room", ({ driverId, driver_id }) => {
-    const id = driverId || driver_id;
+  // 2. Driver Channel Registration
+  socket.on("register_driver_channel", ({ driverId, driver_id }) => {
+    const id = String(driverId || driver_id);
     if (!id) return;
-    
+
     const roomName = `driver_${id}`;
     socket.join(roomName);
+    socket.driverId = id;
+
+    // Guaranteed fallback initialization in activeDrivers Map
+    const existing = activeDrivers.get(id) || {};
+    activeDrivers.set(id, {
+      ...existing,
+      driverId: id,
+      socketId: socket.id,
+      status: existing.status || "online",
+      operatingMode: existing.operatingMode || "STANDARD",
+    });
+
+    console.log(`🚖 Driver ${id} registered to room: ${roomName}`);
+  });
+
+  // Alias support for legacy join_driver_room events
+  socket.on("join_driver_room", ({ driverId, driver_id }) => {
+    const id = String(driverId || driver_id);
+    if (!id) return;
+    const roomName = `driver_${id}`;
+    socket.join(roomName);
+    socket.driverId = id;
+
+    const existing = activeDrivers.get(id) || {};
+    activeDrivers.set(id, {
+      ...existing,
+      driverId: id,
+      socketId: socket.id,
+      status: existing.status || "online",
+      operatingMode: existing.operatingMode || "STANDARD",
+    });
     console.log(`🎯 Socket ${socket.id} registered as Driver Room: ${roomName}`);
   });
 
-  socket.on('join_ride_room', ({ rideId, userId }) => {
+  // 3. Passenger Channel Registration
+  socket.on("register_user_channel", ({ userId }) => {
+    if (!userId) return;
+    const roomName = `user_${userId}`;
+    socket.join(roomName);
+    console.log(`👤 Passenger ${userId} registered to room: ${roomName}`);
+  });
+
+  // 4. Ride Monitoring Room
+  socket.on("join_ride_room", ({ rideId, userId }) => {
+    if (!rideId) return;
     socket.join(`ride_${rideId}`);
     socket.userId = userId;
     socket.rideId = rideId;
     console.log(`👤 User ${userId} joined room for pending ride #${rideId}`);
   });
 
-  io.on('connection', (socket) => {
-  console.log(`🔌 User connected: ${socket.id}`);
+  // 5. Automatic Cancellation on App Close or Disconnect
+  socket.on("disconnect", async () => {
+    console.log(`🔌 Client disconnected: ${socket.id}`);
 
-  // When passenger joins the searching room on StandardScreen
-  socket.on('join_ride_room', ({ rideId, userId }) => {
-    socket.join(`ride_${rideId}`);
-    socket.userId = userId;
-    socket.rideId = rideId;
-    console.log(`👤 User ${userId} joined room for pending ride #${rideId}`);
-  });
+    if (socket.driverId && activeDrivers.has(socket.driverId)) {
+      const driverData = activeDrivers.get(socket.driverId);
+      driverData.socketId = null;
+      activeDrivers.set(socket.driverId, driverData);
+    }
 
-  // 🛑 AUTOMATIC CANCELLATION ON APP CLOSE OR DISCONNECT
-  socket.on('disconnect', async () => {
-    console.log(`🔌 User disconnected: ${socket.id}`);
-    
     if (socket.rideId && socket.userId) {
       try {
         const cancelQuery = `
@@ -126,9 +154,7 @@ io.on("connection", (socket) => {
           WHERE id = $1 AND user_id = $2 AND status = 'pending'
           RETURNING id;
         `;
-        
         const result = await pool.query(cancelQuery, [socket.rideId, socket.userId]);
-        
         if (result.rows.length > 0) {
           console.log(`🧹 Auto-cancelled abandoned pending ride #${socket.rideId} for user ${socket.userId}`);
         }
@@ -138,7 +164,42 @@ io.on("connection", (socket) => {
     }
   });
 });
-});
+
+
+
+// ------------------------------------------------------------------
+// DRIVER LOCATION PING API HANDLER
+// ------------------------------------------------------------------
+function handleDriverPing(req, res) {
+  const { driver_id, lat, lng, heading, status, operating_mode } = req.body;
+
+  if (!driver_id || lat === undefined || lng === undefined) {
+    return res.status(400).json({ success: false, message: "Missing driver location payload" });
+  }
+
+  const driverKey = String(driver_id);
+  const existingState = activeDrivers.get(driverKey) || {};
+
+  const updatedState = {
+    ...existingState,
+    driverId: driverKey,
+    location: { latitude: parseFloat(lat), longitude: parseFloat(lng) },
+    heading: heading || 0,
+    status: status || "online", // 'online' | 'offline'
+    operatingMode: operating_mode || "STANDARD", // 'STANDARD' | 'CORRIDOR'
+    lastPing: Date.now(),
+  };
+
+  if (status === "offline") {
+    activeDrivers.delete(driverKey);
+  } else {
+    activeDrivers.set(driverKey, updatedState);
+  }
+
+  return res.status(200).json({ success: true, timestamp: updatedState.lastPing });
+}
+
+
 
 const TelegramModule = require('node-telegram-bot-api');
 // Safely resolve the constructor across different library versions (v0.x vs v1.x)
@@ -4525,6 +4586,9 @@ app.post('/api/rides/solo/create', async (req, res) => {
       const activeRide = existingResult.rows[0];
       console.log(`⚠️ Active pending ride already exists for user ${user_id} (ID: ${activeRide.id}). Returning existing record.`);
       
+      // Optional: Re-broadcast to nearby drivers if passenger is polling/retrying
+      // dispatchSoloRequestToDrivers(activeRide);
+
       return res.status(200).json({
         success: true,
         message: 'Active ride request already exists.',
@@ -4581,6 +4645,9 @@ app.post('/api/rides/solo/create', async (req, res) => {
     const result = await pool.query(insertQuery, values);
     const newRide = result.rows[0];
 
+    // 📡 4. BROADCAST DISPATCH OFFER TO STANDARD MODE DRIVERS
+    dispatchSoloRequestToDrivers(newRide);
+
     return res.status(201).json({
       success: true,
       message: 'Solo ride request created successfully.',
@@ -4597,6 +4664,38 @@ app.post('/api/rides/solo/create', async (req, res) => {
     });
   }
 });
+
+
+function dispatchSoloRequestToDrivers(rideSoloRow) {
+  const MAX_RADIUS_KM = 5.0; // Set search radius
+
+  activeDrivers.forEach((driverState, driverId) => {
+    // 1. Guardrail checks
+    if (driverState.status !== "online" || driverState.operatingMode !== "STANDARD") return;
+
+    // 2. Proximity check
+    const distance = calculateHaversineDistance(
+      driverState.location.latitude,
+      driverState.location.longitude,
+      parseFloat(rideSoloRow.pickup_lat),
+      parseFloat(rideSoloRow.pickup_lng)
+    );
+
+    // 3. Emit offer if within operational radius
+    if (distance <= MAX_RADIUS_KM) {
+      io.to(`driver_${driverId}`).emit("new_ride_offer", {
+        rideId: rideSoloRow.id,
+        userId: rideSoloRow.user_id,
+        fare: `ETB ${rideSoloRow.price}`,
+        destinationName: rideSoloRow.destination_name,
+        pickupCoords: { latitude: parseFloat(rideSoloRow.pickup_lat), longitude: parseFloat(rideSoloRow.pickup_lng) },
+        distanceKm: parseFloat(rideSoloRow.distance_km),
+        expiresInSeconds: 20
+      });
+    }
+  });
+}
+
 
 
 // Cancel active solo/standard ride request with strict user verification
@@ -4645,8 +4744,7 @@ app.post('/api/rides/solo/cancel', async (req, res) => {
 });
 
 
-// Get nearby active drivers from active_user_sessions table
-// GET /api/drivers/nearby?lat=9.0420778&lng=38.8741641&radius_km=15
+
 // GET /api/drivers/nearby?lat=9.0420778&lng=38.8741641&radius_km=15
 app.get('/api/drivers/nearby', async (req, res) => {
   try {
@@ -4704,11 +4802,186 @@ app.get('/api/drivers/nearby', async (req, res) => {
   }
 });
 
+// driver acceptes broadcast and sets ride_request_solo status to accepted
+app.post('/api/rides/solo/accept', async (req, res) => {
+  const { ride_id, driver_id, vehicle_id } = req.body;
+
+  if (!ride_id || !driver_id) {
+    return res.status(400).json({ success: false, message: 'Missing ride_id or driver_id' });
+  }
+
+  try {
+    // Atomic update: only updates if status is STILL 'pending'
+    const updateQuery = `
+      UPDATE ride_request_solo
+      SET 
+        driver_id = $1,
+        vehicle_id = $2,
+        status = 'accepted',
+        updated_at = NOW()
+      WHERE id = $3 AND status = 'pending'
+      RETURNING *;
+    `;
+
+    const result = await pool.query(updateQuery, [driver_id, vehicle_id || null, ride_id]);
+
+    // Race condition lost: Another driver accepted first or user canceled
+    if (result.rowCount === 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'Ride request was already accepted by another driver or canceled.'
+      });
+    }
+
+    const acceptedRide = result.rows[0];
+
+    // 1. Notify Passenger that a driver is on the way
+    io.to(`user_${acceptedRide.user_id}`).emit('ride_accepted', {
+      rideId: acceptedRide.id,
+      driverId: acceptedRide.driver_id,
+      status: acceptedRide.status,
+      timestamp: acceptedRide.updated_at
+    });
+
+    // 2. Retract offer modal from all other active driver screens
+    io.emit('offer_retracted', { rideId: acceptedRide.id });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Ride successfully assigned.',
+      ride: acceptedRide
+    });
+
+  } catch (err) {
+    console.error("❌ Error assigning driver:", err.message);
+    return res.status(500).json({ success: false, message: 'Server error during driver assignment.' });
+  }
+});
 
 
 
+// ------------------------------------------------------------------
+// DISPATCH ENDPOINT & HELPERS
+// ------------------------------------------------------------------
+
+// Driver accepts broadcast and sets ride_request_solo status to accepted
+app.post('/api/rides/solo/accept', async (req, res) => {
+  // 1. Extract driver_id from payload
+  const driver_id = req.body?.driver_id || req.body?.driverId;
+
+  // 2. Validate strictly driver_id (DO NOT check for ride_id)
+  if (!driver_id) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing required parameter: driver_id' 
+    });
+  }
+
+  try {
+    // 3. Auto-resolve vehicle_id for driver 33 from vehicles table
+    const vehicleResult = await pool.query(
+      `SELECT id FROM vehicles WHERE driver_id = $1 LIMIT 1`,
+      [driver_id]
+    );
+    const vehicle_id = vehicleResult.rows[0]?.id || null;
+
+    // 4. Atomically grab and lock the active pending ride request
+    const updateQuery = `
+      UPDATE ride_request_solo
+      SET 
+        driver_id = $1,
+        vehicle_id = $2,
+        status = 'accepted',
+        updated_at = NOW()
+      WHERE id = (
+        SELECT id FROM ride_request_solo 
+        WHERE status = 'pending' 
+        ORDER BY created_at DESC 
+        LIMIT 1
+      ) AND status = 'pending'
+      RETURNING *;
+    `;
+
+    const result = await pool.query(updateQuery, [driver_id, vehicle_id]);
+
+    if (result.rowCount === 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'No pending ride request available or offer was already claimed.'
+      });
+    }
+
+    const acceptedRide = result.rows[0];
+
+    // 5. Emit socket notifications
+    notifyPassengerRideAccepted(acceptedRide.user_id, acceptedRide);
+    retractOfferFromDrivers(acceptedRide.id);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Ride successfully assigned.',
+      ride: acceptedRide
+    });
+
+  } catch (err) {
+    console.error("❌ Error during ride assignment:", err.message);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Server error during driver assignment.' 
+    });
+  }
+});
 
 
+// Broadcast Solo Request to nearby drivers in STANDARD mode
+function dispatchSoloRequestToDrivers(rideSoloRow) {
+  if (!io) return;
+
+  const offerPayload = {
+    rideId: rideSoloRow.id,
+    userId: rideSoloRow.user_id,
+    hubId: rideSoloRow.hub_id,
+    fare: `ETB ${rideSoloRow.price}`,
+    destinationName: rideSoloRow.destination_name,
+    destinationAddress: rideSoloRow.destination_address,
+    pickupCoords: {
+      latitude: parseFloat(rideSoloRow.pickup_lat),
+      longitude: parseFloat(rideSoloRow.pickup_lng),
+    },
+    destinationCoords: {
+      latitude: parseFloat(rideSoloRow.destination_lat),
+      longitude: parseFloat(rideSoloRow.destination_lng),
+    },
+    distanceKm: parseFloat(rideSoloRow.distance_km),
+    expiresInSeconds: 20,
+  };
+
+  activeDrivers.forEach((driverState, driverId) => {
+    if (driverState.status === "online" && driverState.operatingMode === "STANDARD") {
+      console.log(`📡 Emitting 'new_ride_offer' to driver room: driver_${driverId}`);
+      io.to(`driver_${driverId}`).emit("new_ride_offer", offerPayload);
+    }
+  });
+}
+
+// Retract offer modal across drivers if claimed or canceled
+function retractOfferFromDrivers(rideId) {
+  if (io) {
+    io.emit("offer_retracted", { rideId });
+  }
+}
+
+// Notify passenger when driver accepts
+function notifyPassengerRideAccepted(userId, rideData) {
+  if (io) {
+    io.to(`user_${userId}`).emit("ride_accepted", {
+      rideId: rideData.id,
+      driverId: rideData.driver_id,
+      status: rideData.status,
+      timestamp: rideData.updated_at,
+    });
+  }
+}
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
