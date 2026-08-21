@@ -136,6 +136,53 @@ io.on("connection", (socket) => {
     console.log(`👤 User ${userId} joined room for pending ride #${rideId}`);
   });
 
+  /* 🚗 DRIVER ACCEPTANCE VIA SOCKET */
+  socket.on("solo_ride_accept", (data) => {
+    const { rideId, driverId, passengerId } = data;
+    console.log(`✅ Driver ${driverId} accepted solo ride ${rideId}`);
+
+    const payload = {
+      rideId: rideId,
+      ride_id: rideId,
+      driverId: driverId,
+      driver_id: driverId,
+      status: "accepted",
+      timestamp: new Date().toISOString(),
+    };
+
+    // Broadcast to ride room and direct passenger personal channel
+    io.to(`ride_${rideId}`).emit("solo_ride_accepted", payload);
+    io.to(`ride_${rideId}`).emit("solo_ride_status_updated", payload);
+
+    if (passengerId) {
+      io.to(`user_${passengerId}`).emit("solo_ride_accepted", payload);
+      io.to(`user_${passengerId}`).emit("solo_ride_status_updated", payload);
+    }
+  });
+
+  /* 📍 DRIVER ARRIVAL VIA SOCKET */
+  socket.on("solo_driver_arrived", (data) => {
+    const { rideId, driverId, passengerId } = data;
+    console.log(`📍 Driver ${driverId} arrived for solo ride ${rideId}`);
+
+    const payload = {
+      rideId: rideId,
+      ride_id: rideId,
+      driverId: driverId,
+      driver_id: driverId,
+      status: "arrived",
+      timestamp: new Date().toISOString(),
+    };
+
+    io.to(`ride_${rideId}`).emit("driver_arrived", payload);
+    io.to(`ride_${rideId}`).emit("solo_ride_status_updated", payload);
+
+    if (passengerId) {
+      io.to(`user_${passengerId}`).emit("driver_arrived", payload);
+      io.to(`user_${passengerId}`).emit("solo_ride_status_updated", payload);
+    }
+  });
+
   // 5. Automatic Cancellation on App Close or Disconnect
   socket.on("disconnect", async () => {
     console.log(`🔌 Client disconnected: ${socket.id}`);
@@ -4552,150 +4599,29 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
   }
 });
 
-app.post('/api/rides/solo/create', async (req, res) => {
-  const {
-    user_id,
-    pickup_lat,
-    pickup_lng,
-    destination_lat,
-    destination_lng,
-    destination_name,
-    destination_address,
-    estimated_price,
-    distance_km
-  } = req.body;
+function dispatchSoloRequestToDrivers(newRide) {
+  if (!io) return;
 
-  if (!user_id || !pickup_lat || !pickup_lng || !destination_lat || !destination_lng) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Missing required location or user parameters.' 
-    });
-  }
+  const offerPayload = {
+    id: newRide.id,                // Primary key
+    ride_id: newRide.id,           // Explicit ride identifier
+    user_id: newRide.user_id,      // Passenger user ID
+    passenger_id: newRide.user_id, // Alias for clarity
+    pickup_lat: newRide.pickup_lat,
+    pickup_lng: newRide.pickup_lng,
+    destination_name: newRide.destination_name,
+    destination_address: newRide.destination_address,
+    price: newRide.price,
+    distance_km: newRide.distance_km,
+    status: newRide.status,
+    created_at: newRide.created_at
+  };
 
-  try {
-    // 🛑 1. Check if a pending ride already exists to prevent duplicate rows
-    const existingQuery = `
-      SELECT * FROM ride_request_solo 
-      WHERE user_id = $1 AND status = 'pending'
-      ORDER BY created_at DESC 
-      LIMIT 1;
-    `;
-    const existingResult = await pool.query(existingQuery, [user_id]);
-
-    if (existingResult.rows.length > 0) {
-      const activeRide = existingResult.rows[0];
-      console.log(`⚠️ Active pending ride already exists for user ${user_id} (ID: ${activeRide.id}). Returning existing record.`);
-      
-      // Optional: Re-broadcast to nearby drivers if passenger is polling/retrying
-      // dispatchSoloRequestToDrivers(activeRide);
-
-      return res.status(200).json({
-        success: true,
-        message: 'Active ride request already exists.',
-        ride: activeRide,
-        resolvedHubId: activeRide.hub_id,
-        isExisting: true
-      });
-    }
-
-    // 2. Find nearest hub ID for the hub_id column
-    const hubQuery = `
-      SELECT id,
-      ( 6371 * acos( cos( radians($1) ) * cos( radians(latitude) ) * cos( radians(longitude) - radians($2) ) + sin( radians($1) ) * sin( radians(latitude) ) ) ) AS distance
-      FROM hubs
-      ORDER BY distance ASC
-      LIMIT 1;
-    `;
-    const hubResult = await pool.query(hubQuery, [pickup_lat, pickup_lng]);
-    const resolvedHubId = hubResult.rows.length > 0 ? hubResult.rows[0].id : null;
-
-    // 3. Insert new request only if no pending ride exists
-    const insertQuery = `
-      INSERT INTO ride_request_solo (
-        user_id,
-        pickup_lat,
-        pickup_lng,
-        destination_lat,
-        destination_lng,
-        destination_name,
-        destination_address,
-        price,
-        distance_km,
-        hub_id,
-        status,
-        created_at,
-        updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', NOW(), NOW())
-      RETURNING *;
-    `;
-
-    const values = [
-      user_id,
-      pickup_lat,
-      pickup_lng,
-      destination_lat,
-      destination_lng,
-      destination_name || 'Destination',
-      destination_address || '',
-      estimated_price || 0,
-      distance_km || 0,
-      resolvedHubId
-    ];
-
-    const result = await pool.query(insertQuery, values);
-    const newRide = result.rows[0];
-
-    // 📡 4. BROADCAST DISPATCH OFFER TO STANDARD MODE DRIVERS
-    dispatchSoloRequestToDrivers(newRide);
-
-    return res.status(201).json({
-      success: true,
-      message: 'Solo ride request created successfully.',
-      ride: newRide,
-      resolvedHubId: resolvedHubId,
-      isExisting: false
-    });
-
-  } catch (err) {
-    console.error("❌ Error creating solo ride request:", err.message);
-    return res.status(500).json({ 
-      success: false, 
-      message: 'Server error while dispatching solo ride request.' 
-    });
-  }
-});
-
-
-function dispatchSoloRequestToDrivers(rideSoloRow) {
-  const MAX_RADIUS_KM = 5.0; // Set search radius
-
-  activeDrivers.forEach((driverState, driverId) => {
-    // 1. Guardrail checks
-    if (driverState.status !== "online" || driverState.operatingMode !== "STANDARD") return;
-
-    // 2. Proximity check
-    const distance = calculateHaversineDistance(
-      driverState.location.latitude,
-      driverState.location.longitude,
-      parseFloat(rideSoloRow.pickup_lat),
-      parseFloat(rideSoloRow.pickup_lng)
-    );
-
-    // 3. Emit offer if within operational radius
-    if (distance <= MAX_RADIUS_KM) {
-      io.to(`driver_${driverId}`).emit("new_ride_offer", {
-        rideId: rideSoloRow.id,
-        userId: rideSoloRow.user_id,
-        fare: `ETB ${rideSoloRow.price}`,
-        destinationName: rideSoloRow.destination_name,
-        pickupCoords: { latitude: parseFloat(rideSoloRow.pickup_lat), longitude: parseFloat(rideSoloRow.pickup_lng) },
-        distanceKm: parseFloat(rideSoloRow.distance_km),
-        expiresInSeconds: 20
-      });
-    }
-  });
+  console.log(`📡 Emitting 'new_ride_offer' for Passenger #${newRide.user_id} (Ride #${newRide.id})`);
+  
+  // Broadcast matching your driver screen's socket listener
+  io.emit("new_ride_offer", offerPayload);
 }
-
 
 
 // Cancel active solo/standard ride request with strict user verification
@@ -4802,136 +4728,119 @@ app.get('/api/drivers/nearby', async (req, res) => {
   }
 });
 
-// driver acceptes broadcast and sets ride_request_solo status to accepted
-app.post('/api/rides/solo/accept', async (req, res) => {
-  const { ride_id, driver_id, vehicle_id } = req.body;
-
-  if (!ride_id || !driver_id) {
-    return res.status(400).json({ success: false, message: 'Missing ride_id or driver_id' });
-  }
-
-  try {
-    // Atomic update: only updates if status is STILL 'pending'
-    const updateQuery = `
-      UPDATE ride_request_solo
-      SET 
-        driver_id = $1,
-        vehicle_id = $2,
-        status = 'accepted',
-        updated_at = NOW()
-      WHERE id = $3 AND status = 'pending'
-      RETURNING *;
-    `;
-
-    const result = await pool.query(updateQuery, [driver_id, vehicle_id || null, ride_id]);
-
-    // Race condition lost: Another driver accepted first or user canceled
-    if (result.rowCount === 0) {
-      return res.status(409).json({
-        success: false,
-        message: 'Ride request was already accepted by another driver or canceled.'
-      });
-    }
-
-    const acceptedRide = result.rows[0];
-
-    // 1. Notify Passenger that a driver is on the way
-    io.to(`user_${acceptedRide.user_id}`).emit('ride_accepted', {
-      rideId: acceptedRide.id,
-      driverId: acceptedRide.driver_id,
-      status: acceptedRide.status,
-      timestamp: acceptedRide.updated_at
-    });
-
-    // 2. Retract offer modal from all other active driver screens
-    io.emit('offer_retracted', { rideId: acceptedRide.id });
-
-    return res.status(200).json({
-      success: true,
-      message: 'Ride successfully assigned.',
-      ride: acceptedRide
-    });
-
-  } catch (err) {
-    console.error("❌ Error assigning driver:", err.message);
-    return res.status(500).json({ success: false, message: 'Server error during driver assignment.' });
-  }
-});
-
-
-
 // ------------------------------------------------------------------
 // DISPATCH ENDPOINT & HELPERS
 // ------------------------------------------------------------------
 
-// Driver accepts broadcast and sets ride_request_solo status to accepted
-app.post('/api/rides/solo/accept', async (req, res) => {
-  // 1. Extract driver_id from payload
-  const driver_id = req.body?.driver_id || req.body?.driverId;
+app.post('/api/rides/solo/create', async (req, res) => {
+  const {
+    user_id,
+    pickup_lat,
+    pickup_lng,
+    destination_lat,
+    destination_lng,
+    destination_name,
+    destination_address,
+    estimated_price,
+    distance_km
+  } = req.body || {};
 
-  // 2. Validate strictly driver_id (DO NOT check for ride_id)
-  if (!driver_id) {
+  if (!user_id || !pickup_lat || !pickup_lng || !destination_lat || !destination_lng) {
     return res.status(400).json({ 
       success: false, 
-      message: 'Missing required parameter: driver_id' 
+      message: 'Missing required location or user parameters.' 
     });
   }
 
   try {
-    // 3. Auto-resolve vehicle_id for driver 33 from vehicles table
-    const vehicleResult = await pool.query(
-      `SELECT id FROM vehicles WHERE driver_id = $1 LIMIT 1`,
-      [driver_id]
-    );
-    const vehicle_id = vehicleResult.rows[0]?.id || null;
-
-    // 4. Atomically grab and lock the active pending ride request
-    const updateQuery = `
-      UPDATE ride_request_solo
-      SET 
-        driver_id = $1,
-        vehicle_id = $2,
-        status = 'accepted',
-        updated_at = NOW()
-      WHERE id = (
-        SELECT id FROM ride_request_solo 
-        WHERE status = 'pending' 
-        ORDER BY created_at DESC 
-        LIMIT 1
-      ) AND status = 'pending'
-      RETURNING *;
+    const existingQuery = `
+      SELECT * FROM ride_request_solo 
+      WHERE user_id = $1 AND status IN ('pending', 'accepted', 'in_progress')
+      ORDER BY created_at DESC 
+      LIMIT 1;
     `;
+    const existingResult = await pool.query(existingQuery, [user_id]);
 
-    const result = await pool.query(updateQuery, [driver_id, vehicle_id]);
+    if (existingResult.rows.length > 0) {
+      const activeRide = existingResult.rows[0];
 
-    if (result.rowCount === 0) {
-      return res.status(409).json({
-        success: false,
-        message: 'No pending ride request available or offer was already claimed.'
+      return res.status(200).json({
+        success: true,
+        message: `Active ride request (${activeRide.status}) already exists.`,
+        ride_id: activeRide.id, // 👈 Explicit top-level ride_id
+        ride: activeRide,
+        resolvedHubId: activeRide.hub_id,
+        isExisting: true
       });
     }
 
-    const acceptedRide = result.rows[0];
+    const hubQuery = `
+      SELECT id,
+      ( 6371 * acos( cos( radians($1) ) * cos( radians(latitude) ) * cos( radians(longitude) - radians($2) ) + sin( radians($1) ) * sin( radians(latitude) ) ) ) AS distance
+      FROM hubs
+      ORDER BY distance ASC
+      LIMIT 1;
+    `;
+    const hubResult = await pool.query(hubQuery, [pickup_lat, pickup_lng]);
+    const resolvedHubId = hubResult.rows.length > 0 ? hubResult.rows[0].id : null;
 
-    // 5. Emit socket notifications
-    notifyPassengerRideAccepted(acceptedRide.user_id, acceptedRide);
-    retractOfferFromDrivers(acceptedRide.id);
+    const insertQuery = `
+      INSERT INTO ride_request_solo (
+        user_id,
+        pickup_lat,
+        pickup_lng,
+        destination_lat,
+        destination_lng,
+        destination_name,
+        destination_address,
+        price,
+        distance_km,
+        hub_id,
+        status,
+        created_at,
+        updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', NOW(), NOW())
+      RETURNING *;
+    `;
 
-    return res.status(200).json({
+    const values = [
+      user_id,
+      pickup_lat,
+      pickup_lng,
+      destination_lat,
+      destination_lng,
+      destination_name || 'Destination',
+      destination_address || '',
+      estimated_price || 0,
+      distance_km || 0,
+      resolvedHubId
+    ];
+
+    const result = await pool.query(insertQuery, values);
+    const newRide = result.rows[0];
+
+    if (typeof dispatchSoloRequestToDrivers === 'function') {
+      dispatchSoloRequestToDrivers(newRide);
+    }
+
+    return res.status(201).json({
       success: true,
-      message: 'Ride successfully assigned.',
-      ride: acceptedRide
+      message: 'Solo ride request created successfully.',
+      ride_id: newRide.id, // 👈 Explicit top-level ride_id
+      ride: newRide,
+      resolvedHubId: resolvedHubId,
+      isExisting: false
     });
 
   } catch (err) {
-    console.error("❌ Error during ride assignment:", err.message);
+    console.error("❌ Error creating solo ride request:", err.message);
     return res.status(500).json({ 
       success: false, 
-      message: 'Server error during driver assignment.' 
+      message: 'Server error while dispatching solo ride request.',
+      error: err.message
     });
   }
 });
-
 
 // Broadcast Solo Request to nearby drivers in STANDARD mode
 function dispatchSoloRequestToDrivers(rideSoloRow) {
@@ -4982,6 +4891,235 @@ function notifyPassengerRideAccepted(userId, rideData) {
     });
   }
 }
+
+
+// ----------------------------------------------------
+// 1. ACCEPT SOLO RIDE ROUTE (HTTP POST)
+// ----------------------------------------------------
+app.post('/api/rides/solo/accept', async (req, res) => {
+  const { ride_id, user_id, driver_id, vehicle_id } = req.body || {};
+
+  if (!driver_id || (!ride_id && !user_id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Missing parameters: driver_id and either ride_id or user_id required.'
+    });
+  }
+
+  try {
+    const updateQuery = ride_id
+      ? `UPDATE ride_request_solo SET driver_id = $1, vehicle_id = $2, status = 'accepted', updated_at = NOW() WHERE id = $3 AND status = 'pending' RETURNING *;`
+      : `UPDATE ride_request_solo SET driver_id = $1, vehicle_id = $2, status = 'accepted', updated_at = NOW() WHERE user_id = $3 AND status = 'pending' RETURNING *;`;
+
+    const targetId = ride_id || user_id;
+    const values = [driver_id, vehicle_id || null, targetId];
+    const result = await pool.query(updateQuery, values);
+
+    if (!result.rows || result.rows.length === 0) {
+      const checkQuery = ride_id
+        ? `SELECT status FROM ride_request_solo WHERE id = $1;`
+        : `SELECT status FROM ride_request_solo WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1;`;
+        
+      const checkResult = await pool.query(checkQuery, [targetId]);
+      
+      if (!checkResult.rows || checkResult.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Ride request not found.' });
+      }
+
+      return res.status(409).json({
+        success: false,
+        message: `Ride is no longer available (current status: ${checkResult.rows[0].status}).`
+      });
+    }
+
+    const acceptedRide = result.rows[0];
+
+    // Fetch Passenger details
+    let passenger = null;
+    if (acceptedRide?.user_id) {
+      try {
+        const userResult = await pool.query(
+          `SELECT id, full_name, phone_number FROM users WHERE id = $1;`, 
+          [acceptedRide.user_id]
+        );
+        passenger = userResult.rows?.[0] || { id: acceptedRide.user_id, full_name: 'Passenger', phone_number: '' };
+      } catch (userErr) {
+        console.warn("⚠️ Could not query user details:", userErr.message);
+        passenger = { id: acceptedRide.user_id, full_name: 'Passenger', phone_number: '' };
+      }
+    }
+
+    // Exact payload shape used in server.js
+    const payload = {
+      rideId: acceptedRide.id,
+      ride_id: acceptedRide.id,
+      driverId: driver_id,
+      driver_id: driver_id,
+      passengerId: acceptedRide.user_id,
+      user_id: acceptedRide.user_id,
+      status: "accepted",
+      timestamp: new Date().toISOString(),
+      ride: acceptedRide,
+      passenger: passenger
+    };
+
+    // Broadcast via Socket.io matching server.js room targeting
+    const ioServer = req.io || global.io;
+    if (ioServer) {
+      ioServer.to(`ride_${acceptedRide.id}`).emit("solo_ride_accepted", payload);
+      ioServer.to(`ride_${acceptedRide.id}`).emit("solo_ride_status_updated", payload);
+
+      if (acceptedRide.user_id) {
+        ioServer.to(`user_${acceptedRide.user_id}`).emit("solo_ride_accepted", payload);
+        ioServer.to(`user_${acceptedRide.user_id}`).emit("solo_ride_status_updated", payload);
+      }
+      console.log(`✅ Driver ${driver_id} accepted solo ride ${acceptedRide.id} via HTTP -> Broadcasted to passenger ${acceptedRide.user_id}`);
+    } else {
+      console.warn("⚠️ Socket server instance (req.io or global.io) not attached!");
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Ride request accepted successfully.',
+      ride_id: acceptedRide.id,
+      ride: acceptedRide,
+      passenger
+    });
+
+  } catch (err) {
+    console.error("❌ Error accepting solo ride:", err.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error while accepting ride request.',
+      error: err.message
+    });
+  }
+});
+
+// ----------------------------------------------------
+// 2. DRIVER ARRIVED ROUTE (HTTP POST)
+// ----------------------------------------------------
+app.post('/api/rides/solo/arrived', async (req, res) => {
+  const { ride_id, driver_id } = req.body || {};
+
+  if (!driver_id) {
+    return res.status(400).json({
+      success: false,
+      message: 'Missing required parameter: driver_id.'
+    });
+  }
+
+  try {
+    const updateQuery = ride_id
+      ? `UPDATE ride_request_solo SET status = 'arrived', updated_at = NOW() WHERE id = $1 AND driver_id = $2 AND status = 'accepted' RETURNING *;`
+      : `UPDATE ride_request_solo SET status = 'arrived', updated_at = NOW() WHERE driver_id = $1 AND status = 'accepted' RETURNING *;`;
+
+    const values = ride_id ? [ride_id, driver_id] : [driver_id];
+    const result = await pool.query(updateQuery, values);
+
+    if (!result.rows || result.rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot mark as arrived. Active accepted ride not found.'
+      });
+    }
+
+    const updatedRide = result.rows[0];
+
+    // Exact payload shape used in server.js
+    const payload = {
+      rideId: updatedRide.id,
+      ride_id: updatedRide.id,
+      driverId: driver_id,
+      driver_id: driver_id,
+      passengerId: updatedRide.user_id,
+      user_id: updatedRide.user_id,
+      status: "arrived",
+      timestamp: new Date().toISOString(),
+      ride: updatedRide
+    };
+
+    // Broadcast via Socket.io matching server.js room targeting
+    const ioServer = req.io || global.io;
+    if (ioServer) {
+      ioServer.to(`ride_${updatedRide.id}`).emit("driver_arrived", payload);
+      ioServer.to(`ride_${updatedRide.id}`).emit("solo_ride_status_updated", payload);
+
+      if (updatedRide.user_id) {
+        ioServer.to(`user_${updatedRide.user_id}`).emit("driver_arrived", payload);
+        ioServer.to(`user_${updatedRide.user_id}`).emit("solo_ride_status_updated", payload);
+      }
+      console.log(`📍 Driver ${driver_id} arrived for solo ride ${updatedRide.id} via HTTP -> Broadcasted to passenger ${updatedRide.user_id}`);
+    } else {
+      console.warn("⚠️ Socket server instance (req.io or global.io) not attached!");
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Passenger notified of arrival.',
+      ride_id: updatedRide.id,
+      ride: updatedRide
+    });
+
+  } catch (err) {
+    console.error("❌ Error setting arrived status:", err.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error updating arrival status.',
+      error: err.message
+    });
+  }
+});
+
+function notifyPassengerDriverArrived(updatedRide) {
+  if (!io) {
+    console.warn("⚠️ Socket.io server instance is not initialized.");
+    return;
+  }
+
+  const passengerId = updatedRide.user_id || updatedRide.passenger_id;
+  const rideId = updatedRide.id;
+
+  const payload = {
+    event: "driver_arrived",
+    message: "Your driver has arrived at the pickup point!",
+    ride_id: rideId,
+    ride: updatedRide,
+    timestamp: new Date().toISOString()
+  };
+
+  // 1. Target individual passenger user room
+  if (passengerId) {
+    io.to(`user_${passengerId}`).emit("driver_arrived", payload);
+    console.log(`📡 Broadcasted driver arrival to room: user_${passengerId}`);
+  }
+
+  // 2. Also emit to specific ride channel (if ride rooms are used)
+  io.to(`ride_${rideId}`).emit("driver_arrived", payload);
+}
+
+function notifyPassengerDriverAccepted(updatedRide) {
+  if (!io) return;
+
+  const passengerId = updatedRide.user_id || updatedRide.passenger_id;
+  const rideId = updatedRide.id;
+
+  const payload = {
+    event: "solo_ride_accepted",
+    message: "A driver has accepted your ride request!",
+    rideId: rideId,
+    driverId: updatedRide.driver_id,
+    status: "accepted",
+    ride: updatedRide,
+    timestamp: new Date().toISOString()
+  };
+
+  // Broadcast to ride room, falling back to personal user room
+  io.to(`ride_${rideId}`).to(`user_${passengerId}`).emit("solo_ride_accepted", payload);
+}
+
+
+
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
