@@ -5119,6 +5119,119 @@ function notifyPassengerDriverAccepted(updatedRide) {
 }
 
 
+// STANDARD TIRP IN PROGRESS FETCHING INFO
+
+
+/**
+ * 1. UPDATE RIDE STATUS TO 'in_trip'
+ * Called when the driver taps 'Start Trip' in DriverEnRoute screen
+ */
+app.patch('/api/rides/solo/status', async (req, res) => {
+  try {
+    const { ride_id, status } = req.body;
+
+    if (!ride_id || !status) {
+      return res.status(400).json({ success: false, message: "Missing ride_id or status." });
+    }
+
+    const query = `
+      UPDATE ride_request_solo 
+      SET status = $1, updated_at = NOW() 
+      WHERE id = $2 
+      RETURNING *
+    `;
+    const result = await pool.query(query, [status, ride_id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Ride request not found." });
+    }
+
+    res.json({ success: true, ride: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Error updating ride_request_solo status:", err);
+    res.status(500).json({ success: false, error: "Internal server error." });
+  }
+});
+
+app.get('/api/pricing/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const query = `SELECT * FROM pricing_configs WHERE id = $1 LIMIT 1`;
+    const result = await pool.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: `Pricing configuration not found for ID: ${id}` });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("❌ Error fetching pricing config:", err);
+    res.status(500).json({ error: "Internal server error while fetching pricing." });
+  }
+});
+
+
+/**
+ * 3. COMPLETE RIDE & FINALIZE METRICS
+ * Called when the driver taps 'Complete Trip' in DriverStandardTripInProgress
+ */
+app.post('/api/rides/solo/complete', async (req, res) => {
+  try {
+    const { 
+      ride_id, 
+      final_fare, 
+      platform_commission, 
+      driver_take_home, 
+      distance_km, 
+      duration_minutes 
+    } = req.body;
+
+    if (!ride_id) {
+      return res.status(400).json({ success: false, message: "Missing ride_id." });
+    }
+
+    // Update ride_request_solo with final price, distance, and status 'completed'
+    const updateQuery = `
+      UPDATE ride_request_solo 
+      SET 
+        status = 'completed', 
+        price = $1, 
+        distance_km = $2, 
+        updated_at = NOW() 
+      WHERE id = $3 
+      RETURNING *
+    `;
+    
+    const result = await pool.query(updateQuery, [final_fare, distance_km, ride_id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Ride request not found." });
+    }
+
+    const completedRide = result.rows[0];
+
+    res.json({
+      success: true,
+      message: "Trip completed successfully",
+      ride: completedRide,
+      financials: {
+        final_fare,
+        platform_commission,
+        driver_take_home,
+        distance_km,
+        duration_minutes
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ Error completing ride_request_solo:", err);
+    res.status(500).json({ success: false, error: "Internal server error while completing trip." });
+  }
+});
+
+
+
+
 
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
