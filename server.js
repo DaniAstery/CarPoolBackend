@@ -183,6 +183,58 @@ io.on("connection", (socket) => {
     }
   });
 
+
+// Handle incoming live GPS ping from the driver app
+  socket.on("update_driver_location", async (data) => {
+    const { driver_id, ride_id, user_id, latitude, longitude, heading } = data;
+
+    try {
+      // 1. Upsert coordinates directly into active_user_sessions table
+      await pool.query(
+        `INSERT INTO active_user_sessions (user_id, active_role, lat, lng, heading, status, last_ping_at)
+         VALUES ($1, 'driver', $2, $3, $4, 'online', NOW())
+         ON CONFLICT (user_id) 
+         DO UPDATE SET lat = EXCLUDED.lat, 
+                       lng = EXCLUDED.lng, 
+                       heading = EXCLUDED.heading, 
+                       status = 'online',
+                       last_ping_at = NOW();`,
+        [driver_id, latitude, longitude, heading || 0]
+      );
+
+      // 2. Broadcast live coordinates to the passenger room
+      const payload = { latitude, longitude, heading };
+      
+      if (ride_id) {
+        io.to(`ride_${ride_id}`).emit("driver_location_update", payload);
+      }
+      if (user_id) {
+        io.to(`user_${user_id}`).emit("driver_location_update", payload);
+      }
+
+    } catch (err) {
+      console.error("❌ Error updating active_user_sessions:", err.message);
+    }
+  });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   // 5. Automatic Cancellation on App Close or Disconnect
   socket.on("disconnect", async () => {
     console.log(`🔌 Client disconnected: ${socket.id}`);
@@ -4472,60 +4524,6 @@ app.get('/api/rides/details', async (req, res) => {
   }
 });
 
-
-app.post('/api/rides/estimate-fare', async (req, res) => {
-  try {
-    const { origin_lat, origin_lng, destination_lat, destination_lng } = req.body;
-
-    if (!origin_lat || !origin_lng || !destination_lat || !destination_lng) {
-      return res.status(400).json({ error: 'Origin and destination coordinates are required' });
-    }
-
-    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${origin_lat},${origin_lng}&destinations=${destination_lat},${destination_lng}&key=${GOOGLE_MAPS_API_KEY}`;
-    
-    const response = await axios.get(url);
-    const element = response.data.rows[0]?.elements[0];
-
-    if (!element || element.status !== 'OK') {
-      return res.status(400).json({ error: 'Could not calculate distance between locations' });
-    }
-
-    const distanceMeters = element.distance.value; 
-    const distanceKm = (distanceMeters / 1000).toFixed(1);
-    const durationText = element.duration.text;
-
-    // Standard KM Pricing Formula (Base Fare + Rate per KM)
-    const baseFare = 50; // ETB Base
-    const ratePerKm = 35; // ETB per KM
-    const estimatedPrice = Math.round(baseFare + (parseFloat(distanceKm) * ratePerKm));
-
-    return res.status(200).json({
-      success: true,
-      distanceKm: parseFloat(distanceKm),
-      durationText,
-      estimatedPrice,
-    });
-  } catch (error) {
-    console.error('Fare estimation error:', error.message);
-    return res.status(500).json({ error: 'Failed to calculate fare' });
-  }
-});
-
-// ==================================================================
-  // Helper Haversine distance calculator in kilometers
-// ==================================================================
-function calculateHaversine(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Earth radius in km
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a = 
-    Math.sin(dLat/2) * Math.sin(dLat/2) +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-    Math.sin(dLon/2) * Math.sin(dLon/2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  return R * c; 
-}
-
 app.post('/api/rides/estimate-fare', async (req, res) => {
   try {
     const { origin_lat, origin_lng, destination_lat, destination_lng } = req.body;
@@ -4534,10 +4532,28 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Missing coordinate parameters.' });
     }
 
-    // 1. Fetch active pricing rules dynamically from your dashboard configuration table
+    // 1. Calculate distance natively in PostgreSQL using PostGIS (Longitude, Latitude order)
+    const distQuery = `
+      SELECT (ST_Distance(
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+        ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography
+      ) / 1000.0) * 1.25 AS calculated_distance_km;
+    `;
+    
+    const distResult = await pool.query(distQuery, [
+      parseFloat(origin_lng), 
+      parseFloat(origin_lat), 
+      parseFloat(destination_lng), 
+      parseFloat(destination_lat)
+    ]);
+
+    const rawDist = parseFloat(distResult.rows[0]?.calculated_distance_km || 1.0);
+    const distanceKm = Math.max(1, Math.round(rawDist * 10) / 10);
+
+    // 2. Fetch active pricing rules from pricing_configs (ID 1 for Addis Ababa)
     let pricingConfig = {
-      base_flag_down: 105.00,
-      rate_per_km: 15.50,
+      base_flag_down: 95.00,
+      rate_per_km: 16.00,
       rate_per_minute: 1.50,
       minimum_fare: 120.00,
       fuel_multiplier: 1.00,
@@ -4546,7 +4562,7 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
 
     try {
       const dbResult = await pool.query(
-        "SELECT * FROM pricing_configs WHERE city_code = 'ADDIS_ABABA' AND is_active = TRUE LIMIT 1"
+        "SELECT * FROM pricing_configs WHERE id = 1 LIMIT 1"
       );
       if (dbResult.rows.length > 0) {
         pricingConfig = dbResult.rows[0];
@@ -4555,17 +4571,10 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
       console.warn("⚠️ Failed to load pricing config from DB, using fallback defaults:", dbErr.message);
     }
 
-    // 2. Calculate distance in KM (Applying a 1.25 road-network detour factor for Addis streets)
-    const rawDistanceKm = calculateHaversine(
-      parseFloat(origin_lat), parseFloat(origin_lng),
-      parseFloat(destination_lat), parseFloat(destination_lng)
-    );
-    const distanceKm = Math.max(1, Math.round((rawDistanceKm * 1.25) * 10) / 10);
-
     // 3. Estimate duration based on city traffic speed (~3.5 mins per km)
     const estimatedMinutes = Math.round(distanceKm * 3.5);
 
-    // 4. Compute formula with Fuel and Surge multipliers applied dynamically
+    // 4. Compute formula matching the exact driver-side calculation logic
     const baseFee = parseFloat(pricingConfig.base_flag_down);
     const kmRate = parseFloat(pricingConfig.rate_per_km);
     const minRate = parseFloat(pricingConfig.rate_per_minute);
@@ -4575,7 +4584,7 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
 
     let calculatedPrice = (baseFee + (distanceKm * kmRate) + (estimatedMinutes * minRate)) * fuelMult * surgeMult;
 
-    // 5. Enforce floor minimum fare constraint
+    // 5. Enforce floor minimum fare constraint (120 ETB)
     if (calculatedPrice < minFare) {
       calculatedPrice = minFare;
     }
@@ -4598,6 +4607,17 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
     return res.status(500).json({ success: false, message: 'Server error calculating fare.' });
   }
 });
+
+
+
+
+
+
+
+
+
+
+
 
 function dispatchSoloRequestToDrivers(newRide) {
   if (!io) return;
@@ -4735,14 +4755,13 @@ app.get('/api/drivers/nearby', async (req, res) => {
 app.post('/api/rides/solo/create', async (req, res) => {
   const {
     user_id,
+    hub_id,
     pickup_lat,
     pickup_lng,
     destination_lat,
     destination_lng,
     destination_name,
-    destination_address,
-    estimated_price,
-    distance_km
+    destination_address
   } = req.body || {};
 
   if (!user_id || !pickup_lat || !pickup_lng || !destination_lat || !destination_lng) {
@@ -4753,6 +4772,7 @@ app.post('/api/rides/solo/create', async (req, res) => {
   }
 
   try {
+    // 1. Check if user already has an active ride request
     const existingQuery = `
       SELECT * FROM ride_request_solo 
       WHERE user_id = $1 AND status IN ('pending', 'accepted', 'in_progress')
@@ -4767,23 +4787,83 @@ app.post('/api/rides/solo/create', async (req, res) => {
       return res.status(200).json({
         success: true,
         message: `Active ride request (${activeRide.status}) already exists.`,
-        ride_id: activeRide.id, // 👈 Explicit top-level ride_id
+        ride_id: activeRide.id,
         ride: activeRide,
         resolvedHubId: activeRide.hub_id,
         isExisting: true
       });
     }
 
-    const hubQuery = `
-      SELECT id,
-      ( 6371 * acos( cos( radians($1) ) * cos( radians(latitude) ) * cos( radians(longitude) - radians($2) ) + sin( radians($1) ) * sin( radians(latitude) ) ) ) AS distance
-      FROM hubs
-      ORDER BY distance ASC
-      LIMIT 1;
+    // 2. Calculate distance server-side using PostGIS (with 1.25 Addis road detour factor)
+    const distQuery = `
+      SELECT (ST_Distance(
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+        ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography
+      ) / 1000.0) * 1.25 AS calculated_distance_km;
     `;
-    const hubResult = await pool.query(hubQuery, [pickup_lat, pickup_lng]);
-    const resolvedHubId = hubResult.rows.length > 0 ? hubResult.rows[0].id : null;
+    
+    const distResult = await pool.query(distQuery, [
+      parseFloat(pickup_lng), 
+      parseFloat(pickup_lat), 
+      parseFloat(destination_lng), 
+      parseFloat(destination_lat)
+    ]);
 
+    const rawDist = parseFloat(distResult.rows[0]?.calculated_distance_km || 1.0);
+    const distance_km = Math.max(1, Math.round(rawDist * 10) / 10);
+
+    // 3. Fetch active pricing configuration dynamically from pricing_configs table
+    let pricingConfig = {
+      base_flag_down: 95.00,
+      rate_per_km: 16.00,
+      rate_per_minute: 1.50,
+      minimum_fare: 120.00,
+      fuel_multiplier: 1.00,
+      surge_multiplier: 1.00
+    };
+
+    try {
+      const dbResult = await pool.query(
+        "SELECT base_flag_down, rate_per_km, rate_per_minute, minimum_fare, fuel_multiplier, surge_multiplier FROM pricing_configs WHERE city_code = 'ADDIS_ABABA' AND is_active = TRUE LIMIT 1"
+      );
+      if (dbResult.rows.length > 0) {
+        pricingConfig = dbResult.rows[0];
+      }
+    } catch (dbErr) {
+      console.warn("⚠️ Failed to load pricing config from DB, using fallback defaults:", dbErr.message);
+    }
+
+    // 4. Compute exact price server-side
+    const estimatedMinutes = Math.round(distance_km * 3.5);
+    const baseFee = parseFloat(pricingConfig.base_flag_down);
+    const kmRate = parseFloat(pricingConfig.rate_per_km);
+    const minRate = parseFloat(pricingConfig.rate_per_minute);
+    const fuelMult = parseFloat(pricingConfig.fuel_multiplier);
+    const surgeMult = parseFloat(pricingConfig.surge_multiplier);
+    const minFare = parseFloat(pricingConfig.minimum_fare);
+
+    let calculatedPrice = (baseFee + (distance_km * kmRate) + (estimatedMinutes * minRate)) * fuelMult * surgeMult;
+
+    if (calculatedPrice < minFare) {
+      calculatedPrice = minFare;
+    }
+    const price = Math.round(calculatedPrice);
+
+    // 5. Resolve Hub ID (Use passed hub_id or find nearest if missing)
+    let resolvedHubId = hub_id;
+    if (!resolvedHubId) {
+      const hubQuery = `
+        SELECT id,
+        ( 6371 * acos( cos( radians($1) ) * cos( radians(latitude) ) * cos( radians(longitude) - radians($2) ) + sin( radians($1) ) * sin( radians(latitude) ) ) ) AS distance
+        FROM hubs
+        ORDER BY distance ASC
+        LIMIT 1;
+      `;
+      const hubResult = await pool.query(hubQuery, [pickup_lat, pickup_lng]);
+      resolvedHubId = hubResult.rows.length > 0 ? hubResult.rows[0].id : null;
+    }
+
+    // 6. Insert into ride_request_solo using server-computed price and distance
     const insertQuery = `
       INSERT INTO ride_request_solo (
         user_id,
@@ -4811,8 +4891,8 @@ app.post('/api/rides/solo/create', async (req, res) => {
       destination_lng,
       destination_name || 'Destination',
       destination_address || '',
-      estimated_price || 0,
-      distance_km || 0,
+      price,
+      distance_km,
       resolvedHubId
     ];
 
@@ -4826,7 +4906,7 @@ app.post('/api/rides/solo/create', async (req, res) => {
     return res.status(201).json({
       success: true,
       message: 'Solo ride request created successfully.',
-      ride_id: newRide.id, // 👈 Explicit top-level ride_id
+      ride_id: newRide.id,
       ride: newRide,
       resolvedHubId: resolvedHubId,
       isExisting: false
@@ -4841,6 +4921,7 @@ app.post('/api/rides/solo/create', async (req, res) => {
     });
   }
 });
+
 
 // Broadcast Solo Request to nearby drivers in STANDARD mode
 function dispatchSoloRequestToDrivers(rideSoloRow) {
@@ -4894,36 +4975,68 @@ function notifyPassengerRideAccepted(userId, rideData) {
 
 
 // ----------------------------------------------------
-// 1. ACCEPT SOLO RIDE ROUTE (HTTP POST)
+// 1. ACCEPT SOLO RIDE ROUTE 
 // ----------------------------------------------------
 app.post('/api/rides/solo/accept', async (req, res) => {
-  const { ride_id, user_id, driver_id, vehicle_id } = req.body || {};
+  const { user_id, driver_id } = req.body || {};
 
-  if (!driver_id || (!ride_id && !user_id)) {
+  // Validation: Only require driver_id and user_id
+  if (!driver_id || !user_id) {
     return res.status(400).json({
       success: false,
-      message: 'Missing parameters: driver_id and either ride_id or user_id required.'
+      message: 'Missing required parameters: driver_id and user_id are required.'
     });
   }
 
   try {
-    const updateQuery = ride_id
-      ? `UPDATE ride_request_solo SET driver_id = $1, vehicle_id = $2, status = 'accepted', updated_at = NOW() WHERE id = $3 AND status = 'pending' RETURNING *;`
-      : `UPDATE ride_request_solo SET driver_id = $1, vehicle_id = $2, status = 'accepted', updated_at = NOW() WHERE user_id = $3 AND status = 'pending' RETURNING *;`;
+    // Optional: Automatically fetch the vehicle assigned to this driver
+    let vehicleId = null;
+    try {
+      const driverRes = await pool.query(
+        `SELECT vehicle_id FROM drivers WHERE id = $1;`, 
+        [driver_id]
+      );
+      if (driverRes.rows.length > 0) {
+        vehicleId = driverRes.rows[0].vehicle_id;
+      }
+    } catch (driverErr) {
+      console.warn("⚠️ Could not auto-fetch driver vehicle:", driverErr.message);
+    }
 
-    const targetId = ride_id || user_id;
-    const values = [driver_id, vehicle_id || null, targetId];
+    // Atomically find and update the latest pending ride for this user
+    const updateQuery = `
+      WITH target_ride AS (
+        SELECT id FROM ride_request_solo 
+        WHERE user_id = $1 
+          AND status = 'pending'
+        ORDER BY created_at DESC 
+        LIMIT 1
+      )
+      UPDATE ride_request_solo 
+      SET driver_id = $2, 
+          vehicle_id = $3, 
+          status = 'accepted', 
+          updated_at = NOW() 
+      FROM target_ride 
+      WHERE ride_request_solo.id = target_ride.id 
+      RETURNING ride_request_solo.*;
+    `;
+
+    const values = [user_id, driver_id, vehicleId];
     const result = await pool.query(updateQuery, values);
 
+    // If no row was updated, check why
     if (!result.rows || result.rows.length === 0) {
-      const checkQuery = ride_id
-        ? `SELECT status FROM ride_request_solo WHERE id = $1;`
-        : `SELECT status FROM ride_request_solo WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1;`;
-        
-      const checkResult = await pool.query(checkQuery, [targetId]);
+      const checkQuery = `
+        SELECT status FROM ride_request_solo 
+        WHERE user_id = $1 
+        ORDER BY created_at DESC 
+        LIMIT 1;
+      `;
+      const checkResult = await pool.query(checkQuery, [user_id]);
       
       if (!checkResult.rows || checkResult.rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'Ride request not found.' });
+        return res.status(404).json({ success: false, message: 'No ride requests found for this user.' });
       }
 
       return res.status(409).json({
@@ -4936,20 +5049,18 @@ app.post('/api/rides/solo/accept', async (req, res) => {
 
     // Fetch Passenger details
     let passenger = null;
-    if (acceptedRide?.user_id) {
-      try {
-        const userResult = await pool.query(
-          `SELECT id, full_name, phone_number FROM users WHERE id = $1;`, 
-          [acceptedRide.user_id]
-        );
-        passenger = userResult.rows?.[0] || { id: acceptedRide.user_id, full_name: 'Passenger', phone_number: '' };
-      } catch (userErr) {
-        console.warn("⚠️ Could not query user details:", userErr.message);
-        passenger = { id: acceptedRide.user_id, full_name: 'Passenger', phone_number: '' };
-      }
+    try {
+      const userResult = await pool.query(
+        `SELECT id, full_name, phone_number FROM users WHERE id = $1;`, 
+        [acceptedRide.user_id]
+      );
+      passenger = userResult.rows?.[0] || { id: acceptedRide.user_id, full_name: 'Passenger', phone_number: '' };
+    } catch (userErr) {
+      console.warn("⚠️ Could not query user details:", userErr.message);
+      passenger = { id: acceptedRide.user_id, full_name: 'Passenger', phone_number: '' };
     }
 
-    // Exact payload shape used in server.js
+    // Payload broadcast structure
     const payload = {
       rideId: acceptedRide.id,
       ride_id: acceptedRide.id,
@@ -4963,19 +5074,16 @@ app.post('/api/rides/solo/accept', async (req, res) => {
       passenger: passenger
     };
 
-    // Broadcast via Socket.io matching server.js room targeting
+    // Broadcast via Socket.io
     const ioServer = req.io || global.io;
     if (ioServer) {
       ioServer.to(`ride_${acceptedRide.id}`).emit("solo_ride_accepted", payload);
       ioServer.to(`ride_${acceptedRide.id}`).emit("solo_ride_status_updated", payload);
-
-      if (acceptedRide.user_id) {
-        ioServer.to(`user_${acceptedRide.user_id}`).emit("solo_ride_accepted", payload);
-        ioServer.to(`user_${acceptedRide.user_id}`).emit("solo_ride_status_updated", payload);
-      }
-      console.log(`✅ Driver ${driver_id} accepted solo ride ${acceptedRide.id} via HTTP -> Broadcasted to passenger ${acceptedRide.user_id}`);
+      ioServer.to(`user_${acceptedRide.user_id}`).emit("solo_ride_accepted", payload);
+      ioServer.to(`user_${acceptedRide.user_id}`).emit("solo_ride_status_updated", payload);
+      console.log(`✅ Driver ${driver_id} accepted user ${user_id}'s pending ride via HTTP`);
     } else {
-      console.warn("⚠️ Socket server instance (req.io or global.io) not attached!");
+      console.warn("⚠️ Socket server instance not attached!");
     }
 
     return res.status(200).json({
@@ -4987,7 +5095,7 @@ app.post('/api/rides/solo/accept', async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Error accepting solo ride:", err.message);
+    console.error("❌ Error accepting solo ride by user_id:", err.message);
     return res.status(500).json({
       success: false,
       message: 'Server error while accepting ride request.',
@@ -5176,56 +5284,164 @@ app.get('/api/pricing/:id', async (req, res) => {
  * Called when the driver taps 'Complete Trip' in DriverStandardTripInProgress
  */
 app.post('/api/rides/solo/complete', async (req, res) => {
-  try {
-    const { 
-      ride_id, 
-      final_fare, 
-      platform_commission, 
-      driver_take_home, 
-      distance_km, 
-      duration_minutes 
-    } = req.body;
+  const { ride_id, actual_distance_km, elapsed_minutes } = req.body || {};
 
-    if (!ride_id) {
-      return res.status(400).json({ success: false, message: "Missing ride_id." });
+  if (!ride_id) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Missing ride_id parameter.' 
+    });
+  }
+
+  try {
+    // 1. Fetch the ride request
+    const rideResult = await pool.query(
+      "SELECT * FROM ride_request_solo WHERE id = $1 LIMIT 1",
+      [ride_id]
+    );
+
+    if (rideResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Ride request not found.' });
     }
 
-    // Update ride_request_solo with final price, distance, and status 'completed'
+    const ride = rideResult.rows[0];
+
+    // 2. Fetch active pricing configuration from database
+    const pricingResult = await pool.query(
+      "SELECT base_flag_down, rate_per_km, rate_per_minute, minimum_fare, fuel_multiplier, surge_multiplier, platform_commission_rate FROM pricing_configs WHERE city_code = 'ADDIS_ABABA' AND is_active = TRUE LIMIT 1"
+    );
+
+    if (pricingResult.rows.length === 0) {
+      return res.status(500).json({ success: false, message: 'Active pricing configuration not found.' });
+    }
+
+    const config = pricingResult.rows[0];
+
+    // 3. Use actual metrics passed from driver app (or fallback to ride record values)
+    const finalDist = parseFloat(actual_distance_km !== undefined ? actual_distance_km : ride.distance_km);
+    const finalMins = parseInt(elapsed_minutes !== undefined ? elapsed_minutes : Math.round(finalDist * 3.5), 10);
+
+    const baseFee = parseFloat(config.base_flag_down);
+    const kmRate = parseFloat(config.rate_per_km);
+    const minRate = parseFloat(config.rate_per_minute);
+    const fuelMult = parseFloat(config.fuel_multiplier);
+    const surgeMult = parseFloat(config.surge_multiplier);
+    const minFare = parseFloat(config.minimum_fare);
+    const commissionRate = parseFloat(config.platform_commission_rate || 0.05);
+
+    // 4. Compute metered fare formula
+    let calculatedPrice = (baseFee + (finalDist * kmRate) + (finalMins * minRate)) * fuelMult * surgeMult;
+
+    // Enforce minimum fare floor
+    if (calculatedPrice < minFare) {
+      calculatedPrice = minFare;
+    }
+    const finalPrice = Math.round(calculatedPrice);
+
+    // 5. Calculate platform fee and driver net payout
+    const platformFee = Math.round(finalPrice * commissionRate);
+    const driverNet = finalPrice - platformFee;
+
+    // 6. Update ride status in database to completed
     const updateQuery = `
       UPDATE ride_request_solo 
-      SET 
-        status = 'completed', 
-        price = $1, 
-        distance_km = $2, 
-        updated_at = NOW() 
+      SET status = 'completed', 
+          price = $1, 
+          distance_km = $2, 
+          updated_at = NOW() 
       WHERE id = $3 
-      RETURNING *
+      RETURNING *;
     `;
-    
-    const result = await pool.query(updateQuery, [final_fare, distance_km, ride_id]);
+    const updateResult = await pool.query(updateQuery, [finalPrice, finalDist, ride_id]);
+    const completedRide = updateResult.rows[0];
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Ride request not found." });
-    }
-
-    const completedRide = result.rows[0];
-
-    res.json({
+    return res.status(200).json({
       success: true,
-      message: "Trip completed successfully",
+      message: 'Ride completed successfully.',
       ride: completedRide,
-      financials: {
-        final_fare,
-        platform_commission,
-        driver_take_home,
-        distance_km,
-        duration_minutes
+      fare_breakdown: {
+        total_fare: finalPrice,
+        actual_distance_km: finalDist,
+        elapsed_minutes: finalMins,
+        platform_fee: platformFee,
+        driver_net_payout: driverNet
       }
     });
 
   } catch (err) {
-    console.error("❌ Error completing ride_request_solo:", err);
-    res.status(500).json({ success: false, error: "Internal server error while completing trip." });
+    console.error("❌ Error completing ride:", err.message);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Server error while completing ride.',
+      error: err.message
+    });
+  }
+});
+
+// Passenger needs to know the drivers location while waiting for accepted standard 
+app.get('/api/rides/:rideId/driver-location', async (req, res) => {
+  const { rideId } = req.params;
+  try {
+    const query = `
+      SELECT r.driver_id, s.lat, s.lng, s.heading, s.last_ping_at
+      FROM ride_request_solo r
+      JOIN active_user_sessions s ON r.driver_id = s.user_id
+      WHERE r.id = $1;
+    `;
+    const result = await pool.query(query, [rideId]);
+    
+    if (result.rows.length === 0 || !result.rows[0].lat) {
+      return res.status(404).json({ success: false, message: "Driver location not active yet." });
+    }
+
+    return res.json({ success: true, location: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Error fetching initial driver location:", err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+
+// POSTMAN TEST ROUTE: Simulate driver movement
+app.post('/api/test/simulate-driver', async (req, res) => {
+  const { driver_id, ride_id, user_id, latitude, longitude, heading } = req.body;
+
+  try {
+    const lat = latitude || 9.0105;
+    const lng = longitude || 38.7613;
+    const hdg = heading || 45.0;
+    const dId = driver_id || 33;
+    const rId = ride_id || 1;
+    const uId = user_id || 27;
+
+    // 1. Upsert into active_user_sessions table
+    await pool.query(
+      `INSERT INTO active_user_sessions (user_id, active_role, lat, lng, heading, status, last_ping_at)
+       VALUES ($1, 'driver', $2, $3, $4, 'online', NOW())
+       ON CONFLICT (user_id) 
+       DO UPDATE SET lat = EXCLUDED.lat, 
+                     lng = EXCLUDED.lng, 
+                     heading = EXCLUDED.heading, 
+                     status = 'online',
+                     last_ping_at = NOW();`,
+      [dId, lat, lng, hdg]
+    );
+
+    // 2. Broadcast via Socket.io to the passenger room
+    const payload = { latitude: lat, longitude: lng, heading: hdg };
+    io.to(`ride_${rId}`).emit("driver_location_update", payload);
+    io.to(`user_${uId}`).emit("driver_location_update", payload);
+
+    return res.json({ 
+      success: true, 
+      message: `Simulated driver movement sent for ride #${rId}`,
+      coords: { lat, lng, heading: hdg }
+    });
+
+  } catch (err) {
+    console.error("❌ Simulation error:", err.message);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
