@@ -4624,16 +4624,6 @@ app.post('/api/rides/estimate-fare', async (req, res) => {
 });
 
 
-
-
-
-
-
-
-
-
-
-
 function dispatchSoloRequestToDrivers(newRide) {
   if (!io) return;
 
@@ -5391,6 +5381,34 @@ app.post('/api/rides/solo/complete', async (req, res) => {
     const updateResult = await pool.query(updateQuery, [finalPrice, finalDist, ride_id]);
     const completedRide = updateResult.rows[0];
 
+    // 🚀 7. SOCKET.IO REAL-TIME BROADCAST INTEGRATION
+    const io = req.io;
+    if (io) {
+      const payload = {
+        rideId: completedRide.id,
+        ride_id: completedRide.id,
+        status: "completed",
+        price: completedRide.price,
+        distance_km: completedRide.distance_km,
+        destination_name: completedRide.destination_name,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Broadcast to the ride monitoring room
+      io.to(`ride_${ride_id}`).emit("trip_completed", payload);
+      io.to(`ride_${ride_id}`).emit("ride_status_changed", payload);
+      io.to(`ride_${ride_id}`).emit("solo_ride_status_updated", payload);
+
+      // Broadcast directly to the passenger's personal channel
+      if (completedRide.user_id) {
+        io.to(`user_${completedRide.user_id}`).emit("trip_completed", payload);
+        io.to(`user_${completedRide.user_id}`).emit("ride_status_changed", payload);
+        io.to(`user_${completedRide.user_id}`).emit("solo_ride_status_updated", payload);
+      }
+      
+      console.log(`🏁 Solo ride #${ride_id} marked completed and broadcasted via socket.`);
+    }
+
     return res.status(200).json({
       success: true,
       message: 'Ride completed successfully.',
@@ -5436,6 +5454,74 @@ app.get('/api/rides/:rideId/driver-location', async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// driver payment details and other info when passenger completes standard trip 
+
+app.get('/api/rides/:id', async (req, res) => {
+  const { id } = req.params;
+
+  if (!id) {
+    return res.status(400).json({ success: false, message: "Missing ride id parameter." });
+  }
+
+  try {
+    const query = `
+      SELECT r.*, 
+             u.full_name AS driver_name, 
+             u.phone_number AS driver_phone, 
+             u.rating AS driver_rating,
+             v.model AS vehicle_model, 
+             v.plate_number AS plate_number, 
+             v.color AS vehicle_color,
+             dp.bank_name, 
+             dp.bank_account_number, 
+             dp.telebirr_number
+      FROM ride_request_solo r
+      LEFT JOIN users u ON u.id = r.driver_id
+      LEFT JOIN vehicles v ON v.driver_id = r.driver_id
+      LEFT JOIN driver_profiles dp ON dp.driver_id = r.driver_id
+      WHERE r.id = $1
+      LIMIT 1;
+    `;
+
+    const result = await pool.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Ride request not found." });
+    }
+
+    const ride = result.rows[0];
+
+    res.status(200).json({
+      success: true,
+      id: ride.id,
+      status: ride.status,
+      destination_name: ride.destination_name || "Destination Arrival",
+      price: ride.price || 0,
+      distance_km: ride.distance_km || 0,
+      pickup_lat: ride.pickup_lat,
+      pickup_lng: ride.pickup_lng,
+      destination_lat: ride.destination_lat,
+      destination_lng: ride.destination_lng,
+      driver: {
+        name: ride.driver_name || "Captain",
+        phone_number: ride.driver_phone || "",
+        rating: ride.driver_rating || "5.00",
+        vehicle_model: ride.vehicle_model || "Toyota Corolla",
+        plate_number: ride.plate_number || "3-45678",
+        vehicle_color: ride.vehicle_color || "White",
+        bank_name: ride.bank_name || "Commercial Bank of Ethiopia (CBE)",
+        bank_account_number: ride.bank_account_number || "1000847291024",
+        telebirr_number: ride.telebirr_number || ride.driver_phone || "251998476704",
+      }
+    });
+
+  } catch (err) {
+    console.error("❌ Error fetching ride details:", err.message);
+    res.status(500).json({ success: false, error: "Internal server error." });
+  }
+});
+
 
 
 
