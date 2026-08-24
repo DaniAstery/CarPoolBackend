@@ -4777,10 +4777,11 @@ app.post('/api/rides/solo/create', async (req, res) => {
   }
 
   try {
-    // 1. Check if user already has an active ride request
+    // 🛡️ 1. Check if user already has any active session (catching pending, accepted, arrived, in_trip)
     const existingQuery = `
       SELECT * FROM ride_request_solo 
-      WHERE user_id = $1 AND status IN ('pending', 'accepted', 'in_progress')
+      WHERE user_id = $1 
+        AND LOWER(TRIM(status)) NOT IN ('completed', 'cancelled', 'rejected')
       ORDER BY created_at DESC 
       LIMIT 1;
     `;
