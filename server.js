@@ -217,22 +217,39 @@ io.on("connection", (socket) => {
     }
   });
 
+  /* 🚗 TRIP STARTED / IN_TRIP VIA SOCKET */
+  socket.on("solo_trip_started", async (data) => {
+    const { rideId, driverId, passengerId } = data;
+    console.log(`🚗 Driver ${driverId} started trip for solo ride ${rideId}`);
 
+    try {
+      // 1. Update PostgreSQL status to 'in_trip'
+      await pool.query(
+        `UPDATE ride_request_solo SET status = 'in_trip', updated_at = NOW() WHERE id = $1`,
+        [rideId]
+      );
+    } catch (err) {
+      console.error("❌ Error updating ride status in DB:", err.message);
+    }
 
+    // 2. Broadcast the update payload to the ride room and passenger channel
+    const payload = {
+      rideId: rideId,
+      ride_id: rideId,
+      driverId: driverId,
+      driver_id: driverId,
+      status: "in_trip",
+      timestamp: new Date().toISOString(),
+    };
 
+    io.to(`ride_${rideId}`).emit("trip_started", payload);
+    io.to(`ride_${rideId}`).emit("solo_ride_status_updated", payload);
 
-
-
-
-
-
-
-
-
-
-
-
-
+    if (passengerId) {
+      io.to(`user_${passengerId}`).emit("trip_started", payload);
+      io.to(`user_${passengerId}`).emit("solo_ride_status_updated", payload);
+    }
+  });
 
 
   // 5. Automatic Cancellation on App Close or Disconnect
@@ -3434,54 +3451,52 @@ app.get("/api/rides/status/:rideOfferId", async (req, res) => {
 
 // Soft-cancel passenger pool request by updating status to 'cancelled'
 // PATCH Passenger cancels while in searching or matched state
-app.patch('/api/routes/pool/:userId', async (req, res) => {
-  const userId = req.params.userId;
-  const client = await pool.connect();
 
+app.patch('/api/rides/solo/status', async (req, res) => {
   try {
-    await client.query('BEGIN');
+    const { ride_id, status } = req.body;
 
-    // 1. Find active route_pool entry for the user (only searching or matched states)
-    const poolRes = await client.query(
-      `SELECT id, status, matched_ride_offer_id FROM route_pool 
-       WHERE user_id = $1 AND status IN ('searching', 'matched')`,
-      [userId]
-    );
-
-    if (poolRes.rows.length === 0) {
-      await client.query('COMMIT');
-      return res.status(404).json({ success: false, error: 'No active searching or matched pool entry found.' });
+    if (!ride_id || !status) {
+      return res.status(400).json({ success: false, message: "Missing ride_id or status." });
     }
 
-    const booking = poolRes.rows[0];
+    const query = `
+      UPDATE ride_request_solo 
+      SET status = $1, updated_at = NOW() 
+      WHERE id = $2 
+      RETURNING *
+    `;
+    const result = await pool.query(query, [status, ride_id]);
 
-    // 2. If they were matched to a ride offer, restore the seat back to the driver (+1)
-    if (booking.matched_ride_offer_id) {
-      await client.query(
-        `UPDATE ride_offers 
-         SET available_seats = available_seats + 1 
-         WHERE id = $1;`,
-        [booking.matched_ride_offer_id]
-      );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Ride request not found." });
     }
 
-    // 3. Update route_pool: set status to 'cancelled' and clear matched_ride_offer_id to NULL
-    await client.query(
-      `UPDATE route_pool 
-       SET status = 'cancelled', 
-           matched_ride_offer_id = NULL 
-       WHERE id = $1;`,
-      [booking.id]
-    );
+    const updatedRide = result.rows[0];
 
-    await client.query('COMMIT');
-    res.json({ success: true, message: 'Pool request successfully cancelled and seat released.' });
+    // 🚀 USE req.io (matching your middleware setup)
+    const io = req.io; 
+    if (io) {
+      const room = `ride_${ride_id}`;
+      
+      if (status === 'arrived') {
+        io.to(room).emit('solo_driver_arrived', { ride_id, status });
+      } else if (status === 'in_trip') {
+        io.to(room).emit('solo_trip_started', { ride_id, status });
+        // Also emit standard names just in case client listens to them
+        io.to(room).emit('trip_started', { ride_id, status });
+      } else if (status === 'completed') {
+        io.to(room).emit('trip_completed', { ride_id, status });
+      }
+      
+      io.to(room).emit('ride_status_changed', { ride_id, status });
+      io.to(room).emit('solo_ride_status_updated', { ride_id, status });
+    }
+
+    res.json({ success: true, ride: updatedRide });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Error handling passenger cancellation:', err);
-    res.status(500).json({ success: false, error: 'Server error processing cancellation.' });
-  } finally {
-    client.release();
+    console.error("❌ Error updating ride_request_solo status:", err);
+    res.status(500).json({ success: false, error: "Internal server error." });
   }
 });
 
@@ -5254,12 +5269,33 @@ app.patch('/api/rides/solo/status', async (req, res) => {
       return res.status(404).json({ success: false, message: "Ride request not found." });
     }
 
-    res.json({ success: true, ride: result.rows[0] });
+    const updatedRide = result.rows[0];
+
+    // 🚀 EMIT SOCKET EVENTS TO THE RIDE ROOM
+    const io = req.app.get('io'); // (Make sure io is set on your express app: app.set('io', io))
+    if (io) {
+      const room = `ride_${ride_id}`;
+      
+      if (status === 'arrived') {
+        io.to(room).emit('solo_driver_arrived', { ride_id, status });
+      } else if (status === 'in_trip') {
+        io.to(room).emit('solo_trip_started', { ride_id, status });
+      } else if (status === 'completed') {
+        io.to(room).emit('trip_completed', { ride_id, status });
+      }
+      
+      // Generic fallback event if you want a single listener
+      io.to(room).emit('ride_status_changed', { ride_id, status });
+    }
+
+    res.json({ success: true, ride: updatedRide });
   } catch (err) {
     console.error("❌ Error updating ride_request_solo status:", err);
     res.status(500).json({ success: false, error: "Internal server error." });
   }
 });
+
+
 
 app.get('/api/pricing/:id', async (req, res) => {
   try {
