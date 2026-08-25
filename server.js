@@ -312,6 +312,8 @@ setupPgListener();
     }
   });
 });
+// Passengers Demand SURGE 
+
 
 
 
@@ -563,6 +565,7 @@ const broadcastHubQueueUpdate = async (io, pool, hubName) => {
         ro_latest.id AS ride_offer_id,
         ro_latest.status AS offer_status,
         COALESCE(driver_counts.waiting_drivers, 0)::INTEGER AS driver_queue_count,
+        COALESCE(passenger_counts.waiting_passengers, 0)::INTEGER AS waiting_passengers,
         COALESCE(avg_wait_stats.avg_wait_mins, 0)::INTEGER AS average_wait_mins
       FROM routes r
       JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
@@ -582,6 +585,12 @@ const broadcastHubQueueUpdate = async (io, pool, hubName) => {
         GROUP BY route_id
       ) driver_counts ON r.id = driver_counts.route_id
       LEFT JOIN (
+        SELECT route_id, COUNT(id) AS waiting_passengers
+        FROM route_pool
+        WHERE LOWER(status) = 'searching' AND matched_ride_offer_id IS NULL
+        GROUP BY route_id
+      ) passenger_counts ON r.id = passenger_counts.route_id
+      LEFT JOIN (
         SELECT 
           route_id, 
           ROUND(AVG(EXTRACT(EPOCH FROM (exited_at - entered_at)) / 60)) AS avg_wait_mins
@@ -599,6 +608,7 @@ const broadcastHubQueueUpdate = async (io, pool, hubName) => {
     const roomName = `hub_${hubName.toLowerCase().trim()}`;
     
     io.to(roomName).emit("queue_update", result.rows);
+    io.to(roomName).emit("hub_corridors_updated", result.rows);
   } catch (err) {
     console.error("❌ Error broadcasting hub queue update:", err);
   }
