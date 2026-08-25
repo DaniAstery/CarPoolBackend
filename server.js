@@ -78,6 +78,28 @@ io.on("connection", (socket) => {
     console.log(`🔌 Socket ${socket.id} joined room: ${roomName}`);
   });
 
+const setupPgListener = async () => {
+  try {
+    const client = await pool.connect();
+    await client.query("LISTEN hub_queue_changed");
+
+    client.on("notification", async (msg) => {
+      if (msg.channel === "hub_queue_changed" && msg.payload) {
+        const data = JSON.parse(msg.payload);
+        if (data.hub_name) {
+          await broadcastHubQueueUpdate(io, pool, data.hub_name);
+        }
+      }
+    });
+  } catch (err) {
+    console.error("❌ PG Listener setup error:", err);
+  }
+};
+
+setupPgListener();
+
+
+
   // 2. Driver Channel Registration
   socket.on("register_driver_channel", ({ driverId, driver_id }) => {
     const id = String(driverId || driver_id);
@@ -5568,6 +5590,46 @@ app.post('/api/test/simulate-driver', async (req, res) => {
   }
 });
 
+
+// Going Online  
+
+app.put('/api/status/toggle', async (req, res) => {
+  const { user_id, user_type, is_online, latitude, longitude } = req.body;
+
+  if (!user_id || !user_type || is_online === undefined) {
+    return res.status(400).json({ error: "Missing required fields: user_id, user_type, or is_online" });
+  }
+
+  try {
+    const query = `
+      INSERT INTO user_presence (user_id, user_type, is_online, latitude, longitude, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      ON CONFLICT (user_id, user_type)
+      DO UPDATE SET 
+        is_online = EXCLUDED.is_online,
+        latitude = COALESCE(EXCLUDED.latitude, user_presence.latitude),
+        longitude = COALESCE(EXCLUDED.longitude, user_presence.longitude),
+        updated_at = NOW()
+      RETURNING user_id, user_type, is_online, updated_at;
+    `;
+
+    const result = await pool.query(query, [
+      user_id, 
+      user_type, 
+      is_online, 
+      latitude || null, 
+      longitude || null
+    ]);
+
+    res.json({
+      success: true,
+      presence: result.rows[0]
+    });
+  } catch (err) {
+    console.error("❌ Error updating user presence:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 
 
