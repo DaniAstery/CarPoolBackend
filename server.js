@@ -25,13 +25,17 @@ app.use(express.urlencoded({ extended: true }));
 // 🔌 Wrap Express app in HTTP server for WebSockets
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
-//
+
 app.use((req, res, next) => {
   req.io = io;
   next();
 });
 
-// 🔔 DEDICATED CLIENT FOR POSTGRES LISTEN / NOTIFY 
+// ------------------------------------------------------------------
+// 🔔 DEDICATED POSTGRES LISTENERS (RUN ONCE ON BOOT)
+// ------------------------------------------------------------------
+
+// 1. Listener for Route Pool & Corridor Updates
 const pgListener = new Client({
   connectionString: process.env.DATABASE_URL 
 });
@@ -39,8 +43,10 @@ const pgListener = new Client({
 pgListener.connect()
   .then(async () => {
     console.log("🔌 Dedicated Postgres client connected for LISTEN/NOTIFY");
-    await pgListener.query("LISTEN route_pool_changed");
+    // ✅ FIXED: Matches trigger channel name ('route_pool_channel')
+    await pgListener.query("LISTEN route_pool_channel");
     await pgListener.query("LISTEN queue_changes");
+    console.log("📡 Listening on channels: 'route_pool_channel', 'queue_changes'");
   })
   .catch(err => console.error("❌ Postgres listener connection failed:", err));
 
@@ -49,6 +55,7 @@ pgListener.on("notification", async (msg) => {
     const payload = JSON.parse(msg.payload);
     console.log(`🔔 Postgres Notification Caught on [${msg.channel}]:`, payload);
     
+    // Broadcast route updates to all connected clients
     io.emit("route_pool_updated", payload);
     
     if (payload.hub_id) {
@@ -62,6 +69,34 @@ pgListener.on("notification", async (msg) => {
     console.error("❌ Error processing notification payload:", err);
   }
 });
+
+// 2. Standalone Hub Queue Listener (Moved OUTSIDE connection handler to prevent leaks)
+const setupHubQueueListener = async () => {
+  try {
+    const client = await pool.connect();
+    await client.query("LISTEN hub_queue_changed");
+    console.log("📡 Listening on channel: 'hub_queue_changed'");
+
+    client.on("notification", async (msg) => {
+      if (msg.channel === "hub_queue_changed" && msg.payload) {
+        const data = JSON.parse(msg.payload);
+        console.log("🔔 PG Hub Queue Notification received:", data);
+
+        if (data.hub_name) {
+          const roomName = `hub_${data.hub_name.toLowerCase().trim()}`;
+          io.to(roomName).emit("seat_updated", data);
+          // await broadcastHubQueueUpdate(io, pool, data.hub_name);
+          console.log(`📡 Broadcast sent to room: ${roomName}`);
+        }
+      }
+    });
+  } catch (err) {
+    console.error("❌ Hub Queue PG Listener error:", err);
+  }
+};
+
+setupHubQueueListener();
+
 
 // ------------------------------------------------------------------
 // UNIFIED SOCKET.IO ENGINE
@@ -78,38 +113,6 @@ io.on("connection", (socket) => {
     console.log(`🔌 Socket ${socket.id} joined room: ${roomName}`);
   });
 
-
-const setupPgListener = async () => {
-  try {
-    const client = await pool.connect();
-    await client.query("LISTEN hub_queue_changed");
-
-    client.on("notification", async (msg) => {
-      if (msg.channel === "hub_queue_changed" && msg.payload) {
-        const data = JSON.parse(msg.payload);
-        console.log("🔔 PG Notification received:", data);
-
-        if (data.hub_name) {
-          const roomName = `hub_${data.hub_name.toLowerCase().trim()}`;
-
-          // 1. Direct seat payload emit to room
-          io.to(roomName).emit("seat_updated", data);
-
-          // 2. Refresh full queue emit to room
-          await broadcastHubQueueUpdate(io, pool, data.hub_name);
-          console.log(`📡 Broadcast sent to room: ${roomName}`);
-        }
-      }
-    });
-  } catch (err) {
-    console.error("❌ PG Listener error:", err);
-  }
-};
-
-setupPgListener();
-
-
-
   // 2. Driver Channel Registration
   socket.on("register_driver_channel", ({ driverId, driver_id }) => {
     const id = String(driverId || driver_id);
@@ -119,7 +122,6 @@ setupPgListener();
     socket.join(roomName);
     socket.driverId = id;
 
-    // Guaranteed fallback initialization in activeDrivers Map
     const existing = activeDrivers.get(id) || {};
     activeDrivers.set(id, {
       ...existing,
@@ -182,7 +184,6 @@ setupPgListener();
       timestamp: new Date().toISOString(),
     };
 
-    // Broadcast to ride room and direct passenger personal channel
     io.to(`ride_${rideId}`).emit("solo_ride_accepted", payload);
     io.to(`ride_${rideId}`).emit("solo_ride_status_updated", payload);
 
@@ -215,13 +216,11 @@ setupPgListener();
     }
   });
 
-
-// Handle incoming live GPS ping from the driver app
+  // Handle incoming live GPS ping from the driver app
   socket.on("update_driver_location", async (data) => {
     const { driver_id, ride_id, user_id, latitude, longitude, heading } = data;
 
     try {
-      // 1. Upsert coordinates directly into active_user_sessions table
       await pool.query(
         `INSERT INTO active_user_sessions (user_id, active_role, lat, lng, heading, status, last_ping_at)
          VALUES ($1, 'driver', $2, $3, $4, 'online', NOW())
@@ -234,7 +233,6 @@ setupPgListener();
         [driver_id, latitude, longitude, heading || 0]
       );
 
-      // 2. Broadcast live coordinates to the passenger room
       const payload = { latitude, longitude, heading };
       
       if (ride_id) {
@@ -243,7 +241,6 @@ setupPgListener();
       if (user_id) {
         io.to(`user_${user_id}`).emit("driver_location_update", payload);
       }
-
     } catch (err) {
       console.error("❌ Error updating active_user_sessions:", err.message);
     }
@@ -255,7 +252,6 @@ setupPgListener();
     console.log(`🚗 Driver ${driverId} started trip for solo ride ${rideId}`);
 
     try {
-      // 1. Update PostgreSQL status to 'in_trip'
       await pool.query(
         `UPDATE ride_request_solo SET status = 'in_trip', updated_at = NOW() WHERE id = $1`,
         [rideId]
@@ -264,7 +260,6 @@ setupPgListener();
       console.error("❌ Error updating ride status in DB:", err.message);
     }
 
-    // 2. Broadcast the update payload to the ride room and passenger channel
     const payload = {
       rideId: rideId,
       ride_id: rideId,
@@ -275,14 +270,12 @@ setupPgListener();
     };
 
     io.to(`ride_${rideId}`).emit("trip_started", payload);
-    io.to(`ride_${rideId}`).emit("solo_ride_status_updated", payload);
+    io.to(`ride_${rideId}`).emit("solo_trip_started", payload); // updated or matched payload
 
     if (passengerId) {
       io.to(`user_${passengerId}`).emit("trip_started", payload);
-      io.to(`user_${passengerId}`).emit("solo_ride_status_updated", payload);
     }
   });
-
 
   // 5. Automatic Cancellation on App Close or Disconnect
   socket.on("disconnect", async () => {
@@ -302,18 +295,13 @@ setupPgListener();
           WHERE id = $1 AND user_id = $2 AND status = 'pending'
           RETURNING id;
         `;
-        const result = await pool.query(cancelQuery, [socket.rideId, socket.userId]);
-        if (result.rows.length > 0) {
-          console.log(`🧹 Auto-cancelled abandoned pending ride #${socket.rideId} for user ${socket.userId}`);
-        }
+        await pool.query(cancelQuery, [socket.rideId, socket.userId]);
       } catch (err) {
         console.error("❌ Error auto-cancelling ride on socket disconnect:", err.message);
       }
     }
   });
 });
-// Passengers Demand SURGE 
-
 
 
 
@@ -636,6 +624,39 @@ const setupPostgresListener = (pgClient, io, pool) => {
     }
   });
 };
+// listner for passengers available corridors number of waiting passengers and price changes
+
+function startRoutePoolListener(ioServer) {
+  const routePoolDbClient = new Client({
+    connectionString: process.env.DATABASE_URL,
+  });
+
+  routePoolDbClient.connect()
+    .then(() => {
+      console.log("🔌 Connected to PostgreSQL for real-time route pool updates");
+      return routePoolDbClient.query('LISTEN route_pool_channel');
+    })
+    .then(() => {
+      console.log("📡 Active listener listening on PostgreSQL channel: 'route_pool_channel'");
+    })
+    .catch(err => console.error("❌ Failed to connect route pool listener:", err));
+
+  routePoolDbClient.on('notification', (msg) => {
+    try {
+      const payload = JSON.parse(msg.payload);
+      console.log("⚡ [PG NOTIFY RECEIVED & BROADCASTING]:", payload);
+      
+      // Broadcast the exact payload from the trigger to all connected React Native clients
+      ioServer.emit('route_pool_updated', payload);
+    } catch (err) {
+      console.error("❌ Error parsing notification payload:", err);
+    }
+  });
+
+  routePoolDbClient.on('error', (err) => {
+    console.error("❌ Route pool database client error:", err);
+  });
+}
 
 
 // ==========================================
@@ -1589,19 +1610,29 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
         h_pass.name AS pass_through_name,
         r.recommended_base_price,
         
-        -- Hybrid Pricing: Driver custom price or fallback recommended base price
-        COALESCE(latest_ro.price_per_seat, r.recommended_base_price) AS price,
+        -- Dynamic pricing matching your trigger tiers
+        CASE 
+          WHEN COALESCE(pool_stats.current_pax, 0) = 0 THEN COALESCE(r.standard_solo_fare, r.recommended_base_price, 0)
+          WHEN COALESCE(pool_stats.current_pax, 0) = 1 THEN COALESCE(r.seat_price_2pax, r.recommended_base_price, 0)
+          WHEN COALESCE(pool_stats.current_pax, 0) = 2 THEN COALESCE(r.seat_price_3pax, r.seat_price_2pax, 0)
+          ELSE COALESCE(r.seat_price_4pax, r.seat_price_3pax, 0)
+        END AS price,
         
         latest_ro.available_seats,
         latest_ro.total_seats,
         latest_ro.id AS ride_offer_id,
-        latest_ro.status AS offer_status
+        latest_ro.status AS offer_status,
+
+        -- Live Passenger Counts for the UI
+        COALESCE(pool_stats.searching_pax, 0) AS searching_pax,
+        COALESCE(pool_stats.matched_pax, 0) AS matched_pax,
+        COALESCE(pool_stats.current_pax, 0) AS current_pax
+
       FROM routes r
       LEFT JOIN hubs h_pickup ON h_pickup.id = r.pickup_hub_id
       LEFT JOIN hubs h_drop ON h_drop.id = r.drop_off_hub_id
       LEFT JOIN hubs h_pass ON h_pass.id = r.pass_through_hub_id
       
-      -- Attach latest active driver ride offer matching this route
       LEFT JOIN LATERAL (
         SELECT id, price_per_seat, available_seats, total_seats, status
         FROM ride_offers 
@@ -1610,16 +1641,21 @@ app.get("/api/routes/from/:pickupHub", async (req, res) => {
         ORDER BY id DESC 
         LIMIT 1
       ) latest_ro ON true
+
+      -- Aggregate directly from route_pool so initial state is never 0 if passengers exist
+      LEFT JOIN LATERAL (
+        SELECT 
+          COUNT(CASE WHEN rp.status = 'searching' THEN 1 END)::int AS searching_pax,
+          COUNT(CASE WHEN rp.status = 'matched' THEN 1 END)::int AS matched_pax,
+          COUNT(CASE WHEN rp.status IN ('searching', 'matched') THEN 1 END)::int AS current_pax
+        FROM route_pool rp
+        WHERE rp.route_id = r.id AND rp.status IN ('searching', 'matched')
+      ) pool_stats ON true
       
       WHERE LOWER(h_pickup.name) = LOWER($1) OR r.pickup_hub_id::text = $1
       ORDER BY r.id;`,
       [pickupHub]
     );
-
-    console.log(`📦 [API] Successfully compiled ${result.rows.length} corridors for hub: "${pickupHub}"`);
-    if (result.rows.length > 0) {
-      console.log("📝 Sample Row Data:", JSON.stringify(result.rows[0], null, 2));
-    }
 
     res.json(result.rows);
   } catch (err) {
