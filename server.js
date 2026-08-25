@@ -78,6 +78,7 @@ io.on("connection", (socket) => {
     console.log(`🔌 Socket ${socket.id} joined room: ${roomName}`);
   });
 
+
 const setupPgListener = async () => {
   try {
     const client = await pool.connect();
@@ -86,13 +87,22 @@ const setupPgListener = async () => {
     client.on("notification", async (msg) => {
       if (msg.channel === "hub_queue_changed" && msg.payload) {
         const data = JSON.parse(msg.payload);
+        console.log("🔔 PG Notification received:", data);
+
         if (data.hub_name) {
+          const roomName = `hub_${data.hub_name.toLowerCase().trim()}`;
+
+          // 1. Direct seat payload emit to room
+          io.to(roomName).emit("seat_updated", data);
+
+          // 2. Refresh full queue emit to room
           await broadcastHubQueueUpdate(io, pool, data.hub_name);
+          console.log(`📡 Broadcast sent to room: ${roomName}`);
         }
       }
     });
   } catch (err) {
-    console.error("❌ PG Listener setup error:", err);
+    console.error("❌ PG Listener error:", err);
   }
 };
 
