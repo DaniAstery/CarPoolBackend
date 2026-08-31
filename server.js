@@ -930,46 +930,68 @@ app.get('/api/rides/map_coordinates', async (req, res) => {
 
 
 
-// passenger screen status gatewaykeeper 
+
 
 // 🎯 DEDICATED PASSENGER STATUS LIFECYCLE ENDPOINT
-app.get("/api/passenger/status/:userId", async (req, res) => {
+app.get("/passenger/status/:userId", async (req, res) => {
   const { userId } = req.params;
-
-  if (!userId) {
-    return res.status(400).json({ error: "Missing user identification query path." });
-  }
-
   try {
-    // Read ONLY from route_pool, sorted by latest activity
-    const currentPoolQuery = await pool.query(
-      `SELECT id, matched_ride_offer_id, status, route_id
-       FROM route_pool 
-       WHERE user_id = $1 AND status IN ('searching', 'matched', 'accepted', 'arrived', 'in_trip', 'completed') 
-       ORDER BY joined_at DESC LIMIT 1`,
-      [parseInt(userId, 10)]
-    );
+    const activeQuery = `
+      SELECT 
+        rp.id AS pool_id,
+        rp.status AS pool_status,
+        rp.route_id,
+        rp.matched_ride_offer_id,
+        r.status AS ride_status
+      FROM route_pool rp
+      LEFT JOIN ride_offers r ON rp.matched_ride_offer_id = r.id
+      WHERE rp.user_id = $1 
+        AND LOWER(TRIM(rp.status)) NOT IN ('completed', 'cancelled', 'expired', 'idle')
+      ORDER BY rp.joined_at DESC
+      LIMIT 1;
+    `;
+    
+    let result = await pool.query(activeQuery, [userId]);
 
-    // If no row exists at all, treat them as idle
-    if (currentPoolQuery.rows.length === 0) {
+    if (!result.rows.length) {
+      const latestQuery = `
+        SELECT 
+          rp.id AS pool_id,
+          rp.status AS pool_status,
+          rp.route_id,
+          rp.matched_ride_offer_id,
+          r.status AS ride_status
+        FROM route_pool rp
+        LEFT JOIN ride_offers r ON rp.matched_ride_offer_id = r.id
+        WHERE rp.user_id = $1
+        ORDER BY rp.joined_at DESC
+        LIMIT 1;
+      `;
+      result = await pool.query(latestQuery, [userId]);
+    }
+
+    if (!result.rows.length) {
       return res.json({ status: "idle" });
     }
 
-    const activeRow = currentPoolQuery.rows[0];
+    const row = result.rows[0];
+    
+    let effectiveStatus = row.pool_status || "idle";
+    if (row.ride_status === 'in_trip' || row.pool_status === 'in_trip') {
+      effectiveStatus = 'in_trip';
+    }
 
-    // Return the clean structural snapshot directly from route_pool
     return res.json({
-      status: activeRow.status, // 'searching', 'matched', 'accepted', 'arrived', 'in_trip', 'completed'
-      matched_ride_offer_id: activeRow.matched_ride_offer_id,
-      routeId: activeRow.route_id
+      status: effectiveStatus,
+      matched_ride_offer_id: row.matched_ride_offer_id,
+      routeId: row.route_id,
+      poolId: row.pool_id
     });
-
   } catch (err) {
-    console.error("❌ PURE PASSENGER ROUTE POOL RECOVERY ERROR:", err.stack);
-    return res.status(500).json({ error: "Internal exception executing pure passenger status checks." });
+    console.error("❌ Error fetching passenger status from route_pool:", err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
-
 
 //this for fetching ride_offer_id for passenger to check which offer he is assigned to 
 app.get("/api/rides/status/:userId", async (req, res) => {
