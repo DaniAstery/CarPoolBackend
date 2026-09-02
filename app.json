@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "03f3fb58-9273-44fe-af2f-eeb41c659631"
+      }
+    },
+    "android": {
+      "package": "com.daniastery.corridor"
+    }
+  }
+}

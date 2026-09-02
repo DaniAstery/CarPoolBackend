@@ -5,7 +5,9 @@ const { Client } = require('pg');
 const axios = require('axios');
 const cors = require('cors');
 require('dotenv').config();
-const pool = require('./db'); // 👈 KEEP YOUR EXISTING DB POOL INTACT!
+const pool = require('./db'); 
+
+
 
 const app = express();
 const PORT = process.env.PORT || 5000;
