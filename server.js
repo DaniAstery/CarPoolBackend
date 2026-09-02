@@ -1910,7 +1910,45 @@ app.post("/api/rides", async (req, res) => {
   }
 });
 
+app.post('/api/drivers/ping', async (req, res) => {
+  try {
+    const { driver_id, lat, lng, heading, status } = req.body;
 
+    const parsedLat = parseFloat(lat);
+    const parsedLng = parseFloat(lng);
+    const parsedHeading = parseFloat(heading) || 0;
+
+    if (isNaN(parsedLat) || isNaN(parsedLng)) {
+      return res.status(400).json({ error: "Invalid latitude or longitude format" });
+    }
+
+    const query = `
+      INSERT INTO active_user_sessions (user_id, active_role, lat, lng, heading, status, last_ping_at)
+      VALUES ($1, 'driver', $2, $3, $4, $5, NOW())
+      ON CONFLICT (user_id) 
+      DO UPDATE SET 
+        lat = EXCLUDED.lat,
+        lng = EXCLUDED.lng,
+        heading = EXCLUDED.heading,
+        status = EXCLUDED.status,
+        last_ping_at = NOW()
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [
+      driver_id,
+      parsedLat,
+      parsedLng,
+      parsedHeading,
+      status
+    ]);
+
+    res.status(200).json({ success: true, session: result.rows[0] });
+  } catch (err) {
+    console.error("❌ Driver ping error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ---------------- GET ACTIVE MANIFEST FOR THE DRIVER'S RIDE POOL ---------------- */
 app.get("/api/rides/:rideId/pool-manifest", async (req, res) => {
