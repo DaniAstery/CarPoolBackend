@@ -4909,20 +4909,66 @@ app.get('/api/users/profile/:id', async (req, res) => {
 
 
 // 2. Get last 5 completed trips for trip history
+// ==========================================
+// UPGRADED TRIP HISTORY ENDPOINT
+// ==========================================
+// ==========================================
+// UPGRADED TRIP HISTORY WITH HUBS & USERS
+// ==========================================
 app.get('/api/trips/history/:userId/:role', async (req, res) => {
   const { userId, role } = req.params;
+
   try {
-    const query = role === 'driver'
-      ? `SELECT id, corridor, final_price AS price, created_at FROM rides WHERE driver_id = $1 AND status = 'completed' ORDER BY created_at DESC LIMIT 5`
-      : `SELECT rp.id, rp.route_id, rp.status, rp.created_at, r.corridor, r.final_price AS price 
-         FROM route_pool rp 
-         LEFT JOIN rides r ON rp.matched_ride_offer_id = r.id 
-         WHERE rp.user_id = $1 AND rp.status = 'completed' ORDER BY rp.created_at DESC LIMIT 5`;
+    let query = '';
+
+    if (role === 'driver') {
+      // Driver query: joins hubs for start/end names & calculates passenger count
+      query = `
+        SELECT 
+          ro.id,
+          COALESCE(h_start.name, 'Hub #' || ro.start_location) AS pickup_name,
+          COALESCE(h_end.name, 'Hub #' || ro.end_location) AS dropoff_name,
+          COALESCE(ro.final_price, ro.price_per_seat * ro.total_seats, 150) AS price,
+          ro.status,
+          ro.created_at,
+          COALESCE(ARRAY_LENGTH(ro.accepted_passengers, 1), 0) AS passenger_count
+        FROM ride_offers ro
+        LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
+        LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
+        WHERE ro.driver_id = $1 
+          AND ro.status IN ('completed', 'finished')
+        ORDER BY ro.created_at DESC
+        LIMIT 5
+      `;
+    } else {
+      // Passenger query: joins hubs for pickup/dropoff & users for driver info
+      query = `
+        SELECT 
+          rp.id,
+          COALESCE(h_pickup.name, 'Hub #' || rp.pickup_hub_id) AS pickup_name,
+          COALESCE(h_dropoff.name, 'Hub #' || rp.dropoff_hub_id) AS dropoff_name,
+          COALESCE(ro.price_per_seat, 150) AS price,
+          rp.status,
+          rp.joined_at AS created_at,
+          u_driver.full_name AS driver_name,
+          u_driver.profile_photo_url AS driver_photo
+        FROM route_pool rp
+        LEFT JOIN hubs h_pickup ON rp.pickup_hub_id = h_pickup.id
+        LEFT JOIN hubs h_dropoff ON rp.dropoff_hub_id = h_dropoff.id
+        LEFT JOIN ride_offers ro ON rp.matched_ride_offer_id = ro.id
+        LEFT JOIN users u_driver ON ro.driver_id = u_driver.id
+        WHERE rp.user_id = $1 
+          AND (rp.status IN ('completed', 'dropped_off', 'finished') OR ro.status = 'completed')
+        ORDER BY rp.joined_at DESC
+        LIMIT 5
+      `;
+    }
 
     const result = await pool.query(query, [userId]);
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch trip history" });
+    console.error("Fetch trip history error:", err);
+    res.status(500).json({ error: "Failed to fetch trip history", details: err.message });
   }
 });
 
