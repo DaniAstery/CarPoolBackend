@@ -6,13 +6,35 @@ const axios = require('axios');
 const cors = require('cors');
 require('dotenv').config();
 const pool = require('./db'); 
+const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const fs = require('fs');
 
 
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const multer = require("multer");
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// 2. Configure Multer (temporary local storage before Cloudinary upload)
+const upload = multer({
+  dest: 'temp_uploads/',
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB max
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed!'), false);
+    }
+  },
+});
+
 const path = require("path");
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
@@ -32,6 +54,7 @@ app.use((req, res, next) => {
   req.io = io;
   next();
 });
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ------------------------------------------------------------------
 // 🔔 DEDICATED POSTGRES LISTENERS (RUN ONCE ON BOOT)
@@ -457,6 +480,59 @@ bot.on('message', async (msg) => {
   }
 });
 
+
+app.post('/api/users/upload-photo', (req, res) => {
+  upload.single('photo')(req, res, async (err) => {
+    // Catch Multer errors (e.g. file size > 5MB or invalid mime type)
+    if (err instanceof multer.MulterError) {
+      return res.status(400).json({ error: `File limit error: ${err.message}` });
+    } else if (err) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    const { userId } = req.body;
+    if (!req.file || !userId) {
+      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: "Missing photo file or userId" });
+    }
+
+    try {
+      const result = await cloudinary.uploader.upload(req.file.path, {
+        folder: 'corridor_profile_photos',
+        public_id: `user_${userId}_avatar`,
+        overwrite: true,
+        transformation: [
+          { width: 300, height: 300, crop: 'fill', gravity: 'face' },
+          { fetch_format: 'auto', quality: 'auto' }
+        ],
+      });
+
+      if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+
+      const photoUrl = result.secure_url;
+      await pool.query(
+        `UPDATE users SET profile_photo_url = $1 WHERE id = $2`,
+        [photoUrl, userId]
+      );
+
+      res.json({ success: true, photoUrl });
+    } catch (dbErr) {
+      if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      console.error("Cloudinary/DB Upload Error:", dbErr);
+      res.status(500).json({ error: "Failed to upload profile photo" });
+    }
+  });
+});
+
+
+
+
+
+
+
+
+
+
 // ==========================================
 // AUTHENTICATION & VERIFICATION ENDPOINTS
 // ==========================================
@@ -689,7 +765,7 @@ const storage = multer.diskStorage({
     cb(null, file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname));
   }
 });
-const upload = multer({ storage: storage });
+const diskUpload = multer({ storage: storage });
 
 
 
@@ -4807,21 +4883,30 @@ app.get("/api/rides/TripSummary", async (req, res) => {
 });
 
 
-// DRAWER MENU ENDPOINTS FOR USER PROFILE SUMMARY AND TRIP HISTORY
-// 1. Get user profile summary for drawer header
-app.get('/api/users/profile/:userId', async (req, res) => {
-  const { userId } = req.params;
+
+// ==========================================
+// USER PROFILE ENDPOINT
+// ==========================================
+app.get('/api/users/profile/:id', async (req, res) => {
+  const { id } = req.params;
   try {
     const result = await pool.query(
-      `SELECT id, full_name, role, phone_number, rating, created_at, profile_picture FROM users WHERE id = $1`,
-      [userId]
+      `SELECT id, full_name, phone_number, email, role, rating, profile_photo_url, phone_verified, wallet_balance 
+       FROM users WHERE id = $1`,
+      [id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch user profile" });
+    console.error("Profile fetch error:", err);
+    res.status(500).json({ error: "Database query error", details: err.message });
   }
 });
+
 
 // 2. Get last 5 completed trips for trip history
 app.get('/api/trips/history/:userId/:role', async (req, res) => {
