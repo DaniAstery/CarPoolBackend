@@ -4890,7 +4890,10 @@ app.get("/api/rides/TripSummary", async (req, res) => {
 app.get('/api/users/profile/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await pool.query(
+    // Safely reference whichever database instance is active
+    const dbClient = typeof pool !== 'undefined' ? pool : db;
+
+    const result = await dbClient.query(
       `SELECT id, full_name, phone_number, email, role, rating, profile_photo_url, phone_verified, wallet_balance 
        FROM users WHERE id = $1`,
       [id]
@@ -4900,6 +4903,7 @@ app.get('/api/users/profile/:id', async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
+    console.log(`[Profile API] Successfully fetched profile for user #${id}:`, result.rows[0].full_name);
     res.json(result.rows[0]);
   } catch (err) {
     console.error("Profile fetch error:", err);
@@ -4909,20 +4913,24 @@ app.get('/api/users/profile/:id', async (req, res) => {
 
 
 // 2. Get last 5 completed trips for trip history
-// ==========================================
-// UPGRADED TRIP HISTORY ENDPOINT
-// ==========================================
+
 // ==========================================
 // UPGRADED TRIP HISTORY WITH HUBS & USERS
+// ==========================================
+// ==========================================
+// SAFE TRIP HISTORY ENDPOINT FOR DRIVERS & PASSENGERS
 // ==========================================
 app.get('/api/trips/history/:userId/:role', async (req, res) => {
   const { userId, role } = req.params;
 
+  console.log(`[Trip History API] Fetching history for User #${userId} as Role: ${role}`);
+
   try {
+    const dbClient = typeof pool !== 'undefined' ? pool : db;
     let query = '';
 
     if (role === 'driver') {
-      // Driver query: joins hubs for start/end names & calculates passenger count
+      // Safe regex casting for start_location and end_location
       query = `
         SELECT 
           ro.id,
@@ -4933,15 +4941,14 @@ app.get('/api/trips/history/:userId/:role', async (req, res) => {
           ro.created_at,
           COALESCE(ARRAY_LENGTH(ro.accepted_passengers, 1), 0) AS passenger_count
         FROM ride_offers ro
-        LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
-        LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
+        LEFT JOIN hubs h_start ON (CASE WHEN ro.start_location ~ '^[0-9]+$' THEN ro.start_location::integer ELSE NULL END) = h_start.id
+        LEFT JOIN hubs h_end ON (CASE WHEN ro.end_location ~ '^[0-9]+$' THEN ro.end_location::integer ELSE NULL END) = h_end.id
         WHERE ro.driver_id = $1 
           AND ro.status IN ('completed', 'finished')
         ORDER BY ro.created_at DESC
         LIMIT 5
       `;
     } else {
-      // Passenger query: joins hubs for pickup/dropoff & users for driver info
       query = `
         SELECT 
           rp.id,
@@ -4965,6 +4972,7 @@ app.get('/api/trips/history/:userId/:role', async (req, res) => {
     }
 
     const result = await pool.query(query, [userId]);
+    console.log(`[Trip History API] Returned ${result.rows.length} rows for user #${userId}`);
     res.json(result.rows);
   } catch (err) {
     console.error("Fetch trip history error:", err);
