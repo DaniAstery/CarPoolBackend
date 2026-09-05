@@ -4883,14 +4883,12 @@ app.get("/api/rides/TripSummary", async (req, res) => {
 });
 
 
-
 // ==========================================
-// USER PROFILE ENDPOINT
+// USER PROFILE ENDPOINT (Original & Clean)
 // ==========================================
 app.get('/api/users/profile/:id', async (req, res) => {
   const { id } = req.params;
   try {
-    // Safely reference whichever database instance is active
     const dbClient = typeof pool !== 'undefined' ? pool : db;
 
     const result = await dbClient.query(
@@ -4911,6 +4909,46 @@ app.get('/api/users/profile/:id', async (req, res) => {
   }
 });
 
+
+app.get('/api/users/wallet/:id', async (req, res) => {
+  const { id } = req.params;
+  console.log(`[Wallet API] 📥 Incoming request received for user ID:`, id);
+
+  try {
+    const dbClient = typeof pool !== 'undefined' ? pool : db;
+
+    const query = `
+      SELECT 
+        u.id,
+        u.role,
+        COALESCE(u.wallet_balance, 0.00) AS wallet_balance,
+        CASE 
+          WHEN u.role = 'driver' THEN COALESCE(
+            (SELECT SUM(COALESCE(ro.final_price, ro.price_per_seat * ro.total_seats, 150)) 
+             FROM ride_offers ro 
+             WHERE ro.driver_id = u.id AND ro.status IN ('completed', 'finished')), 
+            0.00
+          )
+          ELSE 0.00
+        END AS total_earnings
+      FROM users u 
+      WHERE u.id = $1
+    `;
+
+    const result = await dbClient.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      console.log(`[Wallet API] ⚠️ User ID #${id} not found in database.`);
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    console.log(`[Wallet API] ✅ Successfully fetched wallet data for User #${id} (Role: ${result.rows[0].role}) -> Balance: ${result.rows[0].wallet_balance}`);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Wallet fetch error:", err);
+    res.status(500).json({ error: "Database query error", details: err.message });
+  }
+});
 
 // 2. Get last 5 completed trips for trip history
 
