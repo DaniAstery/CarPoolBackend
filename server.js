@@ -6184,6 +6184,143 @@ app.get("/api/rides/payment-details-by-user/:userId", async (req, res) => {
   }
 });
 
+// ==========================================
+// 2. BACKEND API ENDPOINTS (server.js)
+// ==========================================
+
+// Submit a deposit request (Called from Mobile App)
+app.post('/wallet/submit-deposit', async (req, res) => {
+  const { user_id, amount, gateway, order_id, transaction_ref } = req.body;
+
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO wallet_transactions (user_id, amount, gateway, order_id, transaction_ref, status) 
+       VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING *`,
+      [user_id, amount, gateway, order_id, transaction_ref]
+    );
+
+    console.log(`[Wallet Deposit] New order ${order_id} submitted by User #${user_id} for ETB ${amount}`);
+    res.status(201).json({ success: true, transaction: result.rows[0] });
+  } catch (err) {
+    console.error("Submit deposit error:", err);
+    res.status(500).json({ error: "Failed to submit deposit record", details: err.message });
+  }
+});
+
+// Admin: Fetch all pending deposits
+app.get('/api/admin/wallet/pending', async (req, res) => {
+ 
+  try {
+    const query = `
+      SELECT 
+        wt.id, 
+        wt.user_id, 
+        u.full_name, 
+        u.phone_number, 
+        u.role, 
+        wt.amount, 
+        wt.gateway, 
+        wt.order_id, 
+        wt.transaction_ref, 
+        wt.status, 
+        wt.created_at 
+      FROM wallet_transactions wt
+      JOIN users u ON wt.user_id = u.id
+      WHERE wt.status = 'pending'
+      ORDER BY wt.created_at ASC
+    `;
+    const result = await pool.query(query);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Fetch pending deposits error:", err);
+    res.status(500).json({ error: "Failed to fetch pending deposits" });
+  }
+});
+
+// Admin: Approve deposit, credit wallet, and lift suspension if threshold met
+app.post('/api/admin/wallet/approve', async (req, res) => {
+  const { transaction_id, admin_id } = req.body;
+  
+
+  try {
+    await pool.query('BEGIN');
+
+    // 1. Fetch transaction details
+    const txResult = await pool.query(
+      `SELECT * FROM wallet_transactions WHERE id = $1 FOR UPDATE`,
+      [transaction_id]
+    );
+
+    if (txResult.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+
+    const tx = txResult.rows[0];
+    if (tx.status !== 'pending') {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({ error: "Transaction already processed" });
+    }
+
+    // 2. Mark transaction as approved
+    await pool.query(
+      `UPDATE wallet_transactions SET status = 'approved' WHERE id = $1`,
+      [transaction_id]
+    );
+
+    // 3. Credit user's wallet balance
+    const userResult = await pool.query(
+      `UPDATE users 
+       SET wallet_balance = COALESCE(wallet_balance, 0) + $1,
+           is_suspended = CASE WHEN (COALESCE(wallet_balance, 0) + $1) >= 50.00 THEN FALSE ELSE is_suspended END
+       WHERE id = $2 
+       RETURNING id, wallet_balance, is_suspended`,
+      [tx.amount, tx.user_id]
+    );
+
+    await pool.query('COMMIT');
+
+    console.log(`[Wallet Admin] Deposit #${transaction_id} approved. Credited ETB ${tx.amount} to User #${tx.user_id}`);
+    res.json({ success: true, updatedUser: userResult.rows[0] });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error("Approve deposit error:", err);
+    res.status(500).json({ error: "Failed to approve deposit", details: err.message });
+  }
+});
+
+// Middleware Check: Enforce minimum commission/wallet threshold (e.g., ETB 50) for drivers
+const checkDriverWalletThreshold = async (req, res, next) => {
+  const driverId = req.body.driver_id || req.params.driverId;
+
+  try {
+    const result = await pool.query(
+      `SELECT wallet_balance, is_suspended, role FROM users WHERE id = $1`,
+      [driverId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    const driver = result.rows[0];
+    if (driver.role === 'driver') {
+      const MIN_THRESHOLD = 50.00; // Minimum ETB balance required to operate
+      if (driver.wallet_balance < MIN_THRESHOLD || driver.is_suspended) {
+        return res.status(403).json({ 
+          error: "Insufficient wallet balance", 
+          message: `Your balance (ETB ${driver.wallet_balance}) is below the required minimum threshold of ETB ${MIN_THRESHOLD}. Please top up via Telebirr or CBE to continue accepting rides.` 
+        });
+      }
+    }
+    next();
+  } catch (err) {
+    console.error("Wallet threshold middleware error:", err);
+    res.status(500).json({ error: "Internal server error during balance check" });
+  }
+};
+
 
 
 /* ===========================================================================

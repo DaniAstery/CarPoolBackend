@@ -1,0 +1,7 @@
+
+
+ corridor admin server 
+
+d@d:~/Desktop/corridor-admin/server/src$ 
+
+node server.js
