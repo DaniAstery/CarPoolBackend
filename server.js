@@ -62,7 +62,10 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // 1. Listener for Route Pool & Corridor Updates
 const pgListener = new Client({
-  connectionString: process.env.DATABASE_URL 
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
 pgListener.connect()
@@ -707,6 +710,9 @@ const setupPostgresListener = (pgClient, io, pool) => {
 function startRoutePoolListener(ioServer) {
   const routePoolDbClient = new Client({
     connectionString: process.env.DATABASE_URL,
+    ssl: {
+    rejectUnauthorized: false
+  }
   });
 
   routePoolDbClient.connect()
