@@ -6361,6 +6361,171 @@ const checkDriverWalletThreshold = async (req, res, next) => {
 
 
 
+app.get('/api/admin/ultimate-reports', async (req, res) => {
+  try {
+    const dbClient = typeof pool !== 'undefined' ? pool : db;
+    const { range = 'today', start_date, end_date, search = '' } = req.query;
+
+    // Date Condition for completed ride_offers
+    let dateCondition = "DATE(ro.created_at) = CURRENT_DATE";
+    if (range === 'week') {
+      dateCondition = "ro.created_at >= NOW() - INTERVAL '7 days'";
+    } else if (range === 'month') {
+      dateCondition = "ro.created_at >= NOW() - INTERVAL '30 days'";
+    } else if (range === 'all') {
+      dateCondition = "1=1";
+    } else if (range === 'custom' && start_date && end_date) {
+      dateCondition = `ro.created_at >= '${start_date} 00:00:00' AND ro.created_at <= '${end_date} 23:59:59'`;
+    }
+
+    // Multi-entity Search Filter (Driver Name, Phone, Vehicle Plate)
+    let searchCondition = "1=1";
+    const searchTerm = `%${search.trim().toLowerCase()}%`;
+    if (search.trim()) {
+      searchCondition = `(
+        LOWER(u.full_name) LIKE '${searchTerm}' OR 
+        LOWER(u.phone_number) LIKE '${searchTerm}' OR 
+        LOWER(v.plate_number) LIKE '${searchTerm}'
+      )`;
+    }
+
+    // 1. Fetch platform settings
+    const settingsResult = await dbClient.query(`SELECT key, value FROM platform_settings`).catch(() => ({ rows: [] }));
+    const settings = {};
+    settingsResult.rows.forEach(row => { settings[row.key] = row.value; });
+    const isCommissionActive = settings['is_commission_active'] === 'true';
+    const commissionRate = parseFloat(settings['commission_rate'] || '0.10');
+
+    // 2. Ongoing Trips (Joined with hubs, vehicles, and users)
+    const ongoingQuery = `
+      SELECT 
+        ro.*,
+        u.full_name AS driver_name,
+        u.phone_number AS driver_phone,
+        v.plate_number AS vehicle_plate,
+        v.make AS vehicle_make,
+        v.model AS vehicle_model,
+        ph.name AS start_hub_name,
+        dh.name AS end_hub_name
+      FROM ride_offers ro
+      LEFT JOIN users u ON ro.driver_id = u.id
+      LEFT JOIN vehicles v ON ro.vehicle_id = v.id
+      LEFT JOIN routes rt ON ro.route_id = rt.id
+      LEFT JOIN hubs ph ON rt.pickup_hub_id = ph.id
+      LEFT JOIN hubs dh ON rt.drop_off_hub_id = dh.id
+      WHERE ro.status NOT IN ('completed', 'finished', 'cancelled')
+      ORDER BY ro.created_at DESC
+    `;
+    const ongoingResult = await dbClient.query(ongoingQuery);
+
+    // 3. Completed Trips (From ride_offers with full hub & vehicle resolutions)
+    const completedQuery = `
+      SELECT 
+        ro.*,
+        u.full_name AS driver_name,
+        u.phone_number AS driver_phone,
+        v.plate_number AS vehicle_plate,
+        v.make AS vehicle_make,
+        v.model AS vehicle_model,
+        ph.name AS start_hub_name,
+        dh.name AS end_hub_name
+      FROM ride_offers ro
+      LEFT JOIN users u ON ro.driver_id = u.id
+      LEFT JOIN vehicles v ON ro.vehicle_id = v.id
+      LEFT JOIN routes rt ON ro.route_id = rt.id
+      LEFT JOIN hubs ph ON rt.pickup_hub_id = ph.id
+      LEFT JOIN hubs dh ON rt.drop_off_hub_id = dh.id
+      WHERE ro.status IN ('completed', 'finished') 
+      AND ${dateCondition} 
+      AND ${searchCondition}
+      ORDER BY ro.created_at DESC
+    `;
+    const completedResult = await dbClient.query(completedQuery);
+
+    // 4. Passenger Queue (With resolved pickup/dropoff hub names)
+    const queueQuery = `
+      SELECT 
+        rp.*,
+        u.full_name,
+        u.phone_number,
+        ph.name AS pickup_hub_name,
+        dh.name AS dropoff_hub_name
+      FROM route_pool rp
+      LEFT JOIN users u ON rp.user_id = u.id
+      LEFT JOIN hubs ph ON rp.pickup_hub_id = ph.id
+      LEFT JOIN hubs dh ON rp.dropoff_hub_id = dh.id
+      WHERE rp.status NOT IN ('completed', 'cancelled')
+      ORDER BY rp.joined_at DESC
+    `;
+    const queueResult = await dbClient.query(queueQuery);
+
+    // 5. Shadow commission calculation
+    let totalFareSum = 0;
+    completedResult.rows.forEach(row => {
+      totalFareSum += parseFloat(row.final_price || row.price_per_seat || 120);
+    });
+    const totalCommission = isCommissionActive ? (totalFareSum * commissionRate) : 0.00;
+
+    const metrics = {
+      totalCommission,
+      completedTripsCount: completedResult.rows.length,
+      ongoingTripsCount: ongoingResult.rows.length,
+      activeQueueCount: queueResult.rows.length,
+      isCommissionActive
+    };
+
+    res.json({
+      metrics,
+      ongoingTrips: ongoingResult.rows,
+      completedTrips: completedResult.rows,
+      routePoolQueue: queueResult.rows
+    });
+  } catch (err) {
+    console.error("Ultimate reports error:", err);
+    res.status(500).json({ error: "Failed to generate ultimate reports", details: err.message });
+  }
+});
+
+
+// admin password login route (for admin panel access)
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const dbClient = typeof pool !== 'undefined' ? pool : db;
+    const { username = 'admin', password } = req.body;
+
+    if (!password) {
+      return res.status(400).json({ error: "Password is required." });
+    }
+
+    // Query admin user by username or check any active admin with this password
+    const adminQuery = `
+      SELECT * FROM admin_users 
+      WHERE (username = $1 OR username = 'admin') 
+      AND password_hash = $2 
+      AND is_active = TRUE
+    `;
+    const result = await dbClient.query(adminQuery, [username, password]);
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: "Invalid administrator credentials." });
+    }
+
+    const admin = result.rows[0];
+    res.json({
+      success: true,
+      admin: {
+        id: admin.id,
+        username: admin.username,
+        full_name: admin.full_name,
+        role: admin.role
+      }
+    });
+  } catch (err) {
+    console.error("Admin login error:", err);
+    res.status(500).json({ error: "Server authentication error", details: err.message });
+  }
+});
+
 /* ===========================================================================
    🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
 =========================================================================== */
