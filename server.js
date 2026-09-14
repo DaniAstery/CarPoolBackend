@@ -60,9 +60,14 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // 🔔 DEDICATED POSTGRES LISTENERS (RUN ONCE ON BOOT)
 // ------------------------------------------------------------------
 
+
 // 1. Listener for Route Pool & Corridor Updates
 const pgListener = new Client({
-  connectionString: process.env.DATABASE_URL,
+  user: process.env.DB_USER || 'Postgres',
+  password: process.env.DB_PASSWORD,
+  host: process.env.DB_HOST,
+  database: process.env.DB_DATABASE,
+  port: process.env.DB_PORT || 5432,
   ssl: {
     rejectUnauthorized: true,
     ca: fs.readFileSync(path.join(__dirname, 'global-bundle.pem'))
@@ -709,13 +714,17 @@ const setupPostgresListener = (pgClient, io, pool) => {
 // listner for passengers available corridors number of waiting passengers and price changes
 
 function startRoutePoolListener(ioServer) {
-  const routePoolDbClient = new Client({
-    connectionString: process.env.DATABASE_URL,
-    ssl: {
-      rejectUnauthorized: true,
-      ca: fs.readFileSync(path.join(__dirname, 'global-bundle.pem'))
-    }
-  });
+      const routePoolDbClient = new Client({
+        user: process.env.DB_USER || 'Postgres',
+        password: process.env.DB_PASSWORD,
+        host: process.env.DB_HOST,
+        database: process.env.DB_DATABASE,
+        port: process.env.DB_PORT || 5432,
+        ssl: {
+          rejectUnauthorized: true,
+          ca: fs.readFileSync(path.join(__dirname, 'global-bundle.pem'))
+        }
+      });
 
   routePoolDbClient.connect()
     .then(() => {
