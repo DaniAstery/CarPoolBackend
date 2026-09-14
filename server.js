@@ -64,7 +64,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 const pgListener = new Client({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false
+    rejectUnauthorized: true,
+    ca: fs.readFileSync(path.join(__dirname, 'global-bundle.pem'))
   }
 });
 
@@ -711,8 +712,9 @@ function startRoutePoolListener(ioServer) {
   const routePoolDbClient = new Client({
     connectionString: process.env.DATABASE_URL,
     ssl: {
-    rejectUnauthorized: false
-  }
+      rejectUnauthorized: true,
+      ca: fs.readFileSync(path.join(__dirname, 'global-bundle.pem'))
+    }
   });
 
   routePoolDbClient.connect()

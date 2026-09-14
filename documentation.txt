@@ -5,3 +5,6 @@
 d@d:~/Desktop/corridor-admin/server/src$ 
 
 node server.js
+
+connect to aws backend
+ssh -i CorridorBackendKey.pem ubuntu@54.167.31.126
