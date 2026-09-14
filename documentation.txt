@@ -8,3 +8,6 @@ node server.js
 
 connect to aws backend
 ssh -i CorridorBackendKey.pem ubuntu@54.167.31.126
+connect to aws db
+export RDSHOST="corridor.co72s6iqs2bu.us-east-1.rds.amazonaws.com" 
+psql "host=$RDSHOST port=5432 dbname=postgres user=Postgres sslmode=verify-full sslrootcert=./global-bundle.pem"
