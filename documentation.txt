@@ -9,8 +9,13 @@ node server.js
 connect to aws backend
 ssh -i CorridorBackendKey.pem ubuntu@3.80.214.175
 connect to aws db
+curl -o global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+
 export RDSHOST="corridor.co72s6iqs2bu.us-east-1.rds.amazonaws.com" 
 psql "host=$RDSHOST port=5432 dbname=postgres user=Postgres sslmode=verify-full sslrootcert=./global-bundle.pem"
+
+
+
 
 uploading to aws backup db from corridor-backend
 scp -i ./CorridorBackendKey.pem corridor_backup.sql ubuntu@3.80.214.175:/home/ubuntu/CarPoolBackend/
