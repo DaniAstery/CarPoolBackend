@@ -10,6 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@googlemaps/google-maps-services-js": "^3.4.2",
     "axios": "^1.19.0",
     "cloudinary": "^2.11.0",
     "cors": "^2.8.6",
@@ -17,7 +18,7 @@
     "express": "^5.2.1",
     "multer": "^2.3.0",
     "node-telegram-bot-api": "^1.2.0",
-    "pg": "^8.21.0",
+    "pg": "^8.23.1",
     "socket.io": "^4.8.3"
   }
 }

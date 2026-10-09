@@ -758,6 +758,41 @@ function startRoutePoolListener(ioServer) {
 // YOUR EXISTING ROUTES (e.g., /api/routes/from/:hubName, etc.)
 // remain completely unaffected below here...
 // ==========================================
+app.get('/api/routes/from/:hubId', async (req, res) => {
+  try {
+    const hubId = req.params.hubId;
+    
+    const query = `
+      SELECT 
+        r.id AS route_id,
+        r.hub_id,
+        r.pickup_hub_id,
+        r.drop_off_hub_id,
+        r.pass_through_hub_id,
+        h_pickup.name AS pickup_hub_name,
+        h_drop.name AS destination_name,
+        h_pass.name AS pass_through_name,
+        COALESCE(r.recommended_base_price, 150) AS recommended_base_price,
+        r.standard_solo_fare,
+        r.seat_price_2pax,
+        r.seat_price_3pax,
+        r.seat_price_4pax
+      FROM routes r
+      JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
+      JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
+      LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id
+      WHERE r.pickup_hub_id = $1 AND r.is_active = true;
+    `;
+
+    const result = await pool.query(query, [hubId]);
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching corridors from hub ID:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
 
 // ⚠️ IMPORTANT: Use server.listen instead of app.listen so WebSockets work!
 server.listen(PORT, () => {
@@ -1476,23 +1511,6 @@ app.post('/api/driver/validate-location', async (req, res) => {
 });
 
 // GET /api/hubs - Fetch all system hubs for the waypoint map display for driver
-app.get('/api/hubs', async (req, res) => {
-  try {
-    const query = `
-      SELECT id, name, latitude, longitude 
-      FROM hubs 
-      ORDER BY id ASC;
-    `;
-    
-    const result = await pool.query(query);
-    
-    // Return standard array expected by React Native frontend
-    res.status(200).json(result.rows);
-  } catch (err) {
-    console.log("❌ Error fetching hubs:", err.message);
-    res.status(500).json({ error: "Failed to retrieve system hubs" });
-  }
-});
 
 
 
@@ -4659,22 +4677,19 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
         r.pass_through_hub_id,
         h_pickup.name AS pickup_hub_name,
         h_drop.name AS destination_name,
-        h_pass.name AS pass_through_name,
+        h_pass.name AS pass_through_name, -- 👈 Must be selected here
         COALESCE(r.recommended_base_price, 100) AS recommended_base_price,
         COALESCE(ro_latest.total_seats, 4) AS capacity,
         COALESCE(ro_latest.available_seats, 4) AS available_seats,
         ro_latest.id AS ride_offer_id,
         ro_latest.status AS offer_status,
-        -- 🚗 Real-time driver queue count join
         COALESCE(driver_counts.waiting_drivers, 0)::INTEGER AS driver_queue_count,
-        -- ⏱️ Average wait time calculated using entered_at & exited_at
         COALESCE(avg_wait_stats.avg_wait_mins, 0)::INTEGER AS average_wait_mins
       FROM routes r
       JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
       JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
-      LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id
+      LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id -- 👈 Must join h_pass
       
-      -- 🛡️ Prevent row duplication by grabbing the latest/active ride offer per route
       LEFT JOIN (
         SELECT DISTINCT ON (route_id) 
           id, total_seats, available_seats, status, route_id
@@ -4683,7 +4698,6 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
         ORDER BY route_id, created_at DESC
       ) ro_latest ON r.id = ro_latest.route_id
       
-      -- 🚗 Real-time driver count aggregated cleanly and independently
       LEFT JOIN (
         SELECT route_id, COUNT(driver_id) AS waiting_drivers
         FROM driver_queue
@@ -4691,7 +4705,6 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
         GROUP BY route_id
       ) driver_counts ON r.id = driver_counts.route_id
 
-      -- ⏱️ Average wait time stats join using entered_at instead of created_at
       LEFT JOIN (
         SELECT 
           route_id, 
@@ -4708,7 +4721,15 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
     `;
 
     const result = await pool.query(query, [hubName]);
-    console.log("🔥 CORRECTED SCHEMA ROWS WITH QUEUE & WAIT METRICS:", result.rows);
+    
+    // 🔍 DEBUG LOG: Check your Node.js terminal to see if pass_through_name appears here!
+    console.log("🔍 API Response Rows Preview:", result.rows.map(r => ({
+      route_id: r.route_id,
+      pickup: r.pickup_hub_name,
+      pass_through: r.pass_through_name,
+      destination: r.destination_name
+    })));
+
     return res.json(result.rows);
     
   } catch (err) {
@@ -4716,7 +4737,6 @@ app.get('/api/routes/live-corridors/:hubName', async (req, res) => {
     return res.status(500).json({ error: "Internal server error" });
   }
 });
-
 
 // 📴 Driver Go Offline Endpoint (Full Cleanup, Route Pool Reset & Matching Engine Trigger)
 app.post('/api/rides/go-offline', async (req, res) => {
