@@ -74,6 +74,8 @@ async function broadcastCorridorPoolUpdate(routeId) {
        FROM routes r
        LEFT JOIN route_pool rp
          ON rp.route_id = r.id
+        AND rp.pickup_hub_id = r.pickup_hub_id
+        AND rp.dropoff_hub_id = r.drop_off_hub_id
         AND LOWER(TRIM(rp.status)) IN ('searching', 'matched')
        WHERE r.id = $1
        GROUP BY r.id, r.standard_solo_fare, r.seat_price_2pax,
@@ -829,6 +831,11 @@ app.get('/api/routes/from/:hubId', async (req, res) => {
         latest_offer.available_seats,
         latest_offer.id AS ride_offer_id,
         latest_offer.status AS offer_status,
+        latest_offer.driver_name,
+        latest_offer.vehicle_make,
+        latest_offer.vehicle_model,
+        COALESCE(waiting_drivers.waiting_driver_count, 0) AS waiting_driver_count,
+        waiting_drivers.waiting_driver_name,
         COALESCE(pool_stats.searching_pax, 0) AS searching_pax,
         COALESCE(pool_stats.matched_pax, 0) AS matched_pax,
         COALESCE(pool_stats.current_pax, 0) AS current_pax,
@@ -839,13 +846,27 @@ app.get('/api/routes/from/:hubId', async (req, res) => {
       JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
       LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id
       LEFT JOIN LATERAL (
-        SELECT id, total_seats, available_seats, status
-        FROM ride_offers
-        WHERE route_id = r.id
-          AND LOWER(TRIM(status)) IN ('pending', 'matched', 'active', 'accepted', 'arrived', 'in_trip', 'inprogress')
-        ORDER BY created_at DESC, id DESC
+        SELECT ro.id, ro.total_seats, ro.available_seats, ro.status,
+               u.full_name AS driver_name,
+               v.make AS vehicle_make,
+               v.model AS vehicle_model
+        FROM ride_offers ro
+        LEFT JOIN users u ON u.id = ro.driver_id
+        LEFT JOIN vehicles v ON v.id = ro.vehicle_id
+        WHERE ro.route_id = r.id
+          AND LOWER(TRIM(ro.status)) IN ('pending', 'matched', 'active')
+        ORDER BY ro.created_at DESC, ro.id DESC
         LIMIT 1
       ) latest_offer ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS waiting_driver_count,
+               MAX(u.full_name) AS waiting_driver_name
+        FROM driver_queue dq
+        LEFT JOIN users u ON u.id = dq.driver_id
+        WHERE dq.route_id = r.id
+          AND dq.current_hub_id = r.pickup_hub_id
+          AND LOWER(TRIM(dq.status)) = 'queued'
+      ) waiting_drivers ON TRUE
       LEFT JOIN LATERAL (
         SELECT
           COUNT(*) FILTER (WHERE LOWER(TRIM(rp.status)) = 'searching')::int AS searching_pax,
@@ -856,6 +877,7 @@ app.get('/api/routes/from/:hubId', async (req, res) => {
         FROM route_pool rp
         WHERE rp.route_id = r.id
           AND rp.pickup_hub_id = r.pickup_hub_id
+          AND rp.dropoff_hub_id = r.drop_off_hub_id
           AND LOWER(TRIM(rp.status)) IN ('searching', 'matched')
       ) pool_stats ON TRUE
       WHERE r.pickup_hub_id = $1 AND r.is_active = TRUE
@@ -2350,6 +2372,9 @@ app.post("/api/rides/create", async (req, res) => {
       pickup_hub_id: routeData.start_hub_id,
       ride_offer_id: activeOfferData.offer_id,
       status: activeOfferData.status,
+      driver_name: driverName,
+      vehicle_make: carMake,
+      vehicle_model: carModel,
     });
 
     const filledCount = vehicleCapacity - activeOfferData.available_seats;
