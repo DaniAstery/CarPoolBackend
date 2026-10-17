@@ -835,7 +835,7 @@ app.get('/api/routes/from/:hubId', async (req, res) => {
         latest_offer.vehicle_make,
         latest_offer.vehicle_model,
         COALESCE(waiting_drivers.waiting_driver_count, 0) AS waiting_driver_count,
-        waiting_drivers.waiting_driver_name,
+        COALESCE(waiting_drivers.waiting_driver_names, ARRAY[]::text[]) AS waiting_driver_names,
         COALESCE(pool_stats.searching_pax, 0) AS searching_pax,
         COALESCE(pool_stats.matched_pax, 0) AS matched_pax,
         COALESCE(pool_stats.current_pax, 0) AS current_pax,
@@ -859,8 +859,9 @@ app.get('/api/routes/from/:hubId', async (req, res) => {
         LIMIT 1
       ) latest_offer ON TRUE
       LEFT JOIN LATERAL (
-        SELECT COUNT(*)::int AS waiting_driver_count,
-               MAX(u.full_name) AS waiting_driver_name
+        SELECT COUNT(DISTINCT dq.driver_id)::int AS waiting_driver_count,
+               ARRAY_AGG(DISTINCT NULLIF(BTRIM(u.full_name), ''))
+                 FILTER (WHERE NULLIF(BTRIM(u.full_name), '') IS NOT NULL) AS waiting_driver_names
         FROM driver_queue dq
         LEFT JOIN users u ON u.id = dq.driver_id
         WHERE dq.route_id = r.id
