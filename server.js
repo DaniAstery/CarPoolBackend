@@ -4961,28 +4961,29 @@ app.get("/api/rides/TripSummary", async (req, res) => {
         .filter(id => !isNaN(id));
     }
 
-    let activePassengers = [];
-    if (passengerIds.length > 0) {
-      // Fetch rating and phone_number from users table
-      const passengersQuery = await pool.query(
-        `SELECT id AS user_id, 
-                COALESCE(full_name, 'Rider #' || id) AS full_name,
-                COALESCE(phone_number, 'N/A') AS phone_number,
-                COALESCE(rating, 5.00) AS rating,
-                COALESCE(profile_photo_url, '') AS profile_photo_url
-         FROM users
-         WHERE id = ANY($1::int[])`,
-        [passengerIds]
-      );
-      activePassengers = passengersQuery.rows;
-    }
+    const passengersQuery = await pool.query(
+      `SELECT DISTINCT u.id AS user_id,
+              COALESCE(u.full_name, 'Rider #' || u.id) AS full_name,
+              COALESCE(u.phone_number, 'N/A') AS phone_number,
+              COALESCE(u.rating, 5.00) AS rating,
+              COALESCE(u.profile_photo_url, '') AS profile_photo_url
+       FROM users u
+       WHERE u.id = ANY($1::int[])
+          OR EXISTS (
+            SELECT 1
+            FROM route_pool rp
+            WHERE rp.user_id = u.id
+              AND rp.matched_ride_offer_id = $2
+          )
+       ORDER BY u.id`,
+      [passengerIds, rideOffer.id]
+    );
+    const activePassengers = passengersQuery.rows;
 
     const totalPassengers = activePassengers.length;
     const grossEarnings = totalPassengers * pricePerSeat;
     const platformFee = grossEarnings * 0.10;
-    const netPayout = rideOffer.final_price !== null && rideOffer.final_price !== undefined
-      ? parseFloat(rideOffer.final_price) 
-      : (grossEarnings - platformFee);
+    const netPayout = grossEarnings - platformFee;
 
     return res.status(200).json({
       success: true,
