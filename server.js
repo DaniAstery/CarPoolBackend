@@ -56,6 +56,41 @@ app.use((req, res, next) => {
 });
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+async function broadcastCorridorPoolUpdate(routeId) {
+  try {
+    const result = await pool.query(
+      `SELECT r.id AS route_id,
+              COUNT(rp.id) FILTER (WHERE LOWER(TRIM(rp.status)) = 'searching')::int AS searching_pax,
+              COUNT(rp.id) FILTER (WHERE LOWER(TRIM(rp.status)) = 'matched')::int AS matched_pax,
+              COUNT(rp.id)::int AS current_pax,
+              MAX(rp.joined_at) FILTER (WHERE LOWER(TRIM(rp.status)) = 'matched') AS matched_at,
+              MAX(rp.joined_at) FILTER (WHERE LOWER(TRIM(rp.status)) = 'matched') + INTERVAL '3 minutes' AS match_expires_at,
+              CASE
+                WHEN COUNT(rp.id) = 0 THEN COALESCE(NULLIF(r.standard_solo_fare, 0), r.recommended_base_price)
+                WHEN COUNT(rp.id) = 1 THEN COALESCE(NULLIF(r.seat_price_2pax, 0), r.recommended_base_price)
+                WHEN COUNT(rp.id) = 2 THEN COALESCE(NULLIF(r.seat_price_3pax, 0), NULLIF(r.seat_price_2pax, 0), r.recommended_base_price)
+                ELSE COALESCE(NULLIF(r.seat_price_4pax, 0), NULLIF(r.seat_price_3pax, 0), r.recommended_base_price)
+              END AS price
+       FROM routes r
+       LEFT JOIN route_pool rp
+         ON rp.route_id = r.id
+        AND LOWER(TRIM(rp.status)) IN ('searching', 'matched')
+       WHERE r.id = $1
+       GROUP BY r.id, r.standard_solo_fare, r.seat_price_2pax,
+                r.seat_price_3pax, r.seat_price_4pax, r.recommended_base_price`,
+      [routeId]
+    );
+
+    if (result.rows.length > 0) {
+      const update = result.rows[0];
+      update.status = update.matched_pax > 0 ? "matched" : "searching";
+      io.emit("route_pool_updated", update);
+    }
+  } catch (err) {
+    console.error(`Failed to broadcast corridor pool update for route ${routeId}:`, err);
+  }
+}
+
 // ------------------------------------------------------------------
 // 🔔 DEDICATED POSTGRES LISTENERS (RUN ONCE ON BOOT)
 // ------------------------------------------------------------------
@@ -760,11 +795,15 @@ function startRoutePoolListener(ioServer) {
 // ==========================================
 app.get('/api/routes/from/:hubId', async (req, res) => {
   try {
-    const hubId = req.params.hubId;
-    
+    const hubId = Number.parseInt(req.params.hubId, 10);
+    if (!Number.isInteger(hubId) || hubId <= 0) {
+      return res.status(400).json({ error: "A valid pickup hub ID is required." });
+    }
+
     const query = `
-      SELECT 
+      SELECT
         r.id AS route_id,
+        r.id,
         r.hub_id,
         r.pickup_hub_id,
         r.drop_off_hub_id,
@@ -776,12 +815,51 @@ app.get('/api/routes/from/:hubId', async (req, res) => {
         r.standard_solo_fare,
         r.seat_price_2pax,
         r.seat_price_3pax,
-        r.seat_price_4pax
+        r.seat_price_4pax,
+        CASE
+          WHEN COALESCE(pool_stats.current_pax, 0) = 0
+            THEN COALESCE(NULLIF(r.standard_solo_fare, 0), r.recommended_base_price, 0)
+          WHEN COALESCE(pool_stats.current_pax, 0) = 1
+            THEN COALESCE(NULLIF(r.seat_price_2pax, 0), r.recommended_base_price, 0)
+          WHEN COALESCE(pool_stats.current_pax, 0) = 2
+            THEN COALESCE(NULLIF(r.seat_price_3pax, 0), NULLIF(r.seat_price_2pax, 0), r.recommended_base_price, 0)
+          ELSE COALESCE(NULLIF(r.seat_price_4pax, 0), NULLIF(r.seat_price_3pax, 0), r.recommended_base_price, 0)
+        END AS price,
+        COALESCE(latest_offer.total_seats, 4) AS total_seats,
+        latest_offer.available_seats,
+        latest_offer.id AS ride_offer_id,
+        latest_offer.status AS offer_status,
+        COALESCE(pool_stats.searching_pax, 0) AS searching_pax,
+        COALESCE(pool_stats.matched_pax, 0) AS matched_pax,
+        COALESCE(pool_stats.current_pax, 0) AS current_pax,
+        pool_stats.matched_at,
+        pool_stats.match_expires_at
       FROM routes r
       JOIN hubs h_pickup ON r.pickup_hub_id = h_pickup.id
       JOIN hubs h_drop ON r.drop_off_hub_id = h_drop.id
       LEFT JOIN hubs h_pass ON r.pass_through_hub_id = h_pass.id
-      WHERE r.pickup_hub_id = $1 AND r.is_active = true;
+      LEFT JOIN LATERAL (
+        SELECT id, total_seats, available_seats, status
+        FROM ride_offers
+        WHERE route_id = r.id
+          AND LOWER(TRIM(status)) IN ('pending', 'matched', 'active', 'accepted', 'arrived', 'in_trip', 'inprogress')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      ) latest_offer ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT
+          COUNT(*) FILTER (WHERE LOWER(TRIM(rp.status)) = 'searching')::int AS searching_pax,
+          COUNT(*) FILTER (WHERE LOWER(TRIM(rp.status)) = 'matched')::int AS matched_pax,
+          COUNT(*)::int AS current_pax,
+          MAX(rp.joined_at) FILTER (WHERE LOWER(TRIM(rp.status)) = 'matched') AS matched_at,
+          MAX(rp.joined_at) FILTER (WHERE LOWER(TRIM(rp.status)) = 'matched') + INTERVAL '3 minutes' AS match_expires_at
+        FROM route_pool rp
+        WHERE rp.route_id = r.id
+          AND rp.pickup_hub_id = r.pickup_hub_id
+          AND LOWER(TRIM(rp.status)) IN ('searching', 'matched')
+      ) pool_stats ON TRUE
+      WHERE r.pickup_hub_id = $1 AND r.is_active = TRUE
+      ORDER BY r.id;
     `;
 
     const result = await pool.query(query, [hubId]);
@@ -940,66 +1018,94 @@ app.get('/', (req, res) => {
    passthrough and eliminate the persistent 404 HTML override error.
 =========================================================================== */
 app.get("/api/routes/status/:userId", async (req, res) => {
-  const { userId } = req.params;
-
-  if (!userId) {
-    return res.status(400).json({ error: "Missing user identification query path." });
+  const userId = Number.parseInt(req.params.userId, 10);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: "A valid user ID is required." });
   }
 
   try {
-    // 🎯 FIX 1: Search for rows that are either 'matched' OR 'arrived' 
     const currentPoolQuery = await pool.query(
-      `SELECT id, matched_ride_offer_id, status, joined_at 
-       FROM route_pool 
-       WHERE user_id = $1 AND status IN ('matched', 'arrived') 
+      `SELECT id, route_id, pickup_hub_id, dropoff_hub_id,
+              matched_ride_offer_id, status, joined_at
+       FROM route_pool
+       WHERE user_id = $1
+         AND LOWER(TRIM(status)) NOT IN ('completed', 'cancelled', 'expired', 'idle')
        ORDER BY joined_at DESC LIMIT 1`,
-      [parseInt(userId, 10)]
+      [userId]
     );
 
-    // If no row is matched or arrived yet, return the default searching state
     if (currentPoolQuery.rows.length === 0) {
-      // Find how many other people are waiting at the same hub for queue counts
-      const countQuery = await pool.query(
-        `SELECT COUNT(*) FROM route_pool WHERE status = 'searching'`
-      );
-      
-      return res.json({
-        status: "searching",
-        currentPoolCount: parseInt(countQuery.rows[0].count, 10) || 1
-      });
+      return res.json({ status: "idle", currentPoolCount: 0, passengers: [] });
     }
 
     const activePoolRow = currentPoolQuery.rows[0];
     const rideOfferId = activePoolRow.matched_ride_offer_id;
-
-    // 🎯 FIX 2: Gather co-riders matching this trip lifecycle block
-    const passengersQuery = await pool.query(
-      `SELECT user_id, status 
-       FROM route_pool 
-       WHERE matched_ride_offer_id = $1 AND status IN ('matched', 'arrived')`,
-      [rideOfferId]
+    const cohortQuery = await pool.query(
+      `SELECT rp.user_id, rp.status, rp.joined_at
+       FROM route_pool rp
+       WHERE LOWER(TRIM(rp.status)) IN ('searching', 'matched', 'accepted', 'arrived', 'in_trip')
+         AND (
+           ($1::int IS NOT NULL AND rp.matched_ride_offer_id = $1)
+           OR (
+             $1::int IS NULL
+             AND rp.route_id = $2
+             AND rp.pickup_hub_id = $3
+             AND rp.dropoff_hub_id = $4
+             AND rp.matched_ride_offer_id IS NULL
+           )
+         )
+       ORDER BY rp.joined_at, rp.user_id`,
+      [
+        rideOfferId,
+        activePoolRow.route_id,
+        activePoolRow.pickup_hub_id,
+        activePoolRow.dropoff_hub_id,
+      ]
     );
-
-    const parsedPassengers = passengersQuery.rows.map(row => ({
+    const parsedPassengers = cohortQuery.rows.map((row) => ({
+      user_id: row.user_id,
       userId: row.user_id,
-      status: row.status // Will return 'matched' or 'arrived' cleanly
+      status: row.status,
     }));
-
-    // Fetch the ride tracking state from offer parameters
-    const rideOfferQuery = await pool.query(
-      `SELECT status FROM ride_offers WHERE id = $1`,
-      [rideOfferId]
+    const currentPoolCount = parsedPassengers.length;
+    const currentPassengerIndex = Math.max(
+      1,
+      cohortQuery.rows.findIndex((row) => Number(row.user_id) === userId) + 1
     );
 
-    const rideStatus = rideOfferQuery.rows[0]?.status || "pending";
+    const routeQuery = await pool.query(
+      `SELECT
+         r.id AS route_id,
+         CASE
+           WHEN $2 = 1 THEN COALESCE(NULLIF(r.standard_solo_fare, 0), r.recommended_base_price, 0)
+           WHEN $2 = 2 THEN COALESCE(NULLIF(r.seat_price_2pax, 0), r.recommended_base_price, 0)
+           WHEN $2 = 3 THEN COALESCE(NULLIF(r.seat_price_3pax, 0), NULLIF(r.seat_price_2pax, 0), r.recommended_base_price, 0)
+           ELSE COALESCE(NULLIF(r.seat_price_4pax, 0), NULLIF(r.seat_price_3pax, 0), r.recommended_base_price, 0)
+         END AS price
+       FROM routes r
+       WHERE r.id = $1`,
+      [activePoolRow.route_id, currentPassengerIndex]
+    );
 
-    // Send complete structural mapping back to the frontend loop
+    const rideOfferQuery = rideOfferId
+      ? await pool.query(
+          `SELECT status, price_per_seat FROM ride_offers WHERE id = $1`,
+          [rideOfferId]
+        )
+      : { rows: [] };
+    const rideStatus = rideOfferQuery.rows[0]?.status || null;
+    const price = Number(routeQuery.rows[0]?.price ?? rideOfferQuery.rows[0]?.price_per_seat ?? 0);
+
     return res.json({
-      status: activePoolRow.status, // Returns 'matched' or 'arrived'
+      status: activePoolRow.status,
+      poolId: activePoolRow.id,
+      routeId: activePoolRow.route_id,
       matched_ride_offer_id: rideOfferId,
+      currentPoolCount,
       rideStatus: rideStatus,
-      finalPrice: 80, // Dynamic cost matrix placeholder
-      passengers: parsedPassengers
+      finalPrice: price,
+      pricePerSeat: price,
+      passengers: parsedPassengers,
     });
 
   } catch (err) {
@@ -1313,7 +1419,8 @@ app.post("/api/routes/join", async (req, res) => {
     // 1. Duplicate check
     const duplicateCheck = await client.query(
       `SELECT id, status, matched_ride_offer_id FROM route_pool 
-       WHERE user_id = $1 AND TRIM(LOWER(status)) NOT IN ('completed', 'cancelled') 
+       WHERE user_id = $1
+         AND TRIM(LOWER(status)) NOT IN ('completed', 'cancelled', 'expired', 'idle')
        LIMIT 1 FOR UPDATE;`, 
       [parseInt(user_id, 10)]
     );
@@ -1380,6 +1487,7 @@ app.post("/api/routes/join", async (req, res) => {
       : "MatchingScreen";
 
     console.log(`✅ [JOIN_FLOW_SUCCESS] Returning response with navigateTo: ${navigateTo}`);
+    await broadcastCorridorPoolUpdate(parseInt(route_id, 10));
 
     return res.status(200).json({ 
       success: true, 
@@ -1769,80 +1877,6 @@ app.get("/api/hubs/search/:term", async (req, res) => {
   } catch (err) {
     console.error("❌ Error searching hubs:", err.message);
     res.status(500).json({ error: "Server error" });
-  }
-});
-
-/* ---------------- GET CORRIDORS FROM PICKUP HUB (MATCHING EXISTING RIDE_OFFERS) ---------------- */
-app.get("/api/routes/from/:pickupHub", async (req, res) => {
-  try {
-    const { pickupHub } = req.params;
-    console.log(`🔍 [API] Fetching corridors for pickupHub parameter: "${pickupHub}"`);
-    
-    const result = await pool.query(
-      `SELECT 
-        r.id AS route_id,
-        r.id AS id,
-        r.hub_id AS parent_hub_id,
-        r.pickup_hub_id,
-        COALESCE(h_pickup.name, 'Unknown Hub') AS pickup_hub_name,
-        r.drop_off_hub_id,
-        COALESCE(h_drop.name, 'Destination') AS name,
-        COALESCE(h_drop.name, 'Destination') AS destination_name,
-        r.pass_through_hub_id,
-        h_pass.name AS pass_through_name,
-        r.recommended_base_price,
-        
-        -- Dynamic pricing matching your trigger tiers
-        CASE 
-          WHEN COALESCE(pool_stats.current_pax, 0) = 0 THEN COALESCE(r.standard_solo_fare, r.recommended_base_price, 0)
-          WHEN COALESCE(pool_stats.current_pax, 0) = 1 THEN COALESCE(r.seat_price_2pax, r.recommended_base_price, 0)
-          WHEN COALESCE(pool_stats.current_pax, 0) = 2 THEN COALESCE(r.seat_price_3pax, r.seat_price_2pax, 0)
-          ELSE COALESCE(r.seat_price_4pax, r.seat_price_3pax, 0)
-        END AS price,
-        
-        latest_ro.available_seats,
-        latest_ro.total_seats,
-        latest_ro.id AS ride_offer_id,
-        latest_ro.status AS offer_status,
-
-        -- Live Passenger Counts for the UI
-        COALESCE(pool_stats.searching_pax, 0) AS searching_pax,
-        COALESCE(pool_stats.matched_pax, 0) AS matched_pax,
-        COALESCE(pool_stats.current_pax, 0) AS current_pax
-
-      FROM routes r
-      LEFT JOIN hubs h_pickup ON h_pickup.id = r.pickup_hub_id
-      LEFT JOIN hubs h_drop ON h_drop.id = r.drop_off_hub_id
-      LEFT JOIN hubs h_pass ON h_pass.id = r.pass_through_hub_id
-      
-      LEFT JOIN LATERAL (
-        SELECT id, price_per_seat, available_seats, total_seats, status
-        FROM ride_offers 
-        WHERE ride_offers.route_id = r.id 
-          AND status IN ('pending', 'matched', 'active')
-        ORDER BY id DESC 
-        LIMIT 1
-      ) latest_ro ON true
-
-      -- Aggregate directly from route_pool so initial state is never 0 if passengers exist
-      LEFT JOIN LATERAL (
-        SELECT 
-          COUNT(CASE WHEN rp.status = 'searching' THEN 1 END)::int AS searching_pax,
-          COUNT(CASE WHEN rp.status = 'matched' THEN 1 END)::int AS matched_pax,
-          COUNT(CASE WHEN rp.status IN ('searching', 'matched') THEN 1 END)::int AS current_pax
-        FROM route_pool rp
-        WHERE rp.route_id = r.id AND rp.status IN ('searching', 'matched')
-      ) pool_stats ON true
-      
-      WHERE LOWER(h_pickup.name) = LOWER($1) OR r.pickup_hub_id::text = $1
-      ORDER BY r.id;`,
-      [pickupHub]
-    );
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error("❌ Error fetching corridors from hub:", err.message);
-    res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
@@ -2310,6 +2344,13 @@ app.post("/api/rides/create", async (req, res) => {
     }
 
     await client.query("COMMIT");
+    await broadcastCorridorPoolUpdate(parseInt(route_id, 10));
+    io.emit("corridor_offer_updated", {
+      route_id: parseInt(route_id, 10),
+      pickup_hub_id: routeData.start_hub_id,
+      ride_offer_id: activeOfferData.offer_id,
+      status: activeOfferData.status,
+    });
 
     const filledCount = vehicleCapacity - activeOfferData.available_seats;
 
