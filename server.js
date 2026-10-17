@@ -3051,7 +3051,7 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
     // 1. Fetch offer details including total_seats and resolved hub coordinates
           const offerQuery = await pool.query(
         `SELECT ro.id, ro.status, ro.price_per_seat, ro.pickup_lat, ro.pickup_lng, ro.route_id,
-                ro.start_location, ro.end_location, ro.total_seats,
+                  ro.start_location, ro.end_location, ro.total_seats, ro.accepted_passengers,
                 h_start.name AS start_hub_name, h_start.latitude AS start_hub_lat, h_start.longitude AS start_hub_lng,
                 h_end.name AS end_hub_name, h_end.latitude AS end_hub_lat, h_end.longitude AS end_hub_lng
         FROM ride_offers ro
@@ -3077,6 +3077,16 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
       [rideOfferId]
     );
 
+    const acceptedPassengerIds = Array.isArray(offer.accepted_passengers)
+      ? offer.accepted_passengers.map((id) => parseInt(id, 10)).filter(Number.isInteger)
+      : typeof offer.accepted_passengers === "string"
+        ? offer.accepted_passengers
+            .replace(/[{}]/g, "")
+            .split(",")
+            .map((id) => parseInt(id.trim(), 10))
+            .filter(Number.isInteger)
+        : [];
+
     // 3. Construct rich payload
     const trackingPayload = {
       rideOfferId: offer.id,
@@ -3092,13 +3102,15 @@ app.get("/api/rides/track-live/offer/:id", async (req, res) => {
       destinationName: offer.end_hub_name || offer.end_location || "Destination Hub",
       
       driverLocation: {
-        latitude: parseFloat(offer.pickup_lat) || 9.0106,
-        longitude: parseFloat(offer.pickup_lng) || 38.7894
+        latitude: Number.isFinite(parseFloat(offer.pickup_lat)) ? parseFloat(offer.pickup_lat) : null,
+        longitude: Number.isFinite(parseFloat(offer.pickup_lng)) ? parseFloat(offer.pickup_lng) : null
       },
       destinationLocation: {
-        latitude: parseFloat(offer.end_hub_lat) || 9.0125,
-        longitude: parseFloat(offer.end_hub_lng) || 38.7535
+        latitude: Number.isFinite(parseFloat(offer.end_hub_lat)) ? parseFloat(offer.end_hub_lat) : null,
+        longitude: Number.isFinite(parseFloat(offer.end_hub_lng)) ? parseFloat(offer.end_hub_lng) : null,
+        name: offer.end_hub_name || null
       },
+      accepted_passengers: acceptedPassengerIds,
       
       passengers: passengersQuery.rows.map(row => ({
         userId: parseInt(row.user_id, 10), 
@@ -3976,11 +3988,12 @@ app.post("/api/rides/complete", async (req, res) => {
   try {
     let targetRideOfferId = ride_offer_id;
     let pricePerSeat = 0;
+    let acceptedPassengers = [];
 
     // 1. If driver_id is provided, find the active ride offer (prioritizing 'in_trip')
     if (driver_id && !targetRideOfferId) {
       const offerCheck = await pool.query(
-        `SELECT id, price_per_seat, status 
+        `SELECT id, price_per_seat, status, accepted_passengers
          FROM ride_offers 
          WHERE driver_id = $1 AND LOWER(TRIM(status)) IN ('in_trip', 'accepted', 'arrived', 'heading_to_pickup')
          ORDER BY CASE WHEN LOWER(TRIM(status)) = 'in_trip' THEN 1 ELSE 2 END, id DESC 
@@ -3994,18 +4007,19 @@ app.post("/api/rides/complete", async (req, res) => {
 
       targetRideOfferId = offerCheck.rows[0].id;
       pricePerSeat = parseFloat(offerCheck.rows[0].price_per_seat) || 0;
+      acceptedPassengers = offerCheck.rows[0].accepted_passengers || [];
     } else {
       // Fallback lookup using direct ride_offer_id
       const offerCheck = await pool.query(
-        "SELECT price_per_seat FROM ride_offers WHERE id = $1",
+        "SELECT price_per_seat, accepted_passengers FROM ride_offers WHERE id = $1",
         [targetRideOfferId]
       );
 
       if (offerCheck.rows.length === 0) {
         return res.status(404).json({ error: "Ride offer target profile instance not found." });
       }
-
       pricePerSeat = parseFloat(offerCheck.rows[0].price_per_seat) || 0;
+      acceptedPassengers = offerCheck.rows[0].accepted_passengers || [];
     }
 
     // 2. Synchronize associated users in route_pool to 'completed'
@@ -4017,7 +4031,20 @@ app.post("/api/rides/complete", async (req, res) => {
       [targetRideOfferId]
     );
 
-    const completedRidersCount = passengerUpdate.rowCount || 0;
+    const acceptedPassengerIds = Array.isArray(acceptedPassengers)
+      ? acceptedPassengers.map((id) => parseInt(id, 10)).filter(Number.isInteger)
+      : typeof acceptedPassengers === "string"
+        ? acceptedPassengers
+            .replace(/[{}]/g, "")
+            .split(",")
+            .map((id) => parseInt(id.trim(), 10))
+            .filter(Number.isInteger)
+        : [];
+    const completedPassengerIds = new Set([
+      ...acceptedPassengerIds,
+      ...passengerUpdate.rows.map((passenger) => parseInt(passenger.user_id, 10)).filter(Number.isInteger),
+    ]);
+    const completedRidersCount = completedPassengerIds.size;
     const calculatedFinalPrice = completedRidersCount * pricePerSeat;
 
     // 3. Finalize parent driver offer row state to 'completed'
