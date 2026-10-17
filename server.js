@@ -1074,7 +1074,8 @@ app.get("/passenger/status/:userId", async (req, res) => {
         rp.status AS pool_status,
         rp.route_id,
         rp.matched_ride_offer_id,
-        r.status AS ride_status
+        r.status AS ride_status,
+        r.created_at AS ride_created_at
       FROM route_pool rp
       LEFT JOIN ride_offers r ON rp.matched_ride_offer_id = r.id
       WHERE rp.user_id = $1 
@@ -1092,7 +1093,8 @@ app.get("/passenger/status/:userId", async (req, res) => {
           rp.status AS pool_status,
           rp.route_id,
           rp.matched_ride_offer_id,
-          r.status AS ride_status
+          r.status AS ride_status,
+          r.created_at AS ride_created_at
         FROM route_pool rp
         LEFT JOIN ride_offers r ON rp.matched_ride_offer_id = r.id
         WHERE rp.user_id = $1
@@ -1107,10 +1109,15 @@ app.get("/passenger/status/:userId", async (req, res) => {
     }
 
     const row = result.rows[0];
-    
     let effectiveStatus = row.pool_status || "idle";
     if (row.ride_status === 'in_trip' || row.pool_status === 'in_trip') {
       effectiveStatus = 'in_trip';
+    }
+    if (String(effectiveStatus).toLowerCase().trim() === "completed") {
+      const completedAt = new Date(row.ride_created_at).getTime();
+      if (!Number.isFinite(completedAt) || Date.now() - completedAt >= 15 * 60 * 1000) {
+        return res.json({ status: "idle" });
+      }
     }
 
     return res.json({
@@ -1847,13 +1854,18 @@ app.post("/api/rides/start-trip", async (req, res) => {
     });
   }
 
-  const { driver_id, driverId } = req.body;
+  const { driver_id, driverId, ride_offer_id, rideOfferId } = req.body;
   const targetDriverId = parseInt(driver_id || driverId, 10);
+  const rideOfferParam = ride_offer_id || rideOfferId;
+  const targetRideOfferId = rideOfferParam ? parseInt(rideOfferParam, 10) : null;
 
   console.log(`🎬 [START TRIP] Request received for Driver ID: ${targetDriverId}`);
 
   if (!targetDriverId || isNaN(targetDriverId)) {
     return res.status(400).json({ error: "Missing or invalid driver_id parameter format." });
+  }
+  if (rideOfferParam && (!targetRideOfferId || isNaN(targetRideOfferId))) {
+    return res.status(400).json({ error: "Invalid ride_offer_id." });
   }
 
   const client = await pool.connect();
@@ -1868,8 +1880,9 @@ app.post("/api/rides/start-trip", async (req, res) => {
            created_at = NOW()
        WHERE driver_id = $1 
          AND TRIM(LOWER(status)) IN ('arrived', 'in_trip')
+         AND ($2::integer IS NULL OR id = $2)
        RETURNING id, status, route_id, driver_id;`,
-      [targetDriverId]
+      [targetDriverId, targetRideOfferId]
     );
 
     if (updateOffer.rows.length === 0) {
@@ -3130,7 +3143,7 @@ app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
        LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
        LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
        WHERE ro.driver_id = $1 
-         AND ro.status IN ('pending', 'accepted', 'arrived', 'matched', 'in_trip', 'inprogress')
+         AND ro.status IN ('pending', 'proposed', 'accepted', 'arrived', 'matched', 'in_trip', 'inprogress')
        ORDER BY ro.created_at DESC 
        LIMIT 1`,
       [driverId]
@@ -3253,14 +3266,28 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
     // 4. Fetch ONLY passengers linked strictly to THIS active ride offer ID
     // (Prevents duplicate historical records from leaking in from previous completed rides)
     const passengersQuery = await pool.query(
-      `SELECT rp.user_id, rp.status, 
-              COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS passenger_name, 
-              u.phone_number 
+      `SELECT rp.user_id, rp.status,
+              COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS passenger_name,
+              u.phone_number,
+              rp.joined_at
        FROM route_pool rp
        LEFT JOIN users u ON rp.user_id = u.id
        WHERE rp.matched_ride_offer_id = $1
-       ORDER BY rp.joined_at ASC`,
-      [offer.id]
+       UNION ALL
+       SELECT accepted.user_id, 'accepted' AS status,
+              COALESCE(u.full_name, 'Passenger ' || accepted.user_id) AS passenger_name,
+              u.phone_number,
+              NULL AS joined_at
+       FROM unnest($2::integer[]) AS accepted(user_id)
+       LEFT JOIN users u ON u.id = accepted.user_id
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM route_pool rp
+         WHERE rp.matched_ride_offer_id = $1
+           AND rp.user_id = accepted.user_id
+       )
+       ORDER BY joined_at NULLS LAST`,
+      [offer.id, acceptedIdsArray]
     );
 
     // 5. Map passengers and prioritize 'accepted' state if present in accepted_passengers array
@@ -3693,7 +3720,7 @@ app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
     }
 
     const latestOffer = result.rows[0];
-    const normalizedStatus = latestOffer.status.trim().toLowerCase();
+    const normalizedStatus = String(latestOffer.status || "").trim().toLowerCase();
 
     // 1. If it's an ongoing active trip, pass it up instantly
     if (normalizedStatus !== 'cancelled' && normalizedStatus !== 'completed') {
@@ -3701,26 +3728,21 @@ app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
         hasActiveSession: true,
         rideOfferId: latestOffer.id,
         routeId: latestOffer.route_id,
-        status: latestOffer.status.trim(),
+        status: normalizedStatus,
         driverId: latestOffer.driver_id
       });
     }
 
     // 2. If it's 'completed' but happened within the last 15 minutes, route to Earnings
-    if (normalizedStatus === 'completed') {
-      const completionTime = new Date(latestOffer.joined_at).getTime();
-      const currentTime = new Date().getTime();
-      const minutesElapsed = (currentTime - completionTime) / (1000 * 60);
-
-      if (minutesElapsed < 15) { // ⏳ 15-minute persistent window
-        return res.status(200).json({
-          hasActiveSession: true, // Mark true to force interception lock
-          rideOfferId: latestOffer.id,
-          routeId: latestOffer.route_id,
-          status: 'completed',
-          driverId: latestOffer.driver_id
-        });
-      }
+    const completionAgeMs = Date.now() - new Date(latestOffer.created_at).getTime();
+    if (normalizedStatus === 'completed' && completionAgeMs >= 0 && completionAgeMs < 15 * 60 * 1000) {
+      return res.status(200).json({
+        hasActiveSession: true,
+        rideOfferId: latestOffer.id,
+        routeId: latestOffer.route_id,
+        status: 'completed',
+        driverId: latestOffer.driver_id
+      });
     }
 
     // If it's a cold/stale completed trip, let them access manual route config
@@ -3853,11 +3875,16 @@ app.post("/api/rides/arrive", async (req, res) => {
     });
   }
 
-  const { driver_id, driverId } = req.body;
+  const { driver_id, driverId, ride_offer_id, rideOfferId } = req.body;
   const targetDriverId = parseInt(driver_id || driverId, 10);
+  const rideOfferParam = ride_offer_id || rideOfferId;
+  const targetRideOfferId = rideOfferParam ? parseInt(rideOfferParam, 10) : null;
 
   if (!targetDriverId || isNaN(targetDriverId)) {
     return res.status(400).json({ error: "Missing or invalid required parameter: driver_id" });
+  }
+  if (rideOfferParam && (!targetRideOfferId || isNaN(targetRideOfferId))) {
+    return res.status(400).json({ error: "Invalid ride_offer_id." });
   }
 
   try {
@@ -3867,8 +3894,9 @@ app.post("/api/rides/arrive", async (req, res) => {
        SET status = 'arrived' 
        WHERE driver_id = $1 
          AND TRIM(LOWER(status)) IN ('accepted', 'arrived', 'matched')
+         AND ($2::integer IS NULL OR id = $2)
        RETURNING id, driver_id, status;`,
-      [targetDriverId]
+      [targetDriverId, targetRideOfferId]
     );
 
     if (updateRideOfferQuery.rows.length === 0) {
@@ -3894,62 +3922,45 @@ app.post("/api/rides/arrive", async (req, res) => {
 });
 
 
+app.get("/api/rides/solo/recovery/:userId", async (req, res) => {
+  const userId = parseInt(req.params.userId, 10);
+  const role = String(req.query.role || "").toLowerCase().trim();
+  const includeRecentCompletion = req.query.include_completed === "true" && role === "passenger";
+  if (!Number.isInteger(userId) || !["driver", "passenger"].includes(role)) {
+    return res.status(400).json({ error: "A valid userId and role are required." });
+  }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-// GET /api/rides/driver-active-session/:driverId
-app.get("/api/rides/driver-active-session/:driverId", async (req, res) => {
   try {
-    const { driverId } = req.params;
-
-    if (!driverId) {
-      return res.status(400).json({ error: "Missing driverId tracking parameter." });
-    }
-
-    // 🎯 FIX: Force LOWER() handling to ensure camelCase 'inTransit' isn't dropped by strict matches
+    const ownerColumn = role === "driver" ? "driver_id" : "user_id";
+    const statuses = role === "driver"
+      ? ["accepted", "arrived", "heading_to_pickup", "in_trip", "intransit"]
+      : ["pending", "searching", "accepted", "arrived", "in_trip", "intransit"];
     const result = await pool.query(
-      `SELECT id, route_id, status 
-       FROM ride_offers 
-       WHERE driver_id = $1 
-         AND LOWER(status) NOT IN ('cancelled', 'completed')
-       ORDER BY created_at DESC 
-       LIMIT 1;`,
-      [parseInt(driverId, 10)]
+      `SELECT ride.*, passenger.full_name AS passenger_name,
+              passenger.phone_number AS passenger_phone,
+              driver.full_name AS driver_name,
+              driver.phone_number AS driver_phone
+       FROM ride_request_solo ride
+       LEFT JOIN users passenger ON passenger.id = ride.user_id
+       LEFT JOIN users driver ON driver.id = ride.driver_id
+       WHERE ride.${ownerColumn} = $1
+         AND (
+           LOWER(TRIM(ride.status)) = ANY($2::text[])
+           OR (
+             $3::boolean
+             AND LOWER(TRIM(ride.status)) = 'completed'
+             AND ride.updated_at >= NOW() - INTERVAL '15 minutes'
+           )
+         )
+       ORDER BY ride.updated_at DESC NULLS LAST, ride.created_at DESC
+       LIMIT 1`,
+      [userId, statuses, includeRecentCompletion]
     );
 
-    // If no row is open, tell the gatekeeper it's safe to stay on CreateCorridorScreen
-    if (result.rows.length === 0) {
-      return res.status(200).json({ 
-        hasActiveSession: false,
-        message: "No active or ongoing corridor sessions found." 
-      });
-    }
-
-    const activeOffer = result.rows[0];
-    console.log(`📡 Gateway API serving active offer #${activeOffer.id} with status: [${activeOffer.status}]`);
-
-    // Return the response keys structured for your frontend switch matrix
-    return res.status(200).json({
-      hasActiveSession: true,
-      rideOfferId: activeOffer.id,
-      routeId: activeOffer.route_id,
-      status: activeOffer.status // Passes 'inTransit' straight up
-    });
-
+    return res.json({ success: true, ride: result.rows[0] || null });
   } catch (err) {
-    console.error("❌ GATEKEEPER SERVICE REJECT:", err.message);
-    return res.status(500).json({ error: `Internal gatekeeper database fault: ${err.message}` });
+    console.error("Solo ride lifecycle recovery failed:", err);
+    return res.status(500).json({ error: "Unable to recover the active solo ride." });
   }
 });
 
@@ -4013,7 +4024,8 @@ app.post("/api/rides/complete", async (req, res) => {
     const offerUpdate = await pool.query(
       `UPDATE ride_offers 
        SET status = 'completed', 
-           final_price = $1
+           final_price = $1,
+           created_at = NOW()
        WHERE id = $2 
        RETURNING id, status, final_price`,
       [calculatedFinalPrice, targetRideOfferId]
