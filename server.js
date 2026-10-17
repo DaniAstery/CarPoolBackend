@@ -1016,6 +1016,7 @@ app.get('/api/rides/map_coordinates', async (req, res) => {
     let query = `
       SELECT 
         ro.id AS ride_offer_id,
+        ro.route_id,
         ro.driver_id,
         ro.status,
         ro.price_per_seat,
@@ -1030,8 +1031,9 @@ app.get('/api/rides/map_coordinates', async (req, res) => {
         eh.latitude AS end_latitude,
         eh.longitude AS end_longitude
       FROM ride_offers ro
-      JOIN hubs sh ON ro.start_location::integer = sh.id
-      JOIN hubs eh ON ro.end_location::integer = eh.id
+      JOIN routes rt ON rt.id = ro.route_id
+      JOIN hubs sh ON sh.id = rt.pickup_hub_id
+      JOIN hubs eh ON eh.id = rt.drop_off_hub_id
     `;
 
     let queryParams = [];
@@ -2740,33 +2742,39 @@ app.post('/api/rides/accept', async (req, res) => {
    ========================================================================= */
 
 app.post("/api/rides/signal-arrival", async (req, res) => {
-  const { user_id, userId } = req.body;
+  const { user_id, userId, ride_offer_id, rideOfferId } = req.body;
   const targetUserId = parseInt(user_id || userId, 10);
+  const targetRideOfferId = parseInt(ride_offer_id || rideOfferId, 10);
 
   if (!targetUserId || isNaN(targetUserId)) {
     return res.status(400).json({ error: "Missing or invalid user_id." });
+  }
+  if ((ride_offer_id || rideOfferId) && (!targetRideOfferId || isNaN(targetRideOfferId))) {
+    return res.status(400).json({ error: "Invalid ride_offer_id." });
   }
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // 1. Find active route_pool record for the user ensuring:
-    //    - route_pool status is 'accepted'
-    //    - ride_offers status is either 'accepted' or 'arrived'
+    // Accepting 'arrived' makes retries safe if a previous response was lost.
     const poolCheckQuery = `
       SELECT rp.id, rp.matched_ride_offer_id, rp.status, ro.status AS ride_status, ro.accepted_passengers
       FROM route_pool rp
       JOIN ride_offers ro ON rp.matched_ride_offer_id = ro.id
       WHERE rp.user_id = $1 
-        AND LOWER(TRIM(rp.status)) = 'accepted'
+        AND LOWER(TRIM(rp.status)) IN ('accepted', 'arrived')
         AND LOWER(TRIM(ro.status)) IN ('accepted', 'arrived')
         AND $1 = ANY(ro.accepted_passengers)
+        AND ($2::integer IS NULL OR ro.id = $2)
       ORDER BY rp.joined_at DESC
       LIMIT 1;
     `;
 
-    const poolResult = await client.query(poolCheckQuery, [targetUserId]);
+    const poolResult = await client.query(poolCheckQuery, [
+      targetUserId,
+      Number.isNaN(targetRideOfferId) ? null : targetRideOfferId
+    ]);
 
     if (poolResult.rows.length === 0) {
       await client.query("ROLLBACK");
@@ -2780,17 +2788,49 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
     const poolRowId = activePoolRow.id;
 
     // 2. Update the active route_pool record status to 'arrived'
-    await client.query(
-      `UPDATE route_pool 
-       SET status = 'arrived' 
-       WHERE id = $1;`,
-      [poolRowId]
-    );
+    if (activePoolRow.status.toLowerCase().trim() !== "arrived") {
+      await client.query(
+        `UPDATE route_pool
+         SET status = 'arrived'
+         WHERE id = $1;`,
+        [poolRowId]
+      );
+    }
 
     // 3. Fetch updated co-riders manifest for this ride offer
+    const acceptedPassengerIds = Array.isArray(activePoolRow.accepted_passengers)
+      ? activePoolRow.accepted_passengers.map(id => parseInt(id, 10)).filter(id => !isNaN(id))
+      : [];
     const passengersQuery = await client.query(
-      `SELECT user_id, TRIM(LOWER(status)) as status FROM route_pool WHERE matched_ride_offer_id = $1`,
-      [targetRideId]
+      `SELECT rp.user_id,
+              CASE
+                WHEN TRIM(LOWER(rp.status)) IN ('accepted', 'arrived') THEN TRIM(LOWER(rp.status))
+                WHEN rp.user_id = ANY($2::integer[]) THEN 'accepted'
+                ELSE TRIM(LOWER(rp.status))
+              END AS status,
+              u.full_name
+       FROM route_pool rp
+       LEFT JOIN users u ON u.id = rp.user_id
+       WHERE rp.matched_ride_offer_id = $1
+         AND (
+           TRIM(LOWER(rp.status)) IN ('matched', 'accepted', 'arrived', 'in_trip', 'completed')
+           OR rp.user_id = ANY($2::integer[])
+         )
+       UNION
+       SELECT u.id AS user_id, 'accepted' AS status, u.full_name
+       FROM users u
+       WHERE u.id = ANY($2::integer[])
+         AND NOT EXISTS (
+           SELECT 1
+           FROM route_pool rp
+           WHERE rp.matched_ride_offer_id = $1
+             AND rp.user_id = u.id
+             AND (
+               TRIM(LOWER(rp.status)) IN ('matched', 'accepted', 'arrived', 'in_trip', 'completed')
+               OR rp.user_id = ANY($2::integer[])
+             )
+         )`,
+      [targetRideId, acceptedPassengerIds]
     );
 
     await client.query("COMMIT");
@@ -2803,6 +2843,8 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
       driverStatus: activePoolRow.ride_status.toLowerCase().trim(), 
       passengers: passengersQuery.rows.map(row => ({
         userId: parseInt(row.user_id, 10),
+        user_id: parseInt(row.user_id, 10),
+        full_name: row.full_name || `Rider ${row.user_id}`,
         status: row.status || "arrived"
       }))
     });
@@ -4096,6 +4138,7 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
         r.accepted_passengers,
         r.start_location,
         r.end_location,
+        r.route_id,
         u.full_name AS driver_name,
         COALESCE(u.rating, 4.9) AS driver_rating,
         v.make AS vehicle_make,
@@ -4448,10 +4491,11 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
         dh.latitude AS dropoff_hub_lat,
         dh.longitude AS dropoff_hub_lng
       FROM ride_offers r
+      LEFT JOIN routes rt ON rt.id = r.route_id
       LEFT JOIN users u ON r.driver_id = u.id
       LEFT JOIN vehicles v ON r.vehicle_id = v.id
-      LEFT JOIN hubs ph ON CASE WHEN r.start_location ~ '^[0-9]+$' THEN CAST(r.start_location AS INTEGER) ELSE NULL END = ph.id
-      LEFT JOIN hubs dh ON CASE WHEN r.end_location ~ '^[0-9]+$' THEN CAST(r.end_location AS INTEGER) ELSE NULL END = dh.id
+      LEFT JOIN hubs ph ON ph.id = rt.pickup_hub_id
+      LEFT JOIN hubs dh ON dh.id = rt.drop_off_hub_id
       WHERE r.id = $1
       LIMIT 1;
     `;
@@ -4472,27 +4516,41 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
     const pickupLng = parseFloat(trip.pickup_lng || trip.pickup_hub_lng || 38.7945);
 
     // 2. Fetch Active Co-Riders Manifest & Presence Statuses
-    const passengersQuery = `
-      SELECT 
-        rp.user_id, 
-        rp.status,
-        u.full_name
-      FROM route_pool rp
-      LEFT JOIN users u ON rp.user_id = u.id
-      WHERE rp.matched_ride_offer_id = $1 
-        AND LOWER(TRIM(rp.status)) IN ('accepted', 'arrived', 'matched', 'in_trip', 'completed')
-    `;
-
-    const passengersRes = await pool.query(passengersQuery, [targetRideOfferId]);
-    let passengers = passengersRes.rows;
-
-    if (passengers.length === 0 && Array.isArray(trip.accepted_passengers) && trip.accepted_passengers.length > 0) {
-      const usersRes = await pool.query(
-        `SELECT id AS user_id, 'accepted' AS status, full_name FROM users WHERE id = ANY($1::int[])`,
-        [trip.accepted_passengers]
-      );
-      passengers = usersRes.rows;
-    }
+    const acceptedPassengerIds = Array.isArray(trip.accepted_passengers)
+      ? trip.accepted_passengers.map(id => parseInt(id, 10)).filter(id => !isNaN(id))
+      : [];
+    const passengersRes = await pool.query(
+      `SELECT rp.user_id,
+              CASE
+                WHEN TRIM(LOWER(rp.status)) IN ('accepted', 'arrived') THEN TRIM(LOWER(rp.status))
+                WHEN rp.user_id = ANY($2::integer[]) THEN 'accepted'
+                ELSE TRIM(LOWER(rp.status))
+              END AS status,
+              u.full_name
+       FROM route_pool rp
+       LEFT JOIN users u ON rp.user_id = u.id
+       WHERE rp.matched_ride_offer_id = $1
+         AND (
+           TRIM(LOWER(rp.status)) IN ('accepted', 'arrived', 'matched', 'in_trip', 'completed')
+           OR rp.user_id = ANY($2::integer[])
+         )
+       UNION
+       SELECT u.id AS user_id, 'accepted' AS status, u.full_name
+       FROM users u
+       WHERE u.id = ANY($2::integer[])
+         AND NOT EXISTS (
+           SELECT 1
+           FROM route_pool rp
+           WHERE rp.matched_ride_offer_id = $1
+             AND rp.user_id = u.id
+             AND (
+               TRIM(LOWER(rp.status)) IN ('accepted', 'arrived', 'matched', 'in_trip', 'completed')
+               OR rp.user_id = ANY($2::integer[])
+             )
+         )`,
+      [targetRideOfferId, acceptedPassengerIds]
+    );
+    const passengers = passengersRes.rows;
 
     // 3. Label Formatting
     const plate = trip.plate_number || trip.license_plate || "";
@@ -4506,6 +4564,7 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
     return res.status(200).json({
       success: true,
       rideOfferId: trip.id,
+      route_id: trip.route_id,
       driver_status: trip.driver_status || "accepted",
       driverName: trip.driver_name || "Assigned Driver",
       vehicleInfo: vehicleDisplay,
@@ -4516,6 +4575,9 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
 
       pickup_lat: pickupLat,
       pickup_lng: pickupLng,
+      dropoff_lat: parseFloat(trip.dropoff_hub_lat),
+      dropoff_lng: parseFloat(trip.dropoff_hub_lng),
+      accepted_passengers: acceptedPassengerIds,
 
       passengers: passengers.map((p) => ({
         user_id: p.user_id,
@@ -6561,11 +6623,4 @@ app.post('/api/admin/login', async (req, res) => {
     console.error("Admin login error:", err);
     res.status(500).json({ error: "Server authentication error", details: err.message });
   }
-});
-
-/* ===========================================================================
-   🏁 7. ENGINE DISPATCH INITIALIZER LISTEN
-=========================================================================== */
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Corridor Engine active on port ${PORT}`);
 });
