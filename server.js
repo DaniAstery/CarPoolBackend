@@ -1420,6 +1420,49 @@ app.get("/api/rides/pool-status/:userId", async (req, res) => {
 
 
 
+app.patch("/api/routes/pool/:userId", async (req, res) => {
+  const userId = Number.parseInt(req.params.userId, 10);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ success: false, message: "A valid user ID is required." });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE route_pool
+       SET status = 'cancelled', updated_at = NOW()
+       WHERE user_id = $1
+         AND LOWER(TRIM(status)) IN ('searching', 'matched', 'assigned', 'proposed', 'accepted_proposal')
+       RETURNING id, route_id, status`,
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      const latest = await pool.query(
+        `SELECT status FROM route_pool
+         WHERE user_id = $1
+         ORDER BY joined_at DESC LIMIT 1`,
+        [userId]
+      );
+      const status = String(latest.rows[0]?.status || "").toLowerCase();
+      if (status === "cancelled") {
+        return res.json({ success: true, status });
+      }
+      return res.status(latest.rows.length ? 409 : 404).json({
+        success: false,
+        message: latest.rows.length
+          ? `This request can no longer be cancelled (status: ${status}).`
+          : "No active corridor request was found.",
+      });
+    }
+
+    await broadcastCorridorPoolUpdate(result.rows[0].route_id);
+    return res.json({ success: true, status: "cancelled" });
+  } catch (err) {
+    console.error("❌ Error cancelling passenger corridor request:", err);
+    return res.status(500).json({ success: false, message: "Could not cancel the corridor request." });
+  }
+});
+
 app.post("/api/routes/join", async (req, res) => {
   const { route_id, user_id, pickup_hub_id, dropoff_hub_id } = req.body;
   console.log(`🚀 [JOIN_FLOW_START] User ${user_id} attempting to join Route ${route_id}`, { pickup_hub_id, dropoff_hub_id });
