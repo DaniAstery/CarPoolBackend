@@ -1431,7 +1431,10 @@ app.patch("/api/routes/pool/:userId", async (req, res) => {
       `UPDATE route_pool
        SET status = 'cancelled', updated_at = NOW()
        WHERE user_id = $1
-         AND LOWER(TRIM(status)) IN ('searching', 'matched', 'assigned', 'proposed', 'accepted_proposal')
+         AND LOWER(TRIM(status)) IN (
+           'searching', 'matching', 'pending', 'active', 'joined',
+           'matched', 'assigned', 'proposed', 'accepted_proposal'
+         )
        RETURNING id, route_id, status`,
       [userId]
     );
