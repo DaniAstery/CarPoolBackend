@@ -1698,20 +1698,17 @@ app.post('/api/driver/validate-location', async (req, res) => {
 
 // GET /api/hubs - Fetch all system hubs for the waypoint map display for driver
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+app.get("/api/hubs", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, name, latitude, longitude FROM hubs ORDER BY name"
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("❌ Error fetching hubs:", err.message);
+    res.status(500).json({ error: "Could not fetch hubs." });
+  }
+});
 
 
 
