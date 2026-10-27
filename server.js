@@ -4876,14 +4876,15 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
     const acceptedPassengerIds = Array.isArray(trip.accepted_passengers)
       ? trip.accepted_passengers.map(id => parseInt(id, 10)).filter(id => !isNaN(id))
       : [];
-    const passengersRes = await pool.query(
+ const passengersRes = await pool.query(
       `SELECT rp.user_id,
               CASE
                 WHEN TRIM(LOWER(rp.status)) IN ('accepted', 'arrived') THEN TRIM(LOWER(rp.status))
                 WHEN rp.user_id = ANY($2::integer[]) THEN 'accepted'
                 ELSE TRIM(LOWER(rp.status))
               END AS status,
-              u.full_name
+              u.full_name,
+              u.profile_photo_url
        FROM route_pool rp
        LEFT JOIN users u ON rp.user_id = u.id
        WHERE rp.matched_ride_offer_id = $1
@@ -4892,7 +4893,7 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
            OR rp.user_id = ANY($2::integer[])
          )
        UNION
-       SELECT u.id AS user_id, 'accepted' AS status, u.full_name
+       SELECT u.id AS user_id, 'accepted' AS status, u.full_name, u.profile_photo_url
        FROM users u
        WHERE u.id = ANY($2::integer[])
          AND NOT EXISTS (
