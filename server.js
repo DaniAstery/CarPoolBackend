@@ -4999,7 +4999,7 @@ app.get("/api/rides/proposal-manifest/:userId", async (req, res) => {
 
     // 🔍 JOIN users table to pull full_name alongside route_pool status
     const passengersRes = await pool.query(`
-      SELECT rp.user_id, rp.status, u.full_name 
+      SELECT rp.user_id, rp.status, u.full_name, u.profile_photo_url 
       FROM route_pool rp
       JOIN users u ON rp.user_id = u.id
       WHERE rp.matched_ride_offer_id = $1 
