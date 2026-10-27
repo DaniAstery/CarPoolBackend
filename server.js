@@ -202,6 +202,11 @@ io.on("connection", (socket) => {
       operatingMode: existing.operatingMode || "STANDARD",
     });
 
+    if (activeDrivers.get(id).operatingMode === "STANDARD") {
+      dispatchPendingSoloRequestToDriver(socket).catch((err) => {
+        console.error("❌ Failed to check pending solo rides for driver:", err.message);
+      });
+    }
     console.log(`🚖 Driver ${id} registered to room: ${roomName}`);
   });
 
@@ -348,7 +353,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 5. Automatic Cancellation on App Close or Disconnect
+  // Pending requests remain active across transient socket reconnects; passengers cancel explicitly.
   socket.on("disconnect", async () => {
     console.log(`🔌 Client disconnected: ${socket.id}`);
 
@@ -356,20 +361,6 @@ io.on("connection", (socket) => {
       const driverData = activeDrivers.get(socket.driverId);
       driverData.socketId = null;
       activeDrivers.set(socket.driverId, driverData);
-    }
-
-    if (socket.rideId && socket.userId) {
-      try {
-        const cancelQuery = `
-          UPDATE ride_request_solo 
-          SET status = 'cancelled', updated_at = NOW() 
-          WHERE id = $1 AND user_id = $2 AND status = 'pending'
-          RETURNING id;
-        `;
-        await pool.query(cancelQuery, [socket.rideId, socket.userId]);
-      } catch (err) {
-        console.error("❌ Error auto-cancelling ride on socket disconnect:", err.message);
-      }
     }
   });
 });
@@ -2510,10 +2501,108 @@ app.get("/api/rides", async (req, res) => {
 
 // Driver Waiting For riders active pool status
 // GET active waiting pool status for a driver by driver_id
+/**
+ * 📍 ACTIVE HUB MATCHES FOR WAITING FOR PASSENGERS SCREEN
+ * Route: GET /api/rides/active-hub-matches
+ */
+app.get('/api/rides/active-hub-matches', async (req, res) => {
+  const { hub, driverId } = req.query;
+  try {
+    let activeOffer = null;
+    if (driverId) {
+      const offerRes = await pool.query(`
+        SELECT ro.id, ro.status, ro.accepted_passengers,
+               u_driver.full_name AS driver_name,
+               u_driver.profile_photo_url AS driver_photo_url
+        FROM ride_offers ro
+        LEFT JOIN users u_driver ON ro.driver_id = u_driver.id
+        WHERE ro.driver_id = $1::integer AND ro.status IN ('pooling', 'ready', 'accepted', 'inprogress', 'in_trip', 'pending')
+        ORDER BY ro.id DESC LIMIT 1
+      `, [driverId]);
+      if (offerRes.rows.length > 0) {
+        activeOffer = offerRes.rows[0];
+      }
+    }
+
+    let passengers = [];
+    if (activeOffer) {
+      const passRes = await pool.query(`
+        SELECT rp.user_id AS "userId", rp.user_id, rp.status,
+               COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS passenger_name,
+               COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS name,
+               u.profile_photo_url,
+               u.profile_photo_url AS "profilePhoto",
+               COALESCE(u.rating, 5.00) AS rating
+        FROM route_pool rp
+        JOIN users u ON rp.user_id = u.id
+        WHERE rp.matched_ride_offer_id = $1
+        UNION
+        SELECT u.id AS "userId", u.id AS user_id, 'accepted' AS status,
+               u.full_name AS passenger_name,
+               u.full_name AS name,
+               u.profile_photo_url,
+               u.profile_photo_url AS "profilePhoto",
+               COALESCE(u.rating, 5.00) AS rating
+        FROM users u
+        WHERE u.id = ANY($2::int[])
+      `, [activeOffer.id, activeOffer.accepted_passengers || []]);
+
+      passengers = passRes.rows.map(p => ({
+        userId: p.userId,
+        user_id: p.userId,
+        name: p.passenger_name,
+        passenger_name: p.passenger_name,
+        profilePhoto: p.profile_photo_url,
+        profile_photo_url: p.profile_photo_url,
+        status: p.status,
+        rating: p.rating
+      }));
+    } else if (hub) {
+      const passRes = await pool.query(`
+        SELECT rp.user_id AS "userId", rp.user_id, rp.status,
+               COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS passenger_name,
+               COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS name,
+               u.profile_photo_url,
+               u.profile_photo_url AS "profilePhoto",
+               COALESCE(u.rating, 5.00) AS rating
+        FROM route_pool rp
+        JOIN users u ON rp.user_id = u.id
+        LEFT JOIN hubs h ON rp.pickup_hub_id = h.id
+        WHERE (h.name ILIKE $1 OR h.hub_name ILIKE $1)
+          AND rp.status IN ('searching', 'matched', 'pooling')
+        LIMIT 10
+      `, [`%${hub}%`]);
+
+      passengers = passRes.rows.map(p => ({
+        userId: p.userId,
+        user_id: p.userId,
+        name: p.passenger_name,
+        passenger_name: p.passenger_name,
+        profilePhoto: p.profile_photo_url,
+        profile_photo_url: p.profile_photo_url,
+        status: p.status,
+        rating: p.rating
+      }));
+    }
+
+    const status = passengers.length >= 2 ? 'ready' : 'pooling';
+    res.json({
+      success: true,
+      passengers,
+      status,
+      rideOfferId: activeOffer ? activeOffer.id : null,
+      driverPhoto: activeOffer ? activeOffer.driver_photo_url : null,
+      driver_photo_url: activeOffer ? activeOffer.driver_photo_url : null
+    });
+  } catch (err) {
+    console.error('Error in active-hub-matches:', err);
+    res.status(500).json({ error: 'Failed to fetch hub matches' });
+  }
+});
+
 app.get('/api/rides/waiting-pool-status/:driverId', async (req, res) => {
   try {
     const { driverId } = req.params;
-
     const rideQuery = `
       SELECT ro.id AS ride_offer_id, 
              ro.route_id, 
@@ -2523,26 +2612,83 @@ app.get('/api/rides/waiting-pool-status/:driverId', async (req, res) => {
              ro.total_seats,
              ro.available_seats,
              ro.status,
+             ro.accepted_passengers,
              h_start.name AS start_hub_name,
-             h_end.name AS end_hub_name
+             h_end.name AS end_hub_name,
+             u_driver.profile_photo_url AS driver_photo_url,
+             u_driver.full_name AS driver_name
       FROM ride_offers ro
       LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
       LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
-      WHERE ro.driver_id = $1::integer AND ro.status = 'pending'
+      LEFT JOIN users u_driver ON ro.driver_id = u_driver.id
+      WHERE ro.driver_id = $1::integer AND ro.status IN ('pending', 'pooling', 'ready')
       ORDER BY ro.created_at DESC
       LIMIT 1
     `;
     
     const rideResult = await pool.query(rideQuery, [driverId]);
 
+    const driverUserRes = await pool.query(
+      `SELECT full_name, profile_photo_url FROM users WHERE id = $1::integer`,
+      [driverId]
+    );
+    const driverUser = driverUserRes.rows[0] || {};
+
     if (rideResult.rows.length === 0) {
-      return res.status(404).json({ 
-        error: "No active pending ride offer found for this driver." 
+      return res.status(200).json({
+        success: true,
+        status: 'idle',
+        totalSearching: 0,
+        totalMatched: 0,
+        driverName: driverUser.full_name || null,
+        driverPhoto: driverUser.profile_photo_url || null,
+        driver_photo_url: driverUser.profile_photo_url || null,
+        matchedRiders: []
       });
     }
-
     const activeRide = rideResult.rows[0];
     const seatsFilled = (activeRide.total_seats || 3) - (activeRide.available_seats || 0);
+
+    // Query matched riders joining users table to include profile_photo_url
+    const ridersRes = await pool.query(`
+      SELECT 
+        rp.user_id,
+        rp.user_id AS "userId",
+        COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS passenger_name,
+        COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS name,
+        u.profile_photo_url,
+        u.profile_photo_url AS "profilePhoto",
+        rp.status,
+        COALESCE(u.rating, 5.00) AS rating,
+        u.phone_number
+      FROM route_pool rp
+      JOIN users u ON rp.user_id = u.id
+      WHERE rp.matched_ride_offer_id = $1
+    `, [activeRide.ride_offer_id]);
+
+    let matchedRiders = ridersRes.rows;
+
+    if (activeRide.accepted_passengers && Array.isArray(activeRide.accepted_passengers) && activeRide.accepted_passengers.length > 0) {
+      const existingIds = new Set(matchedRiders.map(r => Number(r.userId || r.user_id)));
+      const missingIds = activeRide.accepted_passengers.map(Number).filter(id => !existingIds.has(id));
+      if (missingIds.length > 0) {
+        const missingRes = await pool.query(`
+          SELECT 
+            u.id AS user_id,
+            u.id AS "userId",
+            u.full_name AS passenger_name,
+            u.full_name AS name,
+            u.profile_photo_url,
+            u.profile_photo_url AS "profilePhoto",
+            'accepted' AS status,
+            COALESCE(u.rating, 5.00) AS rating,
+            u.phone_number
+          FROM users u
+          WHERE u.id = ANY($1::int[])
+        `, [missingIds]);
+        matchedRiders = [...matchedRiders, ...missingRes.rows];
+      }
+    }
 
     return res.status(200).json({
       success: true,
@@ -2553,15 +2699,18 @@ app.get('/api/rides/waiting-pool-status/:driverId', async (req, res) => {
       destinationName: activeRide.end_hub_name || "Unknown Destination",
       pricePerSeat: activeRide.price_per_seat,
       totalSearching: 0,
-      totalMatched: seatsFilled,
-      matchedRiders: []
+      totalMatched: Math.max(seatsFilled, matchedRiders.length),
+      driverName: activeRide.driver_name || driverUser.full_name || null,
+      driverPhoto: activeRide.driver_photo_url || driverUser.profile_photo_url || null,
+      driver_photo_url: activeRide.driver_photo_url || driverUser.profile_photo_url || null,
+      matchedRiders
     });
-
   } catch (err) {
     console.error("❌ Error fetching driver waiting pool status:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 
 
@@ -2931,7 +3080,8 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
                 WHEN rp.user_id = ANY($2::integer[]) THEN 'accepted'
                 ELSE TRIM(LOWER(rp.status))
               END AS status,
-              u.full_name
+              u.full_name,
+              u.profile_photo_url
        FROM route_pool rp
        LEFT JOIN users u ON u.id = rp.user_id
        WHERE rp.matched_ride_offer_id = $1
@@ -2940,7 +3090,7 @@ app.post("/api/rides/signal-arrival", async (req, res) => {
            OR rp.user_id = ANY($2::integer[])
          )
        UNION
-       SELECT u.id AS user_id, 'accepted' AS status, u.full_name
+       SELECT u.id AS user_id, 'accepted' AS status, u.full_name, u.profile_photo_url
        FROM users u
        WHERE u.id = ANY($2::integer[])
          AND NOT EXISTS (
@@ -3260,10 +3410,13 @@ app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
               ro.total_seats, ro.available_seats, ro.price_per_seat, ro.pickup_lat, ro.pickup_lng,
               ro.accepted_passengers,
               h_start.name AS start_hub_name,
-              h_end.name AS end_hub_name
+              h_end.name AS end_hub_name,
+              u_driver.profile_photo_url AS driver_photo_url,
+              u_driver.full_name AS driver_name
        FROM ride_offers ro
        LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
        LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
+       LEFT JOIN users u_driver ON ro.driver_id = u_driver.id
        WHERE ro.driver_id = $1 
          AND ro.status IN ('pending', 'proposed', 'accepted', 'arrived', 'matched', 'in_trip', 'inprogress')
        ORDER BY ro.created_at DESC 
@@ -3293,7 +3446,7 @@ app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
 
     // 3. Fetch all assigned passengers strictly from route_pool (Source of Truth for Status)
     let passengersQuery = await pool.query(
-      `SELECT rp.user_id, rp.status, u.full_name AS passenger_name, u.phone_number 
+      `SELECT rp.user_id, rp.status, u.full_name AS passenger_name, u.phone_number, u.profile_photo_url 
        FROM route_pool rp
        JOIN users u ON rp.user_id = u.id
        WHERE rp.matched_ride_offer_id = $1`,
@@ -3303,7 +3456,7 @@ app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
     // 4. Fallback: If route_pool entries are unlinked, fetch from users but map status accurately (default to 'matched')
     if (passengersQuery.rows.length === 0 && acceptedIdsArray.length > 0) {
       const fallbackQuery = await pool.query(
-        `SELECT id AS user_id, 'matched' AS status, full_name AS passenger_name, phone_number 
+        `SELECT id AS user_id, 'matched' AS status, full_name AS passenger_name, phone_number, profile_photo_url 
          FROM users 
          WHERE id = ANY($1::int[])`,
         [acceptedIdsArray]
@@ -3328,6 +3481,9 @@ app.get("/api/rides/driver-proposal/:driverId", async (req, res) => {
       pickup_lat: offer.pickup_lat,
       pickup_lng: offer.pickup_lng,
       accepted_passengers: acceptedIdsArray,
+      driverName: offer.driver_name || null,
+      driverPhoto: offer.driver_photo_url || null,
+      driver_photo_url: offer.driver_photo_url || null,
       passengers: passengersQuery.rows
     });
 
@@ -3350,10 +3506,13 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
               ro.total_seats, ro.available_seats, ro.price_per_seat, ro.pickup_lat, ro.pickup_lng,
               ro.accepted_passengers, ro.driver_id,
               h_start.name AS start_hub_name,
-              h_end.name AS end_hub_name
+              h_end.name AS end_hub_name,
+              u_driver.profile_photo_url AS driver_photo_url,
+              u_driver.full_name AS driver_name
        FROM ride_offers ro
        LEFT JOIN hubs h_start ON ro.start_location::integer = h_start.id
        LEFT JOIN hubs h_end ON ro.end_location::integer = h_end.id
+       LEFT JOIN users u_driver ON ro.driver_id = u_driver.id
        WHERE ro.driver_id = $1 
          AND ro.status IN ('pending', 'proposed', 'accepted', 'arrived', 'inprogress')
        ORDER BY ro.created_at DESC 
@@ -3391,6 +3550,7 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
       `SELECT rp.user_id, rp.status,
               COALESCE(u.full_name, 'Passenger ' || rp.user_id) AS passenger_name,
               u.phone_number,
+              u.profile_photo_url,
               rp.joined_at
        FROM route_pool rp
        LEFT JOIN users u ON rp.user_id = u.id
@@ -3399,6 +3559,7 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
        SELECT accepted.user_id, 'accepted' AS status,
               COALESCE(u.full_name, 'Passenger ' || accepted.user_id) AS passenger_name,
               u.phone_number,
+              u.profile_photo_url,
               NULL AS joined_at
        FROM unnest($2::integer[]) AS accepted(user_id)
        LEFT JOIN users u ON u.id = accepted.user_id
@@ -3432,7 +3593,8 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
         user_id: pId,
         status: finalStatus,
         name: passenger.passenger_name,
-        phone_number: passenger.phone_number
+        phone_number: passenger.phone_number,
+        profile_photo_url: passenger.profile_photo_url || null
       };
     });
 
@@ -3457,6 +3619,9 @@ app.get("/api/rides/driver-cluster-offer/:driverId", async (req, res) => {
       pickup_lat: offer.pickup_lat,
       pickup_lng: offer.pickup_lng,
       accepted_passengers: acceptedIdsArray,
+      driverName: offer.driver_name || null,
+      driverPhoto: offer.driver_photo_url || null,
+      driver_photo_url: offer.driver_photo_url || null,
       passengers: formattedPassengers
     });
 
@@ -3546,7 +3711,7 @@ app.post("/api/rides/driver-accept", async (req, res) => {
       SELECT id, route_id, accepted_passengers, total_seats 
       FROM ride_offers 
       WHERE driver_id = $1 
-        AND LOWER(TRIM(status)) = 'pending'
+        AND LOWER(TRIM(status)) IN ('pending', 'searching', 'requested', 'created')
       ORDER BY created_at DESC 
       LIMIT 1 
       FOR UPDATE
@@ -3922,22 +4087,49 @@ app.get("/api/rides/status/:rideOfferId", async (req, res) => {
 
 app.patch('/api/rides/solo/status', async (req, res) => {
   try {
-    const { ride_id, status } = req.body;
+    const { ride_id, status, driver_id } = req.body || {};
+    const rideId = Number(ride_id);
+    const driverId = Number(driver_id);
 
-    if (!ride_id || !status) {
-      return res.status(400).json({ success: false, message: "Missing ride_id or status." });
+    if (!Number.isInteger(rideId) || rideId <= 0 || !Number.isInteger(driverId) || driverId <= 0) {
+      return res.status(400).json({ success: false, message: "A valid ride_id and driver_id are required." });
+    }
+    if (String(status || '').trim().toLowerCase() !== 'in_trip') {
+      return res.status(400).json({ success: false, message: "Only the in_trip transition is supported here." });
     }
 
     const query = `
       UPDATE ride_request_solo 
-      SET status = $1, updated_at = NOW() 
-      WHERE id = $2 
+      SET status = 'in_trip', updated_at = NOW()
+      WHERE id = $1
+        AND driver_id = $2
+        AND LOWER(TRIM(status)) IN ('accepted', 'arrived')
       RETURNING *
     `;
-    const result = await pool.query(query, [status, ride_id]);
+    const result = await pool.query(query, [rideId, driverId]);
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Ride request not found." });
+      const currentResult = await pool.query(
+        `SELECT * FROM ride_request_solo WHERE id = $1 LIMIT 1`,
+        [rideId]
+      );
+      const currentRide = currentResult.rows[0];
+      if (!currentRide) {
+        return res.status(404).json({ success: false, message: "Ride request not found." });
+      }
+      if (
+        Number(currentRide.driver_id) === driverId &&
+        String(currentRide.status || '').trim().toLowerCase() === 'in_trip'
+      ) {
+        return res.json({ success: true, ride: currentRide, isExisting: true });
+      }
+      if (Number(currentRide.driver_id) !== driverId) {
+        return res.status(403).json({ success: false, message: "This ride is assigned to another driver." });
+      }
+      return res.status(409).json({
+        success: false,
+        message: `Ride cannot start from its current status (${currentRide.status}).`,
+      });
     }
 
     const updatedRide = result.rows[0];
@@ -3945,20 +4137,25 @@ app.patch('/api/rides/solo/status', async (req, res) => {
     // 🚀 USE req.io (matching your middleware setup)
     const io = req.io; 
     if (io) {
-      const room = `ride_${ride_id}`;
+      const room = `ride_${rideId}`;
       
-      if (status === 'arrived') {
-        io.to(room).emit('solo_driver_arrived', { ride_id, status });
-      } else if (status === 'in_trip') {
-        io.to(room).emit('solo_trip_started', { ride_id, status });
-        // Also emit standard names just in case client listens to them
-        io.to(room).emit('trip_started', { ride_id, status });
-      } else if (status === 'completed') {
-        io.to(room).emit('trip_completed', { ride_id, status });
+      const payload = {
+        ride_id: rideId,
+        rideId,
+        driver_id: driverId,
+        driverId,
+        user_id: updatedRide.user_id,
+        status: 'in_trip',
+        ride: updatedRide,
+      };
+      io.to(room).emit('solo_trip_started', payload);
+      io.to(room).emit('trip_started', payload);
+      
+      io.to(room).emit('ride_status_changed', payload);
+      io.to(room).emit('solo_ride_status_updated', payload);
+      if (updatedRide.user_id) {
+        io.to(`user_${updatedRide.user_id}`).emit('solo_ride_status_updated', payload);
       }
-      
-      io.to(room).emit('ride_status_changed', { ride_id, status });
-      io.to(room).emit('solo_ride_status_updated', { ride_id, status });
     }
 
     res.json({ success: true, ride: updatedRide });
@@ -4056,7 +4253,7 @@ app.get("/api/rides/solo/recovery/:userId", async (req, res) => {
     const ownerColumn = role === "driver" ? "driver_id" : "user_id";
     const statuses = role === "driver"
       ? ["accepted", "arrived", "heading_to_pickup", "in_trip", "intransit"]
-      : ["pending", "searching", "accepted", "arrived", "in_trip", "intransit"];
+      : ["pending", "searching", "requested", "created", "accepted", "arrived", "in_trip", "intransit"];
     const result = await pool.query(
       `SELECT ride.*, passenger.full_name AS passenger_name,
               passenger.phone_number AS passenger_phone,
@@ -4289,6 +4486,7 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
         r.end_location,
         r.route_id,
         u.full_name AS driver_name,
+        u.profile_photo_url AS driver_photo_url,
         COALESCE(u.rating, 4.9) AS driver_rating,
         v.make AS vehicle_make,
         v.model AS vehicle_model,
@@ -4342,7 +4540,7 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
     let passengers = [];
     if (Array.isArray(trip.accepted_passengers) && trip.accepted_passengers.length > 0) {
       const usersRes = await pool.query(
-        `SELECT id AS user_id, 'accepted' AS status, full_name 
+        `SELECT id AS user_id, 'accepted' AS status, full_name, profile_photo_url 
          FROM users 
          WHERE id = ANY($1::int[])`,
         [trip.accepted_passengers]
@@ -4356,7 +4554,8 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
         SELECT 
           rp.user_id, 
           rp.status,
-          u.full_name
+          u.full_name,
+          u.profile_photo_url
         FROM route_pool rp
         LEFT JOIN users u ON rp.user_id = u.id
         WHERE rp.matched_ride_offer_id = $1 
@@ -4397,6 +4596,8 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
       rideOfferId: trip.id,
       driver_status: trip.driver_status || "accepted",
       driverName: trip.driver_name || "Assigned Driver",
+      driverPhoto: trip.driver_photo_url || null,
+      driver_photo_url: trip.driver_photo_url || null,
       vehicleInfo: vehicleDisplay,
       driverRating: parseFloat(trip.driver_rating).toFixed(1),
       finalPrice: computedFinalPrice,
@@ -4420,6 +4621,7 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
       passengers: passengers.map((p) => ({
         user_id: p.user_id,
         full_name: p.full_name || `Rider ${p.user_id}`,
+        profile_photo_url: p.profile_photo_url || null,
         status: p.status || "accepted",
       })),
     });
@@ -4457,6 +4659,7 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
         r.start_location,
         r.end_location,
         u.full_name AS driver_name,
+        u.profile_photo_url AS driver_photo_url,
         COALESCE(u.rating, 4.9) AS driver_rating,
         v.make AS vehicle_make,
         v.model AS vehicle_model,
@@ -4516,7 +4719,7 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
     let passengers = [];
     if (Array.isArray(trip.accepted_passengers) && trip.accepted_passengers.length > 0) {
       const usersRes = await pool.query(
-        `SELECT id AS user_id, 'accepted' AS status, full_name 
+        `SELECT id AS user_id, 'accepted' AS status, full_name, profile_photo_url 
          FROM users 
          WHERE id = ANY($1::int[])`,
         [trip.accepted_passengers]
@@ -4530,7 +4733,8 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
         SELECT 
           rp.user_id, 
           rp.status,
-          u.full_name
+          u.full_name,
+          u.profile_photo_url
         FROM route_pool rp
         LEFT JOIN users u ON rp.user_id = u.id
         WHERE rp.matched_ride_offer_id = $1 
@@ -4571,6 +4775,8 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
       rideOfferId: trip.id,
       driver_status: trip.driver_status || "accepted",
       driverName: trip.driver_name || "Assigned Driver",
+      driverPhoto: trip.driver_photo_url || null,
+      driver_photo_url: trip.driver_photo_url || null,
       vehicleInfo: vehicleDisplay,
       driverRating: parseFloat(trip.driver_rating).toFixed(1),
       finalPrice: computedFinalPrice,
@@ -4594,6 +4800,7 @@ app.get("/api/rides/passenger-track/:rideOfferId/user/:userId", async (req, res)
       passengers: passengers.map((p) => ({
         user_id: p.user_id,
         full_name: p.full_name || `Rider ${p.user_id}`,
+        profile_photo_url: p.profile_photo_url || null,
         status: p.status || "accepted",
       })),
     });
@@ -4630,6 +4837,7 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
         r.start_location,
         r.end_location,
         u.full_name AS driver_name,
+        u.profile_photo_url AS driver_photo_url,
         v.make AS vehicle_make,
         v.model AS vehicle_model,
         v.plate_number,
@@ -4716,6 +4924,8 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
       route_id: trip.route_id,
       driver_status: trip.driver_status || "accepted",
       driverName: trip.driver_name || "Assigned Driver",
+      driverPhoto: trip.driver_photo_url || null,
+      driver_photo_url: trip.driver_photo_url || null,
       vehicleInfo: vehicleDisplay,
 
       pickup_hub: pickupHubName,
@@ -4732,6 +4942,7 @@ app.get("/api/rides/presence-status/:rideOfferId/:userId", async (req, res) => {
         user_id: p.user_id,
         userId: p.user_id,
         full_name: p.full_name || `Rider ${p.user_id}`,
+        profile_photo_url: p.profile_photo_url || null,
         status: p.status || "accepted",
       })),
     });
@@ -5446,9 +5657,14 @@ function dispatchSoloRequestToDrivers(newRide) {
 
 // Cancel active solo/standard ride request with strict user verification
 app.post('/api/rides/solo/cancel', async (req, res) => {
-  const { requestId, user_id } = req.body;
+  const { requestId, request_id, ride_id, user_id } = req.body || {};
+  const requestIdValue = Number(requestId ?? request_id ?? ride_id);
+  const userId = Number(user_id);
 
-  if (!requestId || !user_id) {
+  if (
+    !Number.isInteger(requestIdValue) || requestIdValue <= 0 ||
+    !Number.isInteger(userId) || userId <= 0
+  ) {
     return res.status(400).json({ 
       success: false, 
       message: 'Missing required request ID or user ID.' 
@@ -5459,11 +5675,13 @@ app.post('/api/rides/solo/cancel', async (req, res) => {
     const updateQuery = `
       UPDATE ride_request_solo 
       SET status = 'cancelled', updated_at = NOW() 
-      WHERE id = $1 AND user_id = $2 AND status = 'pending'
+      WHERE id = $1
+        AND user_id = $2
+        AND LOWER(TRIM(status)) IN ('pending', 'searching', 'requested', 'created')
       RETURNING id, user_id, status;
     `;
 
-    const result = await pool.query(updateQuery, [requestId, user_id]);
+    const result = await pool.query(updateQuery, [requestIdValue, userId]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ 
@@ -5473,6 +5691,7 @@ app.post('/api/rides/solo/cancel', async (req, res) => {
     }
 
     const cancelledRide = result.rows[0];
+    retractOfferFromDrivers(cancelledRide.id);
 
     return res.status(200).json({
       success: true,
@@ -5564,26 +5783,77 @@ app.post('/api/rides/solo/create', async (req, res) => {
     destination_address
   } = req.body || {};
 
-  if (!user_id || !pickup_lat || !pickup_lng || !destination_lat || !destination_lng) {
+  const userId = Number(user_id);
+  const pickupLatitude = Number(pickup_lat);
+  const pickupLongitude = Number(pickup_lng);
+  const destinationLatitude = Number(destination_lat);
+  const destinationLongitude = Number(destination_lng);
+  if (
+    !Number.isInteger(userId) || userId <= 0 ||
+    !Number.isFinite(pickupLatitude) || pickupLatitude < -90 || pickupLatitude > 90 ||
+    !Number.isFinite(pickupLongitude) || pickupLongitude < -180 || pickupLongitude > 180 ||
+    !Number.isFinite(destinationLatitude) || destinationLatitude < -90 || destinationLatitude > 90 ||
+    !Number.isFinite(destinationLongitude) || destinationLongitude < -180 || destinationLongitude > 180
+  ) {
     return res.status(400).json({ 
       success: false, 
-      message: 'Missing required location or user parameters.' 
+      message: 'A valid user ID and pickup/destination coordinates are required.'
     });
   }
 
+  let client;
+  let transactionStarted = false;
   try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
+    await client.query('SELECT pg_advisory_xact_lock($1::int, $2::int)', [748271, userId]);
+
     // 🛡️ 1. Check if user already has any active session (catching pending, accepted, arrived, in_trip)
     const existingQuery = `
       SELECT * FROM ride_request_solo 
-      WHERE user_id = $1 
+      WHERE user_id = $1
         AND LOWER(TRIM(status)) NOT IN ('completed', 'cancelled', 'rejected')
-      ORDER BY created_at DESC 
+      ORDER BY CASE
+        WHEN LOWER(TRIM(status)) IN ('accepted', 'arrived', 'in_trip', 'intransit') THEN 0
+        ELSE 1
+      END,
+      updated_at DESC NULLS LAST,
+      created_at DESC,
+      id DESC
       LIMIT 1;
     `;
-    const existingResult = await pool.query(existingQuery, [user_id]);
+    const existingResult = await client.query(existingQuery, [userId]);
 
     if (existingResult.rows.length > 0) {
       const activeRide = existingResult.rows[0];
+      const stalePendingRides = await client.query(
+        `UPDATE ride_request_solo
+         SET status = 'cancelled', updated_at = NOW()
+         WHERE user_id = $1
+           AND LOWER(TRIM(status)) IN ('pending', 'searching', 'requested', 'created')
+           AND id <> $2
+         RETURNING id`,
+        [userId, activeRide.id]
+      );
+      const activeStatus = String(activeRide.status || '').trim().toLowerCase();
+      const isPendingRequest = ['pending', 'searching', 'requested', 'created'].includes(activeStatus);
+      if (isPendingRequest && activeStatus !== 'pending') {
+        const normalizedRide = await client.query(
+          `UPDATE ride_request_solo
+           SET status = 'pending', updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [activeRide.id]
+        );
+        Object.assign(activeRide, normalizedRide.rows[0]);
+      }
+      await client.query('COMMIT');
+      transactionStarted = false;
+      stalePendingRides.rows.forEach(({ id }) => retractOfferFromDrivers(id));
+      if (isPendingRequest) {
+        dispatchSoloRequestToDrivers(activeRide);
+      }
 
       return res.status(200).json({
         success: true,
@@ -5603,11 +5873,11 @@ app.post('/api/rides/solo/create', async (req, res) => {
       ) / 1000.0) * 1.25 AS calculated_distance_km;
     `;
     
-    const distResult = await pool.query(distQuery, [
-      parseFloat(pickup_lng), 
-      parseFloat(pickup_lat), 
-      parseFloat(destination_lng), 
-      parseFloat(destination_lat)
+    const distResult = await client.query(distQuery, [
+      pickupLongitude,
+      pickupLatitude,
+      destinationLongitude,
+      destinationLatitude
     ]);
 
     const rawDist = parseFloat(distResult.rows[0]?.calculated_distance_km || 1.0);
@@ -5624,13 +5894,17 @@ app.post('/api/rides/solo/create', async (req, res) => {
     };
 
     try {
-      const dbResult = await pool.query(
+      await client.query('SAVEPOINT pricing_config_lookup');
+      const dbResult = await client.query(
         "SELECT base_flag_down, rate_per_km, rate_per_minute, minimum_fare, fuel_multiplier, surge_multiplier FROM pricing_configs WHERE city_code = 'ADDIS_ABABA' AND is_active = TRUE LIMIT 1"
       );
       if (dbResult.rows.length > 0) {
         pricingConfig = dbResult.rows[0];
       }
+      await client.query('RELEASE SAVEPOINT pricing_config_lookup');
     } catch (dbErr) {
+      await client.query('ROLLBACK TO SAVEPOINT pricing_config_lookup');
+      await client.query('RELEASE SAVEPOINT pricing_config_lookup');
       console.warn("⚠️ Failed to load pricing config from DB, using fallback defaults:", dbErr.message);
     }
 
@@ -5660,7 +5934,7 @@ app.post('/api/rides/solo/create', async (req, res) => {
         ORDER BY distance ASC
         LIMIT 1;
       `;
-      const hubResult = await pool.query(hubQuery, [pickup_lat, pickup_lng]);
+      const hubResult = await client.query(hubQuery, [pickupLatitude, pickupLongitude]);
       resolvedHubId = hubResult.rows.length > 0 ? hubResult.rows[0].id : null;
     }
 
@@ -5685,11 +5959,11 @@ app.post('/api/rides/solo/create', async (req, res) => {
     `;
 
     const values = [
-      user_id,
-      pickup_lat,
-      pickup_lng,
-      destination_lat,
-      destination_lng,
+      userId,
+      pickupLatitude,
+      pickupLongitude,
+      destinationLatitude,
+      destinationLongitude,
       destination_name || 'Destination',
       destination_address || '',
       price,
@@ -5697,8 +5971,10 @@ app.post('/api/rides/solo/create', async (req, res) => {
       resolvedHubId
     ];
 
-    const result = await pool.query(insertQuery, values);
+    const result = await client.query(insertQuery, values);
     const newRide = result.rows[0];
+    await client.query('COMMIT');
+    transactionStarted = false;
 
     if (typeof dispatchSoloRequestToDrivers === 'function') {
       dispatchSoloRequestToDrivers(newRide);
@@ -5714,12 +5990,21 @@ app.post('/api/rides/solo/create', async (req, res) => {
     });
 
   } catch (err) {
+    if (client && transactionStarted) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error("❌ Failed to roll back solo ride request creation:", rollbackError.message);
+      }
+    }
     console.error("❌ Error creating solo ride request:", err.message);
     return res.status(500).json({ 
       success: false, 
       message: 'Server error while dispatching solo ride request.',
       error: err.message
     });
+  } finally {
+    client?.release();
   }
 });
 
@@ -5728,24 +6013,7 @@ app.post('/api/rides/solo/create', async (req, res) => {
 function dispatchSoloRequestToDrivers(rideSoloRow) {
   if (!io) return;
 
-  const offerPayload = {
-    rideId: rideSoloRow.id,
-    userId: rideSoloRow.user_id,
-    hubId: rideSoloRow.hub_id,
-    fare: `ETB ${rideSoloRow.price}`,
-    destinationName: rideSoloRow.destination_name,
-    destinationAddress: rideSoloRow.destination_address,
-    pickupCoords: {
-      latitude: parseFloat(rideSoloRow.pickup_lat),
-      longitude: parseFloat(rideSoloRow.pickup_lng),
-    },
-    destinationCoords: {
-      latitude: parseFloat(rideSoloRow.destination_lat),
-      longitude: parseFloat(rideSoloRow.destination_lng),
-    },
-    distanceKm: parseFloat(rideSoloRow.distance_km),
-    expiresInSeconds: 20,
-  };
+  const offerPayload = buildSoloOfferPayload(rideSoloRow);
 
   activeDrivers.forEach((driverState, driverId) => {
     if (driverState.status === "online" && driverState.operatingMode === "STANDARD") {
@@ -5753,6 +6021,43 @@ function dispatchSoloRequestToDrivers(rideSoloRow) {
       io.to(`driver_${driverId}`).emit("new_ride_offer", offerPayload);
     }
   });
+}
+
+function buildSoloOfferPayload(rideSoloRow) {
+  return {
+    rideId: rideSoloRow.id,
+    ride_id: rideSoloRow.id,
+    id: rideSoloRow.id,
+    userId: rideSoloRow.user_id,
+    user_id: rideSoloRow.user_id,
+    hubId: rideSoloRow.hub_id,
+    fare: `ETB ${rideSoloRow.price}`,
+    destinationName: rideSoloRow.destination_name,
+    destinationAddress: rideSoloRow.destination_address,
+    pickupCoords: {
+      latitude: Number(rideSoloRow.pickup_lat),
+      longitude: Number(rideSoloRow.pickup_lng),
+    },
+    destinationCoords: {
+      latitude: Number(rideSoloRow.destination_lat),
+      longitude: Number(rideSoloRow.destination_lng),
+    },
+    distanceKm: Number(rideSoloRow.distance_km),
+    expiresInSeconds: 20,
+  };
+}
+
+async function dispatchPendingSoloRequestToDriver(socket) {
+  const result = await pool.query(
+    `SELECT * FROM ride_request_solo
+     WHERE LOWER(TRIM(status)) IN ('pending', 'searching', 'requested', 'created')
+     ORDER BY created_at DESC, id DESC
+     LIMIT 1`
+  );
+  const pendingRide = result.rows[0];
+  if (pendingRide) {
+    socket.emit("new_ride_offer", buildSoloOfferPayload(pendingRide));
+  }
 }
 
 // Retract offer modal across drivers if claimed or canceled
@@ -5779,23 +6084,32 @@ function notifyPassengerRideAccepted(userId, rideData) {
 // 1. ACCEPT SOLO RIDE ROUTE 
 // ----------------------------------------------------
 app.post('/api/rides/solo/accept', async (req, res) => {
-  const { user_id, driver_id } = req.body || {};
+  const { user_id, ride_id, driver_id } = req.body || {};
+  const userId = user_id == null ? null : Number(user_id);
+  const rideId = ride_id == null ? null : Number(ride_id);
+  const driverId = Number(driver_id);
 
-  // Validation: Only require driver_id and user_id
-  if (!driver_id || !user_id) {
+  if (
+    !Number.isInteger(driverId) || driverId <= 0 ||
+    (userId !== null && (!Number.isInteger(userId) || userId <= 0)) ||
+    (rideId !== null && (!Number.isInteger(rideId) || rideId <= 0)) ||
+    (rideId === null && userId === null)
+  ) {
     return res.status(400).json({
       success: false,
-      message: 'Missing required parameters: driver_id and user_id are required.'
+      message: 'A valid driver ID and either a ride ID or passenger ID are required.'
     });
   }
 
+  let client;
+  let transactionStarted = false;
   try {
     // Optional: Automatically fetch the vehicle assigned to this driver
     let vehicleId = null;
     try {
       const driverRes = await pool.query(
         `SELECT vehicle_id FROM drivers WHERE id = $1;`, 
-        [driver_id]
+        [driverId]
       );
       if (driverRes.rows.length > 0) {
         vehicleId = driverRes.rows[0].vehicle_id;
@@ -5804,49 +6118,123 @@ app.post('/api/rides/solo/accept', async (req, res) => {
       console.warn("⚠️ Could not auto-fetch driver vehicle:", driverErr.message);
     }
 
-    // Atomically find and update the latest pending ride for this user
-    const updateQuery = `
-      WITH target_ride AS (
-        SELECT id FROM ride_request_solo 
-        WHERE user_id = $1 
-          AND status = 'pending'
-        ORDER BY created_at DESC 
-        LIMIT 1
-      )
-      UPDATE ride_request_solo 
-      SET driver_id = $2, 
-          vehicle_id = $3, 
-          status = 'accepted', 
-          updated_at = NOW() 
-      FROM target_ride 
-      WHERE ride_request_solo.id = target_ride.id 
-      RETURNING ride_request_solo.*;
-    `;
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionStarted = true;
 
-    const values = [user_id, driver_id, vehicleId];
-    const result = await pool.query(updateQuery, values);
+    const requestedRideResult = rideId
+      ? await client.query(
+          `SELECT id, user_id FROM ride_request_solo WHERE id = $1 LIMIT 1`,
+          [rideId]
+        )
+      : await client.query(
+          `SELECT id, user_id FROM ride_request_solo
+           WHERE user_id = $1 AND LOWER(TRIM(status)) = 'pending'
+           ORDER BY created_at DESC, id DESC LIMIT 1`,
+          [userId]
+        );
+    const requestedRide = requestedRideResult.rows[0];
+    if (!requestedRide || (userId !== null && Number(requestedRide.user_id) !== userId)) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(404).json({ success: false, message: 'Ride request not found for this passenger.' });
+    }
 
-    // If no row was updated, check why
-    if (!result.rows || result.rows.length === 0) {
-      const checkQuery = `
-        SELECT status FROM ride_request_solo 
-        WHERE user_id = $1 
-        ORDER BY created_at DESC 
-        LIMIT 1;
-      `;
-      const checkResult = await pool.query(checkQuery, [user_id]);
-      
-      if (!checkResult.rows || checkResult.rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'No ride requests found for this user.' });
-      }
+    const targetUserId = Number(requestedRide.user_id);
+    await client.query(
+      'SELECT pg_advisory_xact_lock($1::int, $2::int)',
+      [748271, targetUserId]
+    );
 
+    const lockedRideResult = await client.query(
+      `SELECT * FROM ride_request_solo WHERE id = $1 FOR UPDATE`,
+      [requestedRide.id]
+    );
+    const lockedRide = lockedRideResult.rows[0];
+    let lockedStatus = String(lockedRide?.status || '').trim().toLowerCase();
+
+    if (lockedStatus === 'accepted' && Number(lockedRide.driver_id) === driverId) {
+      await client.query('COMMIT');
+      transactionStarted = false;
+      return res.status(200).json({
+        success: true,
+        message: 'Ride request was already accepted by this driver.',
+        ride_id: lockedRide.id,
+        ride: lockedRide,
+        isExisting: true,
+      });
+    }
+    const isPendingStatus = ['pending', 'searching', 'requested', 'created'].includes(lockedStatus);
+    if (!isPendingStatus) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
       return res.status(409).json({
         success: false,
-        message: `Ride is no longer available (current status: ${checkResult.rows[0].status}).`
+        message: `Ride is no longer available (current status: ${lockedRide?.status || 'unknown'}).`,
+      });
+    }
+    if (lockedStatus !== 'pending') {
+      const normalizedRide = await client.query(
+        `UPDATE ride_request_solo
+         SET status = 'pending', updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [lockedRide.id]
+      );
+      Object.assign(lockedRide, normalizedRide.rows[0]);
+      lockedStatus = 'pending';
+    }
+
+    const otherActiveRide = await client.query(
+      `SELECT id, status FROM ride_request_solo
+       WHERE user_id = $1 AND id <> $2
+         AND LOWER(TRIM(status)) IN ('accepted', 'arrived', 'in_trip', 'intransit')
+       ORDER BY updated_at DESC NULLS LAST, id DESC
+       LIMIT 1`,
+      [targetUserId, lockedRide.id]
+    );
+    if (otherActiveRide.rows.length > 0) {
+      await client.query(
+        `UPDATE ride_request_solo
+         SET status = 'cancelled', updated_at = NOW()
+         WHERE user_id = $1
+           AND LOWER(TRIM(status)) IN ('pending', 'searching', 'requested', 'created')
+           AND id <> $2`,
+        [targetUserId, otherActiveRide.rows[0].id]
+      );
+      await client.query('COMMIT');
+      transactionStarted = false;
+      return res.status(409).json({
+        success: false,
+        message: `Passenger already has an active ride (${otherActiveRide.rows[0].status}).`,
       });
     }
 
+    const result = await client.query(
+      `UPDATE ride_request_solo
+       SET driver_id = $1, vehicle_id = $2, status = 'accepted', updated_at = NOW()
+       WHERE id = $3 AND user_id = $4 AND LOWER(TRIM(status)) = 'pending'
+       RETURNING *`,
+      [driverId, vehicleId, lockedRide.id, targetUserId]
+    );
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({ success: false, message: 'Ride request was claimed by another driver.' });
+    }
+
     const acceptedRide = result.rows[0];
+    await client.query(
+      `UPDATE ride_request_solo
+       SET status = 'cancelled', updated_at = NOW()
+       WHERE user_id = $1
+       AND LOWER(TRIM(status)) IN ('pending', 'searching', 'requested', 'created')
+       AND id <> $2`,
+      [targetUserId, acceptedRide.id]
+    );
+    await client.query('COMMIT');
+    transactionStarted = false;
+    retractOfferFromDrivers(acceptedRide.id);
 
     // Fetch Passenger details
     let passenger = null;
@@ -5865,8 +6253,8 @@ app.post('/api/rides/solo/accept', async (req, res) => {
     const payload = {
       rideId: acceptedRide.id,
       ride_id: acceptedRide.id,
-      driverId: driver_id,
-      driver_id: driver_id,
+      driverId,
+      driver_id: driverId,
       passengerId: acceptedRide.user_id,
       user_id: acceptedRide.user_id,
       status: "accepted",
@@ -5882,7 +6270,7 @@ app.post('/api/rides/solo/accept', async (req, res) => {
       ioServer.to(`ride_${acceptedRide.id}`).emit("solo_ride_status_updated", payload);
       ioServer.to(`user_${acceptedRide.user_id}`).emit("solo_ride_accepted", payload);
       ioServer.to(`user_${acceptedRide.user_id}`).emit("solo_ride_status_updated", payload);
-      console.log(`✅ Driver ${driver_id} accepted user ${user_id}'s pending ride via HTTP`);
+      console.log(`✅ Driver ${driverId} accepted solo ride ${acceptedRide.id} via HTTP`);
     } else {
       console.warn("⚠️ Socket server instance not attached!");
     }
@@ -5896,12 +6284,21 @@ app.post('/api/rides/solo/accept', async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Error accepting solo ride by user_id:", err.message);
+    if (client && transactionStarted) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error("❌ Failed to roll back solo ride acceptance:", rollbackError.message);
+      }
+    }
+    console.error("❌ Error accepting solo ride:", err.message);
     return res.status(500).json({
       success: false,
       message: 'Server error while accepting ride request.',
       error: err.message
     });
+  } finally {
+    client?.release();
   }
 });
 
@@ -5910,23 +6307,53 @@ app.post('/api/rides/solo/accept', async (req, res) => {
 // ----------------------------------------------------
 app.post('/api/rides/solo/arrived', async (req, res) => {
   const { ride_id, driver_id } = req.body || {};
+  const rideId = Number(ride_id);
+  const driverId = Number(driver_id);
 
-  if (!driver_id) {
+  if (
+    !Number.isInteger(rideId) || rideId <= 0 ||
+    !Number.isInteger(driverId) || driverId <= 0
+  ) {
     return res.status(400).json({
       success: false,
-      message: 'Missing required parameter: driver_id.'
+      message: 'Valid ride_id and driver_id are required.'
     });
   }
 
   try {
-    const updateQuery = ride_id
-      ? `UPDATE ride_request_solo SET status = 'arrived', updated_at = NOW() WHERE id = $1 AND driver_id = $2 AND status = 'accepted' RETURNING *;`
-      : `UPDATE ride_request_solo SET status = 'arrived', updated_at = NOW() WHERE driver_id = $1 AND status = 'accepted' RETURNING *;`;
-
-    const values = ride_id ? [ride_id, driver_id] : [driver_id];
-    const result = await pool.query(updateQuery, values);
+    const result = await pool.query(
+      `UPDATE ride_request_solo
+       SET status = 'arrived', updated_at = NOW()
+       WHERE id = $1 AND driver_id = $2 AND LOWER(TRIM(status)) = 'accepted'
+       RETURNING *;`,
+      [rideId, driverId]
+    );
 
     if (!result.rows || result.rows.length === 0) {
+      const currentResult = await pool.query(
+        `SELECT * FROM ride_request_solo WHERE id = $1 LIMIT 1`,
+        [rideId]
+      );
+      const currentRide = currentResult.rows[0];
+      if (
+        currentRide &&
+        Number(currentRide.driver_id) === driverId &&
+        String(currentRide.status || '').trim().toLowerCase() === 'arrived'
+      ) {
+        return res.status(200).json({
+          success: true,
+          message: 'Driver arrival was already recorded.',
+          ride_id: currentRide.id,
+          ride: currentRide,
+          isExisting: true,
+        });
+      }
+      if (currentRide && Number(currentRide.driver_id) !== driverId) {
+        return res.status(403).json({
+          success: false,
+          message: 'This ride is assigned to another driver.',
+        });
+      }
       return res.status(400).json({
         success: false,
         message: 'Cannot mark as arrived. Active accepted ride not found.'
@@ -5939,8 +6366,8 @@ app.post('/api/rides/solo/arrived', async (req, res) => {
     const payload = {
       rideId: updatedRide.id,
       ride_id: updatedRide.id,
-      driverId: driver_id,
-      driver_id: driver_id,
+      driverId,
+      driver_id: driverId,
       passengerId: updatedRide.user_id,
       user_id: updatedRide.user_id,
       status: "arrived",
@@ -5958,7 +6385,7 @@ app.post('/api/rides/solo/arrived', async (req, res) => {
         ioServer.to(`user_${updatedRide.user_id}`).emit("driver_arrived", payload);
         ioServer.to(`user_${updatedRide.user_id}`).emit("solo_ride_status_updated", payload);
       }
-      console.log(`📍 Driver ${driver_id} arrived for solo ride ${updatedRide.id} via HTTP -> Broadcasted to passenger ${updatedRide.user_id}`);
+      console.log(`📍 Driver ${driverId} arrived for solo ride ${updatedRide.id} via HTTP -> Broadcasted to passenger ${updatedRide.user_id}`);
     } else {
       console.warn("⚠️ Socket server instance (req.io or global.io) not attached!");
     }
@@ -6031,58 +6458,6 @@ function notifyPassengerDriverAccepted(updatedRide) {
 // STANDARD TIRP IN PROGRESS FETCHING INFO
 
 
-/**
- * 1. UPDATE RIDE STATUS TO 'in_trip'
- * Called when the driver taps 'Start Trip' in DriverEnRoute screen
- */
-app.patch('/api/rides/solo/status', async (req, res) => {
-  try {
-    const { ride_id, status } = req.body;
-
-    if (!ride_id || !status) {
-      return res.status(400).json({ success: false, message: "Missing ride_id or status." });
-    }
-
-    const query = `
-      UPDATE ride_request_solo 
-      SET status = $1, updated_at = NOW() 
-      WHERE id = $2 
-      RETURNING *
-    `;
-    const result = await pool.query(query, [status, ride_id]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Ride request not found." });
-    }
-
-    const updatedRide = result.rows[0];
-
-    // 🚀 EMIT SOCKET EVENTS TO THE RIDE ROOM
-    const io = req.app.get('io'); // (Make sure io is set on your express app: app.set('io', io))
-    if (io) {
-      const room = `ride_${ride_id}`;
-      
-      if (status === 'arrived') {
-        io.to(room).emit('solo_driver_arrived', { ride_id, status });
-      } else if (status === 'in_trip') {
-        io.to(room).emit('solo_trip_started', { ride_id, status });
-      } else if (status === 'completed') {
-        io.to(room).emit('trip_completed', { ride_id, status });
-      }
-      
-      // Generic fallback event if you want a single listener
-      io.to(room).emit('ride_status_changed', { ride_id, status });
-    }
-
-    res.json({ success: true, ride: updatedRide });
-  } catch (err) {
-    console.error("❌ Error updating ride_request_solo status:", err);
-    res.status(500).json({ success: false, error: "Internal server error." });
-  }
-});
-
-
-
 app.get('/api/pricing/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -6106,27 +6481,44 @@ app.get('/api/pricing/:id', async (req, res) => {
  * Called when the driver taps 'Complete Trip' in DriverStandardTripInProgress
  */
 app.post('/api/rides/solo/complete', async (req, res) => {
-  const { ride_id, actual_distance_km, elapsed_minutes } = req.body || {};
+  const { ride_id, driver_id, actual_distance_km, elapsed_minutes } = req.body || {};
+  const rideId = Number(ride_id);
+  const driverId = Number(driver_id);
 
-  if (!ride_id) {
+  if (!Number.isInteger(rideId) || rideId <= 0 || !Number.isInteger(driverId) || driverId <= 0) {
     return res.status(400).json({ 
       success: false, 
-      message: 'Missing ride_id parameter.' 
+      message: 'Valid ride_id and driver_id parameters are required.'
     });
   }
 
   try {
     // 1. Fetch the ride request
     const rideResult = await pool.query(
-      "SELECT * FROM ride_request_solo WHERE id = $1 LIMIT 1",
-      [ride_id]
+      "SELECT * FROM ride_request_solo WHERE id = $1 AND driver_id = $2 LIMIT 1",
+      [rideId, driverId]
     );
 
     if (rideResult.rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Ride request not found.' });
+      return res.status(404).json({ success: false, message: 'Ride request not found for this driver.' });
     }
 
     const ride = rideResult.rows[0];
+    if (String(ride.status || '').trim().toLowerCase() !== 'in_trip') {
+      return res.status(409).json({
+        success: false,
+        message: `Ride cannot be completed from its current status (${ride.status}).`,
+      });
+    }
+
+    if (
+      (actual_distance_km !== undefined &&
+        (!Number.isFinite(Number(actual_distance_km)) || Number(actual_distance_km) < 0)) ||
+      (elapsed_minutes !== undefined &&
+        (!Number.isInteger(Number(elapsed_minutes)) || Number(elapsed_minutes) < 0))
+    ) {
+      return res.status(400).json({ success: false, message: 'Trip distance and duration must be valid non-negative numbers.' });
+    }
 
     // 2. Fetch active pricing configuration from database
     const pricingResult = await pool.query(
@@ -6171,10 +6563,15 @@ app.post('/api/rides/solo/complete', async (req, res) => {
           price = $1, 
           distance_km = $2, 
           updated_at = NOW() 
-      WHERE id = $3 
+      WHERE id = $3
+        AND driver_id = $4
+        AND LOWER(TRIM(status)) = 'in_trip'
       RETURNING *;
     `;
-    const updateResult = await pool.query(updateQuery, [finalPrice, finalDist, ride_id]);
+    const updateResult = await pool.query(updateQuery, [finalPrice, finalDist, rideId, driverId]);
+    if (updateResult.rows.length === 0) {
+      return res.status(409).json({ success: false, message: 'Ride was already completed or is no longer in progress.' });
+    }
     const completedRide = updateResult.rows[0];
 
     // 🚀 7. SOCKET.IO REAL-TIME BROADCAST INTEGRATION
@@ -6191,9 +6588,9 @@ app.post('/api/rides/solo/complete', async (req, res) => {
       };
 
       // Broadcast to the ride monitoring room
-      io.to(`ride_${ride_id}`).emit("trip_completed", payload);
-      io.to(`ride_${ride_id}`).emit("ride_status_changed", payload);
-      io.to(`ride_${ride_id}`).emit("solo_ride_status_updated", payload);
+      io.to(`ride_${rideId}`).emit("trip_completed", payload);
+      io.to(`ride_${rideId}`).emit("ride_status_changed", payload);
+      io.to(`ride_${rideId}`).emit("solo_ride_status_updated", payload);
 
       // Broadcast directly to the passenger's personal channel
       if (completedRide.user_id) {
@@ -6202,7 +6599,7 @@ app.post('/api/rides/solo/complete', async (req, res) => {
         io.to(`user_${completedRide.user_id}`).emit("solo_ride_status_updated", payload);
       }
       
-      console.log(`🏁 Solo ride #${ride_id} marked completed and broadcasted via socket.`);
+      console.log(`🏁 Solo ride #${rideId} marked completed and broadcasted via socket.`);
     }
 
     return res.status(200).json({
@@ -6266,6 +6663,7 @@ app.get('/api/rides/:id', async (req, res) => {
              u.full_name AS driver_name, 
              u.phone_number AS driver_phone, 
              u.rating AS driver_rating,
+             u.profile_photo_url AS driver_photo_url,
              v.model AS vehicle_model, 
              v.plate_number AS plate_number, 
              v.color AS vehicle_color,
@@ -6291,8 +6689,12 @@ app.get('/api/rides/:id', async (req, res) => {
     res.status(200).json({
       success: true,
       id: ride.id,
+      ride_id: ride.id,
+      user_id: ride.user_id,
+      driver_id: ride.driver_id,
       status: ride.status,
       destination_name: ride.destination_name || "Destination Arrival",
+      destination_address: ride.destination_address || "",
       price: ride.price || 0,
       distance_km: ride.distance_km || 0,
       pickup_lat: ride.pickup_lat,
@@ -6303,6 +6705,8 @@ app.get('/api/rides/:id', async (req, res) => {
         name: ride.driver_name || "Captain",
         phone_number: ride.driver_phone || "",
         rating: ride.driver_rating || "5.00",
+        profile_photo_url: ride.driver_photo_url || null,
+        photo_url: ride.driver_photo_url || null,
         vehicle_model: ride.vehicle_model || "Toyota Corolla",
         plate_number: ride.plate_number || "3-45678",
         vehicle_color: ride.vehicle_color || "White",
